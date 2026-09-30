@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -10,8 +11,8 @@ import '../../utils/format.dart';
 import '../../widgets/thumbhash_placeholder.dart';
 
 /// Every memory the server currently offers, newest first.
-final memoriesProvider = FutureProvider<List<MemoryResponseDto>>((ref) =>
-    ref.watch(memoryRepositoryProvider).search());
+final memoriesProvider = FutureProvider<List<MemoryResponseDto>>(
+    (ref) => ref.watch(memoryRepositoryProvider).search());
 
 /// Memories page: one horizontal strip of thumbnails per memory, with per
 /// memory save / hide actions.
@@ -54,7 +55,8 @@ class _MemorySection extends ConsumerWidget {
 
   /// Assets are always present (the generated DTO has a non-nullable list), but
   /// guard anyway so an empty memory renders as an empty strip.
-  List<AssetResponseDto> get _assets => memory.assets ?? const <AssetResponseDto>[];
+  List<AssetResponseDto> get _assets =>
+      memory.assets ?? const <AssetResponseDto>[];
 
   String get _title {
     final assets = _assets;
@@ -85,12 +87,14 @@ class _MemorySection extends ConsumerWidget {
               IconButton(
                 tooltip: memory.isSaved == true ? 'Unsave' : 'Save',
                 icon: Icon(
-                  memory.isSaved == true ? Icons.bookmark : Icons.bookmark_border,
+                  memory.isSaved == true
+                      ? Icons.bookmark
+                      : Icons.bookmark_border,
                 ),
                 onPressed: () async {
-                  await ref
-                      .read(memoryRepositoryProvider)
-                      .update(memory.id ?? '', isSaved: !(memory.isSaved ?? false));
+                  await ref.read(memoryRepositoryProvider).update(
+                      memory.id ?? '',
+                      isSaved: !(memory.isSaved ?? false));
                   ref.invalidate(memoriesProvider);
                 },
               ),
@@ -98,9 +102,9 @@ class _MemorySection extends ConsumerWidget {
                 tooltip: 'Hide',
                 icon: const Icon(Icons.visibility_off_outlined),
                 onPressed: () async {
-                  await ref
-                      .read(memoryRepositoryProvider)
-                      .update(memory.id ?? '', seenAt: DateTime.now().toIso8601String());
+                  await ref.read(memoryRepositoryProvider).update(
+                      memory.id ?? '',
+                      seenAt: DateTime.now().toIso8601String());
                   ref.invalidate(memoriesProvider);
                   if (context.mounted) showMessage(context, 'Memory hidden');
                 },
@@ -131,7 +135,7 @@ class _MemorySection extends ConsumerWidget {
                           fit: StackFit.expand,
                           children: [
                             ThumbhashPlaceholder(thumbhash: asset.thumbhash),
-                            CachedNetworkImage(
+                            ImmichNetworkImage(
                               imageUrl: repo.thumbnailUrl(asset.id ?? ''),
                               fit: BoxFit.cover,
                               memCacheWidth: 400,
@@ -143,8 +147,8 @@ class _MemorySection extends ConsumerWidget {
                                 alignment: Alignment.bottomRight,
                                 child: Padding(
                                   padding: EdgeInsets.all(6),
-                                  child: Icon(Icons.play_circle_outline,
-                                      size: 20),
+                                  child:
+                                      Icon(Icons.play_circle_outline, size: 20),
                                 ),
                               ),
                           ],

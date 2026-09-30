@@ -5,6 +5,12 @@ import '../providers/session_provider.dart';
 import '../repositories/asset_repository.dart';
 import '../repositories/search_repository.dart';
 
+/// Headers required by media endpoints (API keys use x-api-key, sessions use
+/// Authorization: Bearer). Pass these to image/video network providers.
+final authHeadersProvider = Provider<Map<String, String>>((ref) {
+  return ref.watch(apiClientProvider)?.authHeaders ?? const <String, String>{};
+});
+
 final assetRepositoryProvider = Provider<AssetRepository>((ref) {
   final client = ref.watch(apiClientProvider);
   if (client == null) {

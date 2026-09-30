@@ -31,10 +31,12 @@ class ImmichApiClient {
   final Dio _dio;
   String baseUrl;
   String? accessToken;
+  String? apiKey;
 
   ImmichApiClient({
     required this.baseUrl,
     this.accessToken,
+    this.apiKey,
     Dio? dio,
     Duration connectTimeout = const Duration(seconds: 30),
     Duration receiveTimeout = const Duration(seconds: 120),
@@ -46,6 +48,14 @@ class ImmichApiClient {
         ));
 
   Dio get dio => _dio;
+
+  /// Auth headers for every request, following the OpenAPI security
+  /// schemes: session tokens go in `Authorization: Bearer`, while user
+  /// API keys must go in the `x-api-key` header (Bearer is rejected).
+  Map<String, String> get authHeaders => {
+    if (accessToken != null) 'Authorization': 'Bearer $accessToken',
+    if (accessToken == null && apiKey != null) 'x-api-key': apiKey!,
+  };
 
   Options _opts({ResponseType? responseType, Map<String, dynamic>? extra}) => Options(
     responseType: responseType,
@@ -75,9 +85,7 @@ class ImmichApiClient {
           responseType: responseType ?? ResponseType.json,
           onSendProgress: onSendProgress,
           cancelToken: cancelToken,
-          headers: {
-            if (accessToken != null) 'Authorization': 'Bearer $accessToken',
-          },
+          headers: authHeaders,
         ),
       );
     } on DioException catch (e) {
@@ -125,9 +133,7 @@ class ImmichApiClient {
       await _dio.downloadUri(uri, savePath,
           cancelToken: cancelToken,
           onReceiveProgress: onProgress,
-          options: Options(headers: {
-            if (accessToken != null) 'Authorization': 'Bearer $accessToken',
-          }));
+          options: Options(headers: authHeaders));
     } on DioException catch (e) {
       throw ImmichApiException(e.message ?? 'download failed',
           statusCode: e.response?.statusCode);

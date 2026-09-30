@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -194,7 +195,7 @@ class _PersonScreenState extends ConsumerState<PersonScreen> {
                           backgroundColor: theme.colorScheme.onSurfaceVariant
                               .withValues(alpha: 0.12),
                           child: ClipOval(
-                            child: CachedNetworkImage(
+                            child: ImmichNetworkImage(
                               imageUrl: personThumbnailUrl(client, p.id ?? ''),
                               fit: BoxFit.cover,
                               memCacheWidth: 400,
@@ -209,7 +210,9 @@ class _PersonScreenState extends ConsumerState<PersonScreen> {
                         ),
                         const SizedBox(height: 12),
                         Text(
-                          (p.name ?? '').isEmpty ? 'Unnamed' : p.name ?? 'Unnamed',
+                          (p.name ?? '').isEmpty
+                              ? 'Unnamed'
+                              : p.name ?? 'Unnamed',
                           style: theme.textTheme.titleLarge,
                         ),
                         if (p.birthDate != null && p.birthDate!.isNotEmpty)
@@ -259,7 +262,7 @@ class _PersonScreenState extends ConsumerState<PersonScreen> {
                             child: Stack(
                               fit: StackFit.expand,
                               children: [
-                                CachedNetworkImage(
+                                ImmichNetworkImage(
                                   imageUrl: ref
                                       .read(assetRepositoryProvider)
                                       .thumbnailUrl(a.id ?? ''),

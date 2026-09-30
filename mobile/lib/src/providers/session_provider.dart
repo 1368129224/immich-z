@@ -54,7 +54,7 @@ class SessionState {
   final String? error;
   final bool isLoading;
 
-  bool get isLoggedIn => user != null && config?.accessToken != null;
+  bool get isLoggedIn => user != null && config?.credential != null;
 
   SessionState copyWith({
     ServerConfig? config,
@@ -104,13 +104,14 @@ class ServerDiscovery {
     try {
       final res = await _dio
           .get<String>(
-        '$base/.well-known/immich',
-        options: Options(
-          receiveTimeout: const Duration(seconds: 5),
-          sendTimeout: const Duration(seconds: 5),
-          validateStatus: (s) => s != null && s < 500,
-        ),
-      ).timeout(const Duration(seconds: 8));
+            '$base/.well-known/immich',
+            options: Options(
+              receiveTimeout: const Duration(seconds: 5),
+              sendTimeout: const Duration(seconds: 5),
+              validateStatus: (s) => s != null && s < 500,
+            ),
+          )
+          .timeout(const Duration(seconds: 8));
       final body = res.data;
       if (body != null && body.isNotEmpty) {
         final doc = jsonDecode(body) as Map<String, dynamic>;
@@ -138,13 +139,14 @@ class ServerDiscovery {
     try {
       final res = await _dio
           .get<Map<String, dynamic>>(
-        '$endpoint/server/ping',
-        options: Options(
-          receiveTimeout: const Duration(seconds: 5),
-          sendTimeout: const Duration(seconds: 5),
-          validateStatus: (s) => s != null && s < 500,
-        ),
-      ).timeout(const Duration(seconds: 8));
+            '$endpoint/server/ping',
+            options: Options(
+              receiveTimeout: const Duration(seconds: 5),
+              sendTimeout: const Duration(seconds: 5),
+              validateStatus: (s) => s != null && s < 500,
+            ),
+          )
+          .timeout(const Duration(seconds: 8));
       if (res.statusCode != 200) return false;
       final data = res.data;
       return data != null && (data['res'] == 'pong' || data['res'] == true);
@@ -182,16 +184,17 @@ class SessionController extends StateNotifier<SessionState> {
       state = SessionState(isLoading: false, error: e.toString());
       return;
     }
-    if (cfg == null || cfg.accessToken == null) {
+    if (cfg == null || cfg.credential == null) {
       state = SessionState(isLoading: false);
       return;
     }
     try {
-      final api = cfg.apiEndpoint ??
-          '${ServerDiscovery.normalize(cfg.serverUrl)}/api';
+      final api =
+          cfg.apiEndpoint ?? '${ServerDiscovery.normalize(cfg.serverUrl)}/api';
       _client = ImmichApiClient(
         baseUrl: api,
-        accessToken: cfg.accessToken!,
+        accessToken: cfg.accessToken,
+        apiKey: cfg.apiKey,
       );
       final user = await _client!.getMyUser();
       state = SessionState(config: cfg, user: user, isLoading: false);
@@ -284,7 +287,7 @@ class SessionController extends StateNotifier<SessionState> {
       await _persistAndLoad(
         apiEndpoint: apiEndpoint,
         serverUrl: serverUrl,
-        accessToken: apiKey,
+        apiKey: apiKey,
       );
     } catch (e) {
       state = state.copyWith(isLoading: false, error: e.toString());
@@ -295,16 +298,22 @@ class SessionController extends StateNotifier<SessionState> {
   Future<void> _persistAndLoad({
     required String apiEndpoint,
     required String serverUrl,
-    required String accessToken,
+    String? accessToken,
+    String? apiKey,
   }) async {
     final deviceId = 'immich-z-${Platform.operatingSystem}';
     final cfg = ServerConfig(
       serverUrl: ServerDiscovery.normalize(serverUrl),
       apiEndpoint: apiEndpoint,
       accessToken: accessToken,
+      apiKey: apiKey,
       deviceId: deviceId,
     );
-    _client = ImmichApiClient(baseUrl: apiEndpoint, accessToken: accessToken);
+    _client = ImmichApiClient(
+      baseUrl: apiEndpoint,
+      accessToken: accessToken,
+      apiKey: apiKey,
+    );
     final user = await _client!.getMyUser();
     await _store.writeServerConfig(cfg);
     state = SessionState(config: cfg, user: user, isLoading: false);
@@ -313,7 +322,8 @@ class SessionController extends StateNotifier<SessionState> {
 
   Future<void> logout() async {
     try {
-      await _client?.logout();
+      // API-key sessions have no server-side session to close.
+      if (_client?.accessToken != null) await _client?.logout();
     } catch (_) {
       // Ignore: we clear local state regardless.
     }
@@ -333,5 +343,8 @@ final sessionProvider =
 
 /// Convenience: the live client, or null when logged out.
 final apiClientProvider = Provider<ImmichApiClient?>((ref) {
-  return ref.watch(sessionProvider.notifier).client;
+  // Subscribe to session state so dependents rebuild when login/logout swaps
+  // the controller's active client.
+  ref.watch(sessionProvider);
+  return ref.read(sessionProvider.notifier).client;
 });

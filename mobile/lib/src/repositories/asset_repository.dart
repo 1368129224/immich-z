@@ -172,32 +172,28 @@ class AssetRepository {
 
   Future<TrashResponseDto> emptyTrash() => _client.emptyTrash();
 
-  Future<void> favorite(List<String> ids, bool value) =>
-      _client
-          .updateAssets(body: AssetBulkUpdateDto(ids: ids, isFavorite: value))
-          .catchError((_) {});
+  Future<void> favorite(List<String> ids, bool value) => _client
+      .updateAssets(body: AssetBulkUpdateDto(ids: ids, isFavorite: value))
+      .catchError((_) {});
 
-  Future<void> archive(List<String> ids, bool value) =>
-      _client
-          .updateAssets(
-            body: AssetBulkUpdateDto(
-              ids: ids,
-              visibility:
-                  value ? AssetVisibility.archive : AssetVisibility.timeline,
-            ),
-          )
-          .catchError((_) {});
+  Future<void> archive(List<String> ids, bool value) => _client
+      .updateAssets(
+        body: AssetBulkUpdateDto(
+          ids: ids,
+          visibility:
+              value ? AssetVisibility.archive : AssetVisibility.timeline,
+        ),
+      )
+      .catchError((_) {});
 
-  Future<void> setDescription(List<String> ids, String? description) =>
-      _client
-          .updateAssets(
-              body: AssetBulkUpdateDto(ids: ids, description: description))
-          .catchError((_) {});
+  Future<void> setDescription(List<String> ids, String? description) => _client
+      .updateAssets(
+          body: AssetBulkUpdateDto(ids: ids, description: description))
+      .catchError((_) {});
 
-  Future<void> setRating(List<String> ids, int? rating) =>
-      _client
-          .updateAssets(body: AssetBulkUpdateDto(ids: ids, rating: rating))
-          .catchError((_) {});
+  Future<void> setRating(List<String> ids, int? rating) => _client
+      .updateAssets(body: AssetBulkUpdateDto(ids: ids, rating: rating))
+      .catchError((_) {});
 
   Future<void> setLocation(
     List<String> ids, {
@@ -266,7 +262,7 @@ class AssetRepository {
       '${_client.baseUrl}/assets/$id/video/stream/main.m3u8';
 
   String videoPlaybackUrl(String id) =>
-      '${_client.baseUrl}/video/playback/$id';
+      '${_client.baseUrl}/assets/$id/video/playback';
 
   String thumbnailUrl(String id, {String size = 'thumbnail'}) =>
       '${_client.baseUrl}/assets/$id/thumbnail?size=$size';

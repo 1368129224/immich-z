@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -79,7 +80,7 @@ class FavoritesScreen extends ConsumerWidget {
                   fit: StackFit.expand,
                   children: [
                     ThumbhashPlaceholder(thumbhash: a.thumbhash),
-                    CachedNetworkImage(
+                    ImmichNetworkImage(
                       imageUrl: repo.thumbnailUrl(a.id ?? ''),
                       fit: BoxFit.cover,
                       memCacheWidth: 400,

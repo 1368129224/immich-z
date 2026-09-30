@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -59,7 +60,9 @@ class _PeopleScreenState extends ConsumerState<PeopleScreen> {
     );
     if (name == null || name.isEmpty || name == person.name) return;
     try {
-      await ref.read(personRepositoryProvider).update(person.id ?? '', name: name);
+      await ref
+          .read(personRepositoryProvider)
+          .update(person.id ?? '', name: name);
       ref.invalidate(peopleProvider);
       if (mounted) showMessage(context, 'Renamed to $name');
     } catch (e) {
@@ -95,7 +98,8 @@ class _PeopleScreenState extends ConsumerState<PeopleScreen> {
           context: context,
           builder: (ctx) => AlertDialog(
             title: const Text('Delete person?'),
-            content: Text('Delete "${person.name ?? ''}"? This cannot be undone.'),
+            content:
+                Text('Delete "${person.name ?? ''}"? This cannot be undone.'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.of(ctx).pop(false),
@@ -121,7 +125,8 @@ class _PeopleScreenState extends ConsumerState<PeopleScreen> {
 
   Future<void> _hideUnnamed(List<PersonResponseDto> people) async {
     final unnamed = people
-        .where((p) => (p.name ?? '').trim().isEmpty || (p.name ?? '').trim() == 'Unknown')
+        .where((p) =>
+            (p.name ?? '').trim().isEmpty || (p.name ?? '').trim() == 'Unknown')
         .toList(growable: false);
     if (unnamed.isEmpty) {
       showMessage(context, 'No unnamed people');
@@ -172,7 +177,9 @@ class _PeopleScreenState extends ConsumerState<PeopleScreen> {
             ),
             ListTile(
               leading: Icon(
-                person.isHidden == true ? Icons.visibility : Icons.visibility_off,
+                person.isHidden == true
+                    ? Icons.visibility
+                    : Icons.visibility_off,
               ),
               title: Text(person.isHidden == true ? 'Unhide' : 'Hide'),
               onTap: () {
@@ -252,7 +259,8 @@ class _PeopleScreenState extends ConsumerState<PeopleScreen> {
               itemBuilder: (context, i) {
                 final p = items[i];
                 return GestureDetector(
-                  onTap: () => context.push('${AppRoutes.people}/${p.id ?? ''}'),
+                  onTap: () =>
+                      context.push('${AppRoutes.people}/${p.id ?? ''}'),
                   onLongPress: () => _showSheet(p),
                   child: Column(
                     mainAxisSize: MainAxisSize.min,
@@ -264,8 +272,9 @@ class _PeopleScreenState extends ConsumerState<PeopleScreen> {
                             width: 88,
                             height: 88,
                             child: ClipOval(
-                              child: CachedNetworkImage(
-                                imageUrl: personThumbnailUrl(client, p.id ?? ''),
+                              child: ImmichNetworkImage(
+                                imageUrl:
+                                    personThumbnailUrl(client, p.id ?? ''),
                                 fit: BoxFit.cover,
                                 memCacheWidth: 400,
                                 errorWidget: (_, __, ___) => Icon(
@@ -292,7 +301,9 @@ class _PeopleScreenState extends ConsumerState<PeopleScreen> {
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        (p.name ?? '').isEmpty ? 'Unnamed' : p.name ?? 'Unnamed',
+                        (p.name ?? '').isEmpty
+                            ? 'Unnamed'
+                            : p.name ?? 'Unnamed',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
                         style: theme.textTheme.bodyMedium,

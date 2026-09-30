@@ -553,10 +553,12 @@ client: list[str] = [
     "  final Dio _dio;",
     "  String baseUrl;",
     "  String? accessToken;",
+    "  String? apiKey;",
     "",
     "  ImmichApiClient({",
     "    required this.baseUrl,",
     "    this.accessToken,",
+    "    this.apiKey,",
     "    Dio? dio,",
     "    Duration connectTimeout = const Duration(seconds: 30),",
     "    Duration receiveTimeout = const Duration(seconds: 120),",
@@ -568,6 +570,14 @@ client: list[str] = [
     "        ));",
     "",
     "  Dio get dio => _dio;",
+    "",
+    "  /// Auth headers for every request, following the OpenAPI security",
+    "  /// schemes: session tokens go in `Authorization: Bearer`, while user",
+    "  /// API keys must go in the `x-api-key` header (Bearer is rejected).",
+    "  Map<String, String> get authHeaders => {",
+    "    if (accessToken != null) 'Authorization': 'Bearer $accessToken',",
+    "    if (accessToken == null && apiKey != null) 'x-api-key': apiKey!,",
+    "  };",
     "",
     "  Options _opts({ResponseType? responseType, Map<String, dynamic>? extra}) => Options(",
     "    responseType: responseType,",
@@ -724,9 +734,7 @@ client.append("          data: data,")
 client.append("          responseType: responseType ?? ResponseType.json,")
 client.append("          onSendProgress: onSendProgress,")
 client.append("          cancelToken: cancelToken,")
-client.append("          headers: {")
-client.append("            if (accessToken != null) 'Authorization': 'Bearer $accessToken',")
-client.append("          },")
+client.append("          headers: authHeaders,")
 client.append("        ),")
 client.append("      );")
 client.append("    } on DioException catch (e) {")
@@ -776,9 +784,7 @@ client.append("    try {")
 client.append("      await _dio.downloadUri(uri, savePath,")
 client.append("          cancelToken: cancelToken,")
 client.append("          onReceiveProgress: onProgress,")
-client.append("          options: Options(headers: {")
-client.append("            if (accessToken != null) 'Authorization': 'Bearer $accessToken',")
-client.append("          }));")
+client.append("          options: Options(headers: authHeaders));")
 client.append("    } on DioException catch (e) {")
 client.append("      throw ImmichApiException(e.message ?? 'download failed',")
 client.append("          statusCode: e.response?.statusCode);")

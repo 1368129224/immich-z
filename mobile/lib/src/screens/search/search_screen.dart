@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -131,7 +132,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
                         fit: StackFit.expand,
                         children: [
                           ThumbhashPlaceholder(thumbhash: a.thumbhash),
-                          CachedNetworkImage(
+                          ImmichNetworkImage(
                             imageUrl: _thumbnailUrl(a.id ?? ''),
                             fit: BoxFit.cover,
                             memCacheWidth: 400,
@@ -175,7 +176,8 @@ class _ExploreGrid extends ConsumerWidget {
               : const Center(child: CircularProgressIndicator());
         }
         final items = snap.data!;
-        if (items.isEmpty) return const Center(child: Text('Nothing to explore'));
+        if (items.isEmpty)
+          return const Center(child: Text('Nothing to explore'));
         return GridView.builder(
           padding: const EdgeInsets.all(2),
           gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -196,8 +198,10 @@ class _ExploreGrid extends ConsumerWidget {
                 fit: StackFit.expand,
                 children: [
                   ThumbhashPlaceholder(thumbhash: a.thumbhash),
-                  CachedNetworkImage(
-                    imageUrl: ref.read(assetRepositoryProvider).thumbnailUrl(a.id ?? ''),
+                  ImmichNetworkImage(
+                    imageUrl: ref
+                        .read(assetRepositoryProvider)
+                        .thumbnailUrl(a.id ?? ''),
                     fit: BoxFit.cover,
                     memCacheWidth: 400,
                   ),

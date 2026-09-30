@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -58,10 +59,10 @@ class _AlbumScreenState extends ConsumerState<AlbumScreen> {
             title: Text(album.albumName ?? ''),
             background: album.albumThumbnailAssetId == null
                 ? null
-                : CachedNetworkImage(
-                    imageUrl: ref
-                        .read(assetRepositoryProvider)
-                        .thumbnailUrl(album.albumThumbnailAssetId!, size: 'preview'),
+                : ImmichNetworkImage(
+                    imageUrl: ref.read(assetRepositoryProvider).thumbnailUrl(
+                        album.albumThumbnailAssetId!,
+                        size: 'preview'),
                     fit: BoxFit.cover,
                   ),
           ),
@@ -166,7 +167,7 @@ class _AlbumScreenState extends ConsumerState<AlbumScreen> {
                       child: Stack(
                         fit: StackFit.expand,
                         children: [
-                          CachedNetworkImage(
+                          ImmichNetworkImage(
                             imageUrl: ref
                                 .read(assetRepositoryProvider)
                                 .thumbnailUrl(asset.id ?? ''),
@@ -178,7 +179,8 @@ class _AlbumScreenState extends ConsumerState<AlbumScreen> {
                               alignment: Alignment.bottomRight,
                               child: Padding(
                                 padding: EdgeInsets.all(4),
-                                child: Icon(Icons.play_circle_outline, size: 18),
+                                child:
+                                    Icon(Icons.play_circle_outline, size: 18),
                               ),
                             ),
                           if (_selectionMode)

@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -81,7 +82,7 @@ class ArchiveScreen extends ConsumerWidget {
                   fit: StackFit.expand,
                   children: [
                     ThumbhashPlaceholder(thumbhash: a.thumbhash),
-                    CachedNetworkImage(
+                    ImmichNetworkImage(
                       imageUrl: repo.thumbnailUrl(a.id ?? ''),
                       fit: BoxFit.cover,
                       memCacheWidth: 400,
@@ -122,7 +123,9 @@ class ArchiveScreen extends ConsumerWidget {
               title: const Text('Unarchive'),
               onTap: () async {
                 Navigator.of(sheetContext).pop();
-                await ref.read(assetRepositoryProvider).archive([asset.id ?? ''], false);
+                await ref
+                    .read(assetRepositoryProvider)
+                    .archive([asset.id ?? ''], false);
                 ref.invalidate(archiveProvider);
                 if (context.mounted) showMessage(context, 'Moved to timeline');
               },
@@ -132,7 +135,9 @@ class ArchiveScreen extends ConsumerWidget {
               title: const Text('Delete'),
               onTap: () async {
                 Navigator.of(sheetContext).pop();
-                await ref.read(assetRepositoryProvider).delete([asset.id ?? '']);
+                await ref
+                    .read(assetRepositoryProvider)
+                    .delete([asset.id ?? '']);
                 ref.invalidate(archiveProvider);
                 if (context.mounted) showMessage(context, 'Moved to trash');
               },

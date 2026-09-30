@@ -1,4 +1,3 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -9,6 +8,7 @@ import '../../providers/theme_provider.dart';
 import '../../repositories/asset_repository.dart';
 import '../../routing/app_router.dart';
 import '../../utils/format.dart';
+import '../../widgets/immich_network_image.dart';
 import '../../widgets/thumbhash_placeholder.dart';
 
 /// Number of columns in the timeline grid; pinch-zoom changes it live.
@@ -151,8 +151,7 @@ class _TimelineScreenState extends ConsumerState<TimelineScreen> {
                 PopupMenuButton<GroupBy>(
                   icon: const Icon(Icons.view_agenda_outlined),
                   tooltip: 'Group by',
-                  onSelected: (g) =>
-                      ref.read(groupByProvider.notifier).set(g),
+                  onSelected: (g) => ref.read(groupByProvider.notifier).set(g),
                   itemBuilder: (context) => [
                     for (final g in GroupBy.values)
                       CheckedPopupMenuItem(
@@ -178,8 +177,9 @@ class _TimelineScreenState extends ConsumerState<TimelineScreen> {
           final factor = d.scale / _scaleBase;
           if ((factor - 1.0).abs() < 0.15) return;
           _scaleBase = d.scale;
-          final next =
-              (_columnsBase / (factor > 1 ? 1.5 : 1 / 1.5)).round().clamp(1, 12);
+          final next = (_columnsBase / (factor > 1 ? 1.5 : 1 / 1.5))
+              .round()
+              .clamp(1, 12);
           if (next != columns) {
             ref.read(timelineColumnsProvider.notifier).set(next);
           }
@@ -298,8 +298,12 @@ class _TimelineScreenState extends ConsumerState<TimelineScreen> {
     ];
   }
 
-  List<String> get _allIds =>
-      ref.read(timelineProvider).days.expand((d) => d.assets).map((a) => a.id).toList();
+  List<String> get _allIds => ref
+      .read(timelineProvider)
+      .days
+      .expand((d) => d.assets)
+      .map((a) => a.id)
+      .toList();
 
   int _flatIndex(String id) {
     final ids = _allIds;
@@ -328,7 +332,8 @@ class _TimelineScreenState extends ConsumerState<TimelineScreen> {
           context: context,
           builder: (c) => AlertDialog(
             title: const Text('Move to trash?'),
-            content: Text('${_selected.length} item(s) will be moved to trash.'),
+            content:
+                Text('${_selected.length} item(s) will be moved to trash.'),
             actions: [
               TextButton(
                 onPressed: () => Navigator.pop(c, false),
@@ -468,7 +473,7 @@ final timelineProvider =
 
 /// A single grid cell: cached thumbnail with a thumbhash placeholder and a
 /// video badge.
-class _TimelineCell extends StatelessWidget {
+class _TimelineCell extends ConsumerWidget {
   const _TimelineCell({
     required this.asset,
     required this.thumbnailUrl,
@@ -486,7 +491,7 @@ class _TimelineCell extends StatelessWidget {
   final VoidCallback onLongPress;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return GestureDetector(
       onTap: onTap,
       onLongPress: onLongPress,
@@ -494,11 +499,10 @@ class _TimelineCell extends StatelessWidget {
         fit: StackFit.expand,
         children: [
           ThumbhashPlaceholder(thumbhash: asset.thumbhash),
-          CachedNetworkImage(
+          ImmichNetworkImage(
             imageUrl: thumbnailUrl,
             fit: BoxFit.cover,
             memCacheWidth: 400,
-            fadeInDuration: const Duration(milliseconds: 120),
             errorWidget: (_, __, ___) => const Icon(Icons.broken_image),
           ),
           if (asset.isVideo)
@@ -534,7 +538,8 @@ class _TimelineCell extends StatelessWidget {
             ),
           if (selected)
             ColoredBox(
-              color: Theme.of(context).colorScheme.primary.withValues(alpha: 0.28),
+              color:
+                  Theme.of(context).colorScheme.primary.withValues(alpha: 0.28),
             ),
         ],
       ),

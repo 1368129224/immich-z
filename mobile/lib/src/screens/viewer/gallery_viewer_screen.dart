@@ -35,8 +35,7 @@ class _GalleryViewerScreenState extends ConsumerState<GalleryViewerScreen> {
     _controller = PageController(initialPage: _index);
   }
 
-  int get _maxIndex =>
-      widget.assetIds.isEmpty ? 0 : widget.assetIds.length - 1;
+  int get _maxIndex => widget.assetIds.isEmpty ? 0 : widget.assetIds.length - 1;
 
   @override
   void dispose() {
@@ -176,7 +175,10 @@ class _AssetPageState extends ConsumerState<_AssetPage> {
     final existing = _video;
     if (existing != null && existing.dataSource == url) return;
     await existing?.dispose();
-    final c = VideoPlayerController.networkUrl(Uri.parse(url));
+    final c = VideoPlayerController.networkUrl(
+      Uri.parse(url),
+      httpHeaders: ref.read(requireClientProvider).authHeaders,
+    );
     _video = c;
     try {
       await c.initialize();
@@ -238,7 +240,10 @@ class _AssetPageState extends ConsumerState<_AssetPage> {
     }
 
     return PhotoView(
-      imageProvider: NetworkImage(repo.originalUrl(a.id ?? '')),
+      imageProvider: NetworkImage(
+        repo.originalUrl(a.id ?? ''),
+        headers: ref.read(requireClientProvider).authHeaders,
+      ),
       minScale: PhotoViewComputedScale.contained,
       maxScale: PhotoViewComputedScale.covered * 6,
       backgroundDecoration: const BoxDecoration(color: Colors.black),

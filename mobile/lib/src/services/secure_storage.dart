@@ -13,24 +13,31 @@ class ServerConfig {
     required this.serverUrl,
     this.apiEndpoint,
     this.accessToken,
+    this.apiKey,
     this.deviceId,
   });
 
   final String serverUrl;
   final String? apiEndpoint;
   final String? accessToken;
+  final String? apiKey;
   final String? deviceId;
+
+  /// Whichever credential exists: session token first, API key second.
+  String? get credential => accessToken ?? apiKey;
 
   ServerConfig copyWith({
     String? serverUrl,
     String? apiEndpoint,
     String? accessToken,
+    String? apiKey,
     String? deviceId,
   }) =>
       ServerConfig(
         serverUrl: serverUrl ?? this.serverUrl,
         apiEndpoint: apiEndpoint ?? this.apiEndpoint,
         accessToken: accessToken ?? this.accessToken,
+        apiKey: apiKey ?? this.apiKey,
         deviceId: deviceId ?? this.deviceId,
       );
 
@@ -38,6 +45,7 @@ class ServerConfig {
         'serverUrl': serverUrl,
         'apiEndpoint': apiEndpoint,
         'accessToken': accessToken,
+        'apiKey': apiKey,
         'deviceId': deviceId,
       };
 
@@ -48,6 +56,7 @@ class ServerConfig {
       serverUrl: url,
       apiEndpoint: j['apiEndpoint'] as String?,
       accessToken: j['accessToken'] as String?,
+      apiKey: j['apiKey'] as String?,
       deviceId: j['deviceId'] as String?,
     );
   }

@@ -1,5 +1,6 @@
-import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
+
+import '../../widgets/immich_network_image.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
@@ -137,7 +138,7 @@ class _AlbumTile extends ConsumerWidget {
                   color: Colors.black26,
                   child: Icon(Icons.photo_album_outlined),
                 )
-              : CachedNetworkImage(imageUrl: url, fit: BoxFit.cover),
+              : ImmichNetworkImage(imageUrl: url, fit: BoxFit.cover),
         ),
       ),
       title: Text(album.albumName ?? ''),

@@ -78,11 +78,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 30
 
-  # Silently skipped until the signing secrets exist.
+  # Enable by setting the ENABLE_ANDROID_SIGNING repository variable to 'true'
+  # and configuring the signing secrets below.
   build-apk-signed:
     name: APK (signed release)
     runs-on: ubuntu-latest
-    if: ${{ secrets.KEYSTORE_BASE64 != '' }}
+    if: ${{ vars.ENABLE_ANDROID_SIGNING == 'true' }}
     defaults:
       run:
         working-directory: ./mobile

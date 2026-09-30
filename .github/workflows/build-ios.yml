@@ -82,15 +82,15 @@ jobs:
           retention-days: 30
 
   # ---------------------------------------------------------------------------
-  # SIGNED: no-ops until the Apple secrets are configured.
-  # Requires a PAID Apple Developer Program membership.
+  # SIGNED: enabled by setting the ENABLE_IOS_SIGNING repository variable to
+  # 'true' after configuring the Apple secrets. Requires a PAID membership.
   # Note: Flutter remaps the export `method` for Xcode >= 15.4 when you use
   # --export-method, so the legacy values above stay correct here.
   # ---------------------------------------------------------------------------
   build-ios-signed:
     name: IPA (signed)
     runs-on: macos-15
-    if: ${{ secrets.APPLE_CERTIFICATE_BASE64 != '' }}
+    if: ${{ vars.ENABLE_IOS_SIGNING == 'true' }}
     defaults:
       run:
         working-directory: ./mobile

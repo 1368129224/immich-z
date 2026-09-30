@@ -167,11 +167,28 @@ struct NativeSearchPage {
   let next: String?
 }
 
+struct NativeExploreSection: Identifiable {
+  let id: String
+  let items: [NativeExploreTile]
+}
+
+struct NativeExploreTile: Identifiable {
+  let id: String
+  let name: String
+  let asset: NativeAsset?
+}
+
 extension NativeImmichClient {
   func searchPage(query: String? = nil, albumId: String? = nil, cursor: String? = nil, filter: [String: Any] = [:]) async throws -> NativeSearchPage {
     var terms = filter
     if let albumId { terms["albumIds"] = ["any": [albumId]] }
-    if let query, !query.isEmpty { terms["originalFileName"] = ["like": query] }
+    if let query, !query.isEmpty {
+      terms["or"] = [
+        ["originalFileName": ["like": query]],
+        ["originalPath": ["like": query]],
+        ["description": ["like": query]],
+      ]
+    }
     var payload: [String: Any] = [
       "size": 100,
       "orderBy": ["field": "fileCreatedAt", "direction": "desc"],
@@ -180,27 +197,51 @@ extension NativeImmichClient {
     if let cursor { payload["cursor"] = cursor }
     let result = try await send(path: "search/metadata", method: "POST", body: payload)
     guard let page = result["assets"] as? [String: Any], let items = page["items"] as? [[String: Any]] else { throw NativeFeatureError.badResponse }
-    let assets = items.compactMap { item -> NativeAsset? in
-      guard let id = item["id"] as? String else { return nil }
-      let dateText = (item["localDateTime"] as? String) ?? (item["fileCreatedAt"] as? String) ?? ""
-      let formatter = ISO8601DateFormatter()
-      formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-      let date = formatter.date(from: dateText) ?? ISO8601DateFormatter().date(from: dateText) ?? .distantPast
-      return NativeAsset(id: id, date: date, isImage: (item["type"] as? String) != "VIDEO", isFavorite: item["isFavorite"] as? Bool ?? false, thumbhash: item["thumbhash"] as? String)
-    }
-    return NativeSearchPage(assets: assets, next: page["nextCursor"] as? String)
+    return NativeSearchPage(assets: items.compactMap(Self.decodeAsset), next: page["nextCursor"] as? String)
   }
 
-  func serverAlbums() async throws -> [NativeServerAlbum] {
-    // /albums returns an array, unlike JSON-object endpoints.
+  func smartSearch(query: String, page: Int, filter: [String: Any]) async throws -> NativeSearchPage {
+    var payload: [String: Any] = ["query": query, "page": page, "size": 100]
+    if !filter.isEmpty { payload["filter"] = filter }
+    let response = try await send(path: "search/smart", method: "POST", body: payload)
+    guard let assets = response["assets"] as? [String: Any], let rows = assets["items"] as? [[String: Any]] else { throw NativeFeatureError.badResponse }
+    return NativeSearchPage(assets: rows.compactMap(Self.decodeAsset), next: assets["nextPage"] as? String)
+  }
+
+  func explore() async throws -> [NativeExploreSection] {
+    let rows = try await nativeArray(path: "search/explore")
+    return rows.compactMap { row in
+      guard let name = row["fieldName"] as? String, let items = row["items"] as? [[String: Any]] else { return nil }
+      return NativeExploreSection(id: name, items: items.compactMap { item in
+        guard let value = item["value"] as? String else { return nil }
+        return NativeExploreTile(id: value, name: value, asset: (item["data"] as? [String: Any]).flatMap(Self.decodeAsset))
+      })
+    }
+  }
+
+  func nativeArray(path: String) async throws -> [[String: Any]] {
     let base = config.apiEndpoint ?? (NativeImmichClient.normalize(config.serverUrl) + "/api")
-    guard let url = URL(string: base + "/albums") else { throw NativeFeatureError.badResponse }
+    guard let url = URL(string: base + "/" + path) else { throw NativeFeatureError.badResponse }
     var request = URLRequest(url: url)
     if let token = config.accessToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
     if let key = config.apiKey { request.setValue(key, forHTTPHeaderField: "x-api-key") }
     let (data, response) = try await URLSession.shared.data(for: request)
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw NativeFeatureError.badResponse }
     guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw NativeFeatureError.badResponse }
+    return rows
+  }
+
+  private static func decodeAsset(_ item: [String: Any]) -> NativeAsset? {
+    guard let id = item["id"] as? String else { return nil }
+    let dateText = (item["localDateTime"] as? String) ?? (item["fileCreatedAt"] as? String) ?? ""
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    let date = formatter.date(from: dateText) ?? ISO8601DateFormatter().date(from: dateText) ?? .distantPast
+    return NativeAsset(id: id, date: date, isImage: (item["type"] as? String) != "VIDEO", isFavorite: item["isFavorite"] as? Bool ?? false, thumbhash: item["thumbhash"] as? String)
+  }
+
+  func serverAlbums() async throws -> [NativeServerAlbum] {
+    let rows = try await nativeArray(path: "albums")
     return rows.compactMap { row in
       guard let id = row["id"] as? String, let name = row["albumName"] as? String else { return nil }
       return NativeServerAlbum(id: id, name: name, count: row["assetCount"] as? Int ?? 0)
@@ -220,12 +261,13 @@ private final class NativeResultsModel: ObservableObject {
   @Published var error: String?
   @Published var next: String?
   private var cursors = Set<String>()
+  private var smartPage = 1
   private let client: NativeImmichClient
   init(_ client: NativeImmichClient) { self.client = client }
 
   func load(query: String? = nil, albumId: String? = nil, filter: [String: Any] = [:], reset: Bool = false) async {
     guard !loading else { return }
-    if reset { assets = []; next = nil; cursors = [] }
+    if reset { assets = []; next = nil; cursors = []; smartPage = 1 }
     else if !assets.isEmpty && next == nil { return }
     if let next, !cursors.insert(next).inserted { self.next = nil; return }
     loading = true
@@ -236,6 +278,27 @@ private final class NativeResultsModel: ObservableObject {
       var ids = Set(assets.map(\.id))
       assets += page.assets.filter { ids.insert($0.id).inserted }
       next = page.assets.isEmpty || page.next == next ? nil : page.next
+    } catch {
+      if let next { cursors.remove(next) }
+      self.error = error.localizedDescription
+    }
+  }
+
+  func clear() { assets = []; next = nil; smartPage = 1; cursors = [] }
+
+  func smart(query: String, filter: [String: Any] = [:], reset: Bool = false) async {
+    guard !loading else { return }
+    if reset { assets = []; next = nil; smartPage = 1 }
+    else if !assets.isEmpty && next == nil { return }
+    loading = true
+    error = nil
+    defer { loading = false }
+    do {
+      let response = try await client.smartSearch(query: query, page: smartPage, filter: filter)
+      var ids = Set(assets.map(\.id))
+      assets += response.assets.filter { ids.insert($0.id).inserted }
+      next = response.next
+      if next != nil { smartPage += 1 }
     } catch { self.error = error.localizedDescription }
   }
 }
@@ -322,6 +385,17 @@ private struct NativeSearchView: View {
   let client: NativeImmichClient
   @StateObject private var model: NativeResultsModel
   @State private var term = ""
+  @State private var submitted = ""
+  @State private var smartMode = false
+  @State private var explore: [NativeExploreSection] = []
+  @State private var exploreError: String?
+  @State private var filterPhotos = true
+  @State private var filterVideos = true
+  @State private var favoritesOnly = false
+  @State private var after = Date()
+  @State private var before = Date()
+  @State private var useAfter = false
+  @State private var useBefore = false
   init(client: NativeImmichClient) {
     self.client = client
     _model = StateObject(wrappedValue: NativeResultsModel(client))
@@ -329,21 +403,107 @@ private struct NativeSearchView: View {
   var body: some View {
     NavigationView {
       VStack(spacing: 0) {
-        TextField("搜索文件名", text: $term).textFieldStyle(.roundedBorder).padding()
-          .submitLabel(.search).onSubmit { Task { await model.load(query: term, reset: true) } }
-        if let error = model.error { Text(error).foregroundColor(.red); Button("重试") { Task { await model.load(query: term, reset: model.assets.isEmpty) } } }
-        if model.assets.isEmpty && !model.loading {
-          Spacer()
-          Text("输入文件名搜索服务器资产\n更多官方搜索筛选仍在迁移中")
-            .multilineTextAlignment(.center).foregroundColor(.secondary)
-          Spacer()
+        HStack {
+          TextField(smartMode ? "描述你要找的照片" : "搜索文件名、路径或描述", text: $term)
+            .textFieldStyle(.roundedBorder).submitLabel(.search)
+            .onSubmit { runSearch() }
+          if !term.isEmpty { Button { term = ""; runSearch() } label: { Image(systemName: "xmark.circle.fill") } }
+        }.padding(.horizontal)
+        HStack {
+          Picker("搜索方式", selection: $smartMode) {
+            Text("文件与信息").tag(false); Text("智能搜索").tag(true)
+          }.pickerStyle(.segmented)
+          Menu {
+            Toggle("照片", isOn: $filterPhotos)
+            Toggle("视频", isOn: $filterVideos)
+            Toggle("只看收藏", isOn: $favoritesOnly)
+            Toggle("开始日期", isOn: $useAfter)
+            Toggle("结束日期", isOn: $useBefore)
+          } label: { Image(systemName: "line.3.horizontal.decrease.circle").padding(8) }
+        }.padding(.horizontal)
+        if useAfter { DatePicker("从", selection: $after, displayedComponents: .date).padding(.horizontal) }
+        if useBefore { DatePicker("至", selection: $before, displayedComponents: .date).padding(.horizontal) }
+        if let error = model.error {
+          HStack { Text(error).font(.caption); Button("重试") { runSearch() } }.padding(8)
+        }
+        if submitted.isEmpty && model.assets.isEmpty && !model.loading && !favoritesOnly && !useAfter && !useBefore && filterPhotos && filterVideos {
+          ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+              if let exploreError { Text(exploreError).font(.caption); Button("重试探索") { Task { await loadExplore() } } }
+              ForEach(explore) { section in
+                VStack(alignment: .leading) {
+                  Text(section.id).font(.headline)
+                  ScrollView(.horizontal) {
+                    HStack {
+                      ForEach(section.items) { tile in
+                        Button { term = tile.name; runSearch() } label: {
+                          VStack(alignment: .leading) {
+                            if let asset = tile.asset { NativeThumbnail(client: client, asset: asset).frame(width: 108, height: 108).clipped() }
+                            Text(tile.name).font(.caption).lineLimit(1)
+                          }.frame(width: 108)
+                        }.buttonStyle(.plain)
+                      }
+                    }
+                  }
+                }
+              }
+              Text("本机尚未上传的照片不参与服务器语义搜索").font(.caption).foregroundColor(.secondary)
+            }.padding()
+          }
+        } else if model.assets.isEmpty && !model.loading {
+          Spacer(); Text("没有找到匹配的服务器照片").foregroundColor(.secondary); Spacer()
         } else {
-          NativeResultGrid(client: client, assets: model.assets, hasOlder: model.next != nil) { Task { await model.load(query: term) } }
+          NativeResultGrid(client: client, assets: model.assets, hasOlder: model.next != nil) {
+            Task { await fetch(reset: false) }
+          }
         }
         if model.loading { ProgressView().padding(8) }
       }
       .navigationTitle("搜索")
+      .task { await loadExplore() }
+      .onChange(of: smartMode) { _ in runSearch() }
+      .onChange(of: filterPhotos) { _ in runSearch() }
+      .onChange(of: filterVideos) { _ in runSearch() }
+      .onChange(of: favoritesOnly) { _ in runSearch() }
+      .onChange(of: useAfter) { _ in runSearch() }
+      .onChange(of: useBefore) { _ in runSearch() }
+      .onChange(of: after) { _ in if useAfter { runSearch() } }
+      .onChange(of: before) { _ in if useBefore { runSearch() } }
     }.navigationViewStyle(.stack)
+  }
+
+  private var filters: [String: Any] {
+    var value: [String: Any] = [:]
+    if filterPhotos != filterVideos { value["type"] = ["eq": filterPhotos ? "IMAGE" : "VIDEO"] }
+    if favoritesOnly { value["isFavorite"] = ["eq": true] }
+    let formatter = ISO8601DateFormatter()
+    if useAfter { value["takenAt"] = ["gte": formatter.string(from: after)] }
+    if useBefore {
+      var bounds = value["takenAt"] as? [String: String] ?? [:]
+      bounds["lte"] = formatter.string(from: Calendar.current.date(byAdding: .day, value: 1, to: before) ?? before)
+      value["takenAt"] = bounds
+    }
+    return value
+  }
+
+  private func runSearch() {
+    submitted = term.trimmingCharacters(in: .whitespacesAndNewlines)
+    Task { await fetch(reset: true) }
+  }
+
+  private func fetch(reset: Bool) async {
+    guard filterPhotos || filterVideos else {
+      if reset { model.clear() }
+      return
+    }
+    if smartMode && !submitted.isEmpty { await model.smart(query: submitted, filter: filters, reset: reset) }
+    else { await model.load(query: submitted.isEmpty ? nil : submitted, filter: filters, reset: reset) }
+  }
+
+  private func loadExplore() async {
+    guard explore.isEmpty else { return }
+    do { explore = try await client.explore(); exploreError = nil }
+    catch { exploreError = error.localizedDescription }
   }
 }
 

@@ -1,4 +1,5 @@
 import Foundation
+import Photos
 import Security
 import SwiftUI
 import UIKit
@@ -16,7 +17,7 @@ private func nativeData(for request: URLRequest, using session: URLSession = .sh
 
 // MARK: - Native session and API
 
-private struct NativeServerConfig: Codable {
+struct NativeServerConfig: Codable {
   var serverUrl: String
   var apiEndpoint: String?
   var accessToken: String?
@@ -124,7 +125,7 @@ private enum NativeAPIError: LocalizedError {
 }
 
 @MainActor
-private final class NativeImmichClient {
+final class NativeImmichClient {
   let config: NativeServerConfig
   private let session: URLSession
 
@@ -185,7 +186,7 @@ private final class NativeImmichClient {
     _ = try await send(path: "users/me")
   }
 
-  private func send(path: String, method: String = "GET", query: [URLQueryItem] = [], body: [String: Any]? = nil) async throws -> [String: Any] {
+  func send(path: String, method: String = "GET", query: [URLQueryItem] = [], body: [String: Any]? = nil) async throws -> [String: Any] {
     let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
     guard var components = URLComponents(string: base + "/" + path) else { throw NativeAPIError.invalidServer }
     if !query.isEmpty { components.queryItems = query }
@@ -193,8 +194,7 @@ private final class NativeImmichClient {
     var request = URLRequest(url: url)
     request.httpMethod = method
     request.setValue("application/json", forHTTPHeaderField: "Accept")
-    if let token = config.accessToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-    if let key = config.apiKey { request.setValue(key, forHTTPHeaderField: "x-api-key") }
+    applyAuth(to: &request)
     if let body {
       request.setValue("application/json", forHTTPHeaderField: "Content-Type")
       request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -226,16 +226,16 @@ private final class NativeImmichClient {
     guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw NativeAPIError.invalidResponse }
     return rows.compactMap { row in
       guard let id = row["timeBucket"] as? String else { return nil }
-      return NativeBucket(id: id, count: row["count"] as? Int ?? 0)
+      return NativeBucket(id: String(id.prefix(10)), count: row["count"] as? Int ?? 0)
     }
   }
 
   func assets(in bucket: NativeBucket) async throws -> [NativeAsset] {
     let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
     guard var components = URLComponents(string: base + "/timeline/bucket") else { throw NativeAPIError.invalidServer }
-    let bucketValue = bucket.id.count == 10 ? bucket.id + "T00:00:00.000Z" : bucket.id
+    // v3.2.4 /timeline/bucket accepts the YYYY-MM-DD bucket identifier.
     components.queryItems = [
-      URLQueryItem(name: "timeBucket", value: bucketValue),
+      URLQueryItem(name: "timeBucket", value: bucket.id),
       URLQueryItem(name: "order", value: "desc"),
       URLQueryItem(name: "orderBy", value: "takenAt"),
       URLQueryItem(name: "visibility", value: "timeline"),
@@ -280,6 +280,9 @@ private final class NativeImmichClient {
   }
 
   func imageData(for url: URL) async throws -> Data {
+    guard let endpoint = URL(string: config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")),
+          url.scheme == endpoint.scheme, url.host == endpoint.host, url.port == endpoint.port,
+          url.path.hasPrefix(endpoint.path + "/") else { throw NativeAPIError.invalidServer }
     var request = URLRequest(url: url)
     applyAuth(to: &request)
     let (data, response) = try await nativeData(for: request, using: session)
@@ -322,7 +325,7 @@ private struct NativeBucket: Identifiable {
   let count: Int
 }
 
-private struct NativeAsset: Identifiable {
+struct NativeAsset: Identifiable {
   let id: String
   let date: Date
   let isImage: Bool
@@ -343,7 +346,7 @@ struct NativeImmichRootView: View {
       if restoring {
         ProgressView("正在恢复登录状态…")
       } else if let config {
-        NativePhotosView(client: NativeImmichClient(config: config), onUseFlutter: onUseFlutter) {
+        NativeTabShell(client: NativeImmichClient(config: config), onUseFlutter: onUseFlutter) {
           NativeSessionStore.clear()
           self.config = nil
           restoreError = nil
@@ -545,19 +548,22 @@ private final class NativeTimelineModel: ObservableObject {
   }
 }
 
-private struct NativePhotosView: View {
+struct NativePhotosView: View {
   let client: NativeImmichClient
+  @ObservedObject var device: NativeDeviceLibrary
   let onUseFlutter: () -> Void
   let onLogout: () -> Void
   @StateObject private var model: NativeTimelineModel
   @State private var zoom: CGFloat = 1
   @State private var zoomStart: CGFloat = 1
   @State private var selected: NativeAsset?
+  @State private var selectedLocal: NativeDeviceAsset?
   @State private var loadingOlderAnchor: String?
   @State private var initialPositioned = false
 
-  init(client: NativeImmichClient, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void) {
+  init(client: NativeImmichClient, device: NativeDeviceLibrary, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void) {
     self.client = client
+    self.device = device
     self.onUseFlutter = onUseFlutter
     self.onLogout = onLogout
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
@@ -587,26 +593,33 @@ private struct NativePhotosView: View {
                     .padding(.top, 12)
                     .frame(maxWidth: .infinity, alignment: .leading)
                   LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
-                    ForEach(group.assets) { asset in
-                      Button { selected = asset } label: {
-                        NativeThumbnail(client: client, asset: asset)
-                          .frame(width: tileWidth(in: geometry.size.width), height: tileWidth(in: geometry.size.width))
-                          .clipped()
-                          .overlay(alignment: .bottomTrailing) {
-                            if !asset.isImage {
-                              Image(systemName: "video.fill")
-                                .font(.caption2)
-                                .foregroundColor(.white)
-                                .padding(5)
-                                .shadow(radius: 2)
-                            }
-                          }
+                    ForEach(group.assets) { entry in
+                      Button {
+                        selected = entry.server
+                        selectedLocal = entry.local
+                      } label: {
+                        Group {
+                          if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
+                          else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
+                        }
+                        .frame(width: tileWidth(in: geometry.size.width), height: tileWidth(in: geometry.size.width))
+                        .clipped()
+                        .overlay(alignment: .bottomTrailing) {
+                          if entry.local != nil { Image(systemName: "iphone").foregroundColor(.white).padding(5) }
+                          else if entry.server?.isImage == false { Image(systemName: "video.fill").foregroundColor(.white).padding(5) }
+                        }
                       }
                       .buttonStyle(.plain)
-                      .id(asset.id)
+                      .id(entry.id)
                     }
                   }
                 }
+              }
+              if device.authorized && !device.assets.isEmpty {
+                Text("本机与服务器同一时间轴 · 尚未核实去重")
+                  .font(.footnote).foregroundColor(.secondary).padding(.horizontal)
+              } else if !device.authorized {
+                Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding()
               }
               if model.isLoading { ProgressView().padding() }
               if let message = model.error {
@@ -628,15 +641,20 @@ private struct NativePhotosView: View {
             await Task.yield()
             withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
           }
+          .onChange(of: device.assets.count) { _ in
+            guard !initialPositioned, !mergedAssets.isEmpty else { return }
+            withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+            initialPositioned = true
+          }
           .onAppear {
             guard model.assets.isEmpty, !model.isLoading else { return }
             Task {
               await model.loadInitial()
               await Task.yield()
-              if !model.assets.isEmpty {
+              if !mergedAssets.isEmpty && !initialPositioned {
                 withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+                initialPositioned = true
               }
-              initialPositioned = true
             }
           }
         }
@@ -664,14 +682,20 @@ private struct NativePhotosView: View {
       .sheet(item: $selected) { asset in
         NativeAssetViewer(client: client, asset: asset)
       }
+      .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
     }
     .navigationViewStyle(.stack)
     .animation(.interactiveSpring(response: 0.22, dampingFraction: 0.82), value: zoom)
   }
 
+  private var mergedAssets: [NativeGridItem] {
+    (model.assets.map { NativeGridItem(server: $0, local: nil) }
+      + device.assets.map { NativeGridItem(server: nil, local: $0) })
+      .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
+  }
+
   private var dayGroups: [NativeDayGroup] {
-    let calendar = Calendar.current
-    let groups = Dictionary(grouping: model.assets) { calendar.startOfDay(for: $0.date) }
+    let groups = Dictionary(grouping: mergedAssets) { Calendar.current.startOfDay(for: $0.date) }
     return groups.keys.sorted().map { NativeDayGroup(date: $0, assets: groups[$0] ?? []) }
   }
 
@@ -683,7 +707,7 @@ private struct NativePhotosView: View {
 
   private func requestOlder(proxy: ScrollViewProxy) {
     guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading else { return }
-    let anchor = model.assets.first?.id
+    let anchor = mergedAssets.first?.id
     loadingOlderAnchor = anchor ?? "pending"
     Task {
       await model.loadOlder()
@@ -698,10 +722,10 @@ private struct NativePhotosView: View {
 
 private struct NativeDayGroup {
   let date: Date
-  let assets: [NativeAsset]
+  let assets: [NativeGridItem]
 }
 
-private struct NativeThumbnail: View {
+struct NativeThumbnail: View {
   let client: NativeImmichClient
   let asset: NativeAsset
   @State private var image: UIImage?
@@ -725,7 +749,7 @@ private struct NativeThumbnail: View {
   }
 }
 
-private struct NativeAssetViewer: View {
+struct NativeAssetViewer: View {
   let client: NativeImmichClient
   let asset: NativeAsset
   @Environment(\.dismiss) private var dismiss
@@ -735,7 +759,10 @@ private struct NativeAssetViewer: View {
     NavigationView {
       ZStack {
         Color.black.ignoresSafeArea()
-        if let image { Image(uiImage: image).resizable().scaledToFit() }
+        if !asset.isImage {
+          Text("视频播放尚未迁移；请从“使用完整应用”打开视频。")
+            .foregroundColor(.white).multilineTextAlignment(.center).padding()
+        } else if let image { Image(uiImage: image).resizable().scaledToFit() }
         else { ProgressView().tint(.white) }
       }
       .navigationBarTitleDisplayMode(.inline)
@@ -748,7 +775,7 @@ private struct NativeAssetViewer: View {
         }
       }
       .task {
-        guard let url = client.originalURL(for: asset) else { return }
+        guard asset.isImage, let url = client.originalURL(for: asset) else { return }
         if let data = try? await client.imageData(for: url) { image = UIImage(data: data) }
       }
     }

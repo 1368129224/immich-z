@@ -521,7 +521,7 @@ private final class NativeTimelineModel: ObservableObject {
     do {
       error = nil
       try await loadNextPage()
-    } catch { error = error.localizedDescription }
+    } catch { self.error = error.localizedDescription }
   }
 
   func retry() async {

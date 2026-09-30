@@ -664,13 +664,19 @@ def emit_operation(m: str, p: str, op: dict, out: list):
         base = rt
         if base.startswith("List<"):
             inner = base[5:-1]
+            if inner == "String":
+                # e is dynamic: e?.toString() is String? which cannot fill
+                # List<String>. Drop nulls and stringify the rest.
+                str_map = "where((e) => e != null).map((e) => e.toString()).toList()"
+            else:
+                str_map = "map((e) => %s).toList()" % parse_expr(inner, "e")
             out.append("    final raw = res.data;")
             out.append("    if (raw is List) {")
-            out.append("      return raw.map((e) => %s).toList();" % parse_expr(inner, "e"))
+            out.append("      return raw.%s;" % str_map)
             out.append("    }")
             out.append("    if (raw is Map && raw['items'] is List) {")
             out.append("      final items = raw['items'] as List;")
-            out.append("      return items.map((e) => %s).toList();" % parse_expr(inner, "e"))
+            out.append("      return items.%s;" % str_map)
             out.append("    }")
             out.append("    return <Never>[] as List<%s>;" % inner)
         elif base == "String":

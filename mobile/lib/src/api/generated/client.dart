@@ -1402,11 +1402,11 @@ class ImmichApiClient {
     );
     final raw = res.data;
     if (raw is List) {
-      return raw.map((e) => e?.toString()).toList();
+      return raw.where((e) => e != null).map((e) => e.toString()).toList();
     }
     if (raw is Map && raw['items'] is List) {
       final items = raw['items'] as List;
-      return items.map((e) => e?.toString()).toList();
+      return items.where((e) => e != null).map((e) => e.toString()).toList();
     }
     return <Never>[] as List<String>;
   }
@@ -3246,11 +3246,11 @@ class ImmichApiClient {
     );
     final raw = res.data;
     if (raw is List) {
-      return raw.map((e) => e?.toString()).toList();
+      return raw.where((e) => e != null).map((e) => e.toString()).toList();
     }
     if (raw is Map && raw['items'] is List) {
       final items = raw['items'] as List;
-      return items.map((e) => e?.toString()).toList();
+      return items.where((e) => e != null).map((e) => e.toString()).toList();
     }
     return <Never>[] as List<String>;
   }

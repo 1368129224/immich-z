@@ -194,6 +194,7 @@ extension NativeImmichClient {
       "orderBy": ["field": "fileCreatedAt", "direction": "desc"],
     ]
     if !terms.isEmpty { payload["filter"] = terms }
+    if terms["trashedAt"] != nil { payload["withDeleted"] = true }
     if let cursor { payload["cursor"] = cursor }
     let result = try await send(path: "search/metadata", method: "POST", body: payload)
     guard let page = result["assets"] as? [String: Any], let items = page["items"] as? [[String: Any]] else { throw NativeFeatureError.badResponse }
@@ -593,31 +594,60 @@ private struct NativeAlbumDetail: View {
 private struct NativeLibraryView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
+  @State private var features: [String: Any] = [:]
+
   var body: some View {
     NavigationView {
       List {
         Section("快捷入口") {
           NavigationLink("收藏") { NativeFilteredView(client: client, title: "收藏", filter: ["isFavorite": ["eq": true]]) }
           NavigationLink("归档") { NativeFilteredView(client: client, title: "归档", filter: ["visibility": ["eq": "archive"]]) }
-          NavigationLink("共享链接 · 使用完整应用") { NativeFallbackNote() }
-          NavigationLink("回收站 · 使用完整应用") { NativeFallbackNote() }
+          NavigationLink("共享链接") {
+            NativeLibrarySection(client: client, title: "共享链接", path: "shared-links", query: []) { row in
+              guard let id = row["id"] as? String else { return nil }
+              return LibraryRow(id: id, title: row["description"] as? String ?? row["slug"] as? String ?? "共享链接", detail: row["type"] as? String ?? "", assetID: nil)
+            }
+          }
+          if features["trash"] as? Bool == true {
+            NavigationLink("回收站") { NativeFilteredView(client: client, title: "回收站", filter: ["trashedAt": ["ne": NSNull()]]) }
+          }
         }
         Section("集合") {
-          NavigationLink("人物 · 使用完整应用") { NativeFallbackNote() }
-          NavigationLink("地点 · 使用完整应用") { NativeFallbackNote() }
+          if features["facialRecognition"] as? Bool != false { NavigationLink("人物") { NativePeopleView(client: client) } }
+          if features["map"] as? Bool != false { NavigationLink("地点") { NativePlacesView(client: client) } }
           NavigationLink("本机") {
             if device.authorized { NativeDeviceGrid(title: "本机照片", assets: device.assets) }
             else { Button("允许访问设备相册") { Task { await device.requestAccess() } } }
           }
-          NavigationLink("回忆 · 使用完整应用") { NativeFallbackNote() }
+          NavigationLink("回忆") {
+            NativeLibrarySection(client: client, title: "回忆", path: "memories", query: []) { row in
+              guard let id = row["id"] as? String else { return nil }
+              return LibraryRow(id: id, title: row["type"] as? String ?? "回忆", detail: row["memoryAt"] as? String ?? "", assetID: nil)
+            }
+          }
         }
         Section("快捷访问") {
-          ForEach(["文件夹", "锁定文件夹", "伙伴共享"], id: \.self) { name in
-            NavigationLink("\(name) · 使用完整应用") { NativeFallbackNote() }
+          NavigationLink("服务器文件夹") { NativeFoldersView(client: client) }
+          NavigationLink("锁定文件夹 · 使用完整应用") { NativeFallbackNote() }
+          NavigationLink("伙伴共享") {
+            NativeLibrarySection(client: client, title: "伙伴共享", path: "partners", query: [URLQueryItem(name: "direction", value: "shared-by")]) { row in
+              guard let id = row["id"] as? String else { return nil }
+              return LibraryRow(id: id, title: row["name"] as? String ?? row["email"] as? String ?? "伙伴", detail: row["email"] as? String ?? "", assetID: nil)
+            }
+          }
+          NavigationLink("标签") {
+            NativeLibrarySection(client: client, title: "标签", path: "tags", query: []) { row in
+              guard let id = row["id"] as? String else { return nil }
+              return LibraryRow(id: id, title: row["value"] as? String ?? row["name"] as? String ?? "标签", detail: "", assetID: id)
+            }
           }
         }
       }
       .navigationTitle("资源库")
+      .task {
+        do { features = try await client.send(path: "server/features") }
+        catch { features = [:] }
+      }
     }.navigationViewStyle(.stack)
   }
 }
@@ -626,7 +656,7 @@ private struct NativeFallbackNote: View {
   var body: some View { Text("此功能尚未迁移到 Swift。请返回照片页菜单，选择“使用完整应用”。").padding() }
 }
 
-private struct NativeFilteredView: View {
+struct NativeFilteredView: View {
   let client: NativeImmichClient
   let title: String
   let filter: [String: Any]

@@ -10,6 +10,7 @@
 		A41000000000000000000001 /* NativeImmichApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A41000000000000000000002 /* NativeImmichApp.swift */; };
 		A41000000000000000000003 /* NativeFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = A41000000000000000000004 /* NativeFeatures.swift */; };
 		A41000000000000000000005 /* NativeCloudStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A41000000000000000000006 /* NativeCloudStatus.swift */; };
+		A41000000000000000000007 /* NativeLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A41000000000000000000008 /* NativeLibrary.swift */; };
 		1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */ = {isa = PBXBuildFile; fileRef = 1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */; };
 		331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C807B294A618700263BE5 /* RunnerTests.swift */; };
 		3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */ = {isa = PBXBuildFile; fileRef = 3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */; };
@@ -46,6 +47,7 @@
 		A41000000000000000000002 /* NativeImmichApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeImmichApp.swift; sourceTree = "<group>"; };
 		A41000000000000000000004 /* NativeFeatures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeFeatures.swift; sourceTree = "<group>"; };
 		A41000000000000000000006 /* NativeCloudStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeCloudStatus.swift; sourceTree = "<group>"; };
+		A41000000000000000000008 /* NativeLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeLibrary.swift; sourceTree = "<group>"; };
 		1498D2321E8E86230040F4C2 /* GeneratedPluginRegistrant.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = GeneratedPluginRegistrant.h; sourceTree = "<group>"; };
 		1498D2331E8E89220040F4C2 /* GeneratedPluginRegistrant.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = GeneratedPluginRegistrant.m; sourceTree = "<group>"; };
 		331C807B294A618700263BE5 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
@@ -125,6 +127,7 @@
 				A41000000000000000000002 /* NativeImmichApp.swift */,
 				A41000000000000000000004 /* NativeFeatures.swift */,
 				A41000000000000000000006 /* NativeCloudStatus.swift */,
+				A41000000000000000000008 /* NativeLibrary.swift */,
 				74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */,
 			);
 			path = Runner;
@@ -281,6 +284,7 @@
 				A41000000000000000000001 /* NativeImmichApp.swift in Sources */,
 				A41000000000000000000003 /* NativeFeatures.swift in Sources */,
 				A41000000000000000000005 /* NativeCloudStatus.swift in Sources */,
+				A41000000000000000000007 /* NativeLibrary.swift in Sources */,
 				1498D2341E8E89220040F4C2 /* GeneratedPluginRegistrant.m in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

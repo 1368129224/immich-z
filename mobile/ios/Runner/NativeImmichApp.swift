@@ -320,7 +320,7 @@ private extension Array {
   subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }
 
-private struct NativeBucket: Identifiable {
+struct NativeBucket: Identifiable {
   let id: String
   let count: Int
 }

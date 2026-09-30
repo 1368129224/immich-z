@@ -6,20 +6,30 @@ import 'package:immich_z/src/repositories/search_repository.dart';
 void main() {
   group('timeline bucket mapping', () {
     test('uses file creation date and preserves image/video flags', () {
-      final bucket = TimeBucketAssetResponseDto(
-        id: const ['image-id', 'video-id'],
-        fileCreatedAt: const [
+      final bucket = TimeBucketAssetResponseDto.fromJson({
+        'id': ['image-id', 'video-id'],
+        'duration': [null, 1500],
+        'latitude': [null, 37.5],
+        'fileCreatedAt': [
           '2025-03-04T12:00:00.000Z',
           '2025-03-03T12:00:00.000Z',
         ],
-        isImage: const [true, false],
-      );
+        'isImage': [true, false],
+      });
 
       final assets = flattenBucket(bucket);
 
       expect(assets.map((asset) => asset.id), ['image-id', 'video-id']);
       expect(assets.map((asset) => asset.isImage), [true, false]);
       expect(assets.first.createdAt.toUtc(), DateTime.utc(2025, 3, 4, 12));
+      expect(assets.map((asset) => asset.duration), [null, '1500']);
+      expect(assets.map((asset) => asset.latitude), [null, 37.5]);
+    });
+  });
+
+  group('empty search ordering', () {
+    test('uses the complete metadata cursor query for an empty filter', () {
+      expect(const SearchFilter().toJson(), isEmpty);
     });
   });
 

@@ -1,7 +1,7 @@
 name: immich_z
 description: A feature-complete Immich client for iOS and Android, built from the public Immich REST API.
 publish_to: "none"
-version: 0.0.1+2
+version: 0.0.1+3
 
 environment:
   sdk: ">=3.5.0 <4.0.0"

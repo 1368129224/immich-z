@@ -94,6 +94,9 @@ treat CI as the source of truth for builds.
   - `List<String>` mapping must be null-safe:
     `where((e) => e != null).map((e) => e.toString()).toList()`
     (`e?.toString()` yields `List<String?>` → compile error).
+- Numeric array fields whose OpenAPI `items` are nullable must filter nulls
+  before casting (`whereType<num>()`); never emit `(e as num)` directly for
+  these arrays (e.g. timeline `duration` is null for still images).
   - No `catchError((_) => null)` for non-nullable futures; use explicit
     `try { x = await …; } catch (_) { x = null; }`.
 - After changing the generator or spec, regenerate + `flutter analyze`.

@@ -20,8 +20,10 @@ final searchResultsProvider =
     FutureProvider<List<AssetResponseDto>>((ref) async {
   final query = ref.watch(searchQueryProvider).trim();
   final mode = ref.watch(searchModeProvider);
-  if (query.isEmpty) return <AssetResponseDto>[];
   final repo = ref.watch(searchRepositoryProvider);
+  if (query.isEmpty) {
+    return repo.metadataAll(filter: const SearchFilter());
+  }
   if (mode == SearchMode.smart) {
     final hits = await repo.smart(query: query);
     return sortAssetsNewestFirst(
@@ -36,7 +38,7 @@ final searchResultsProvider =
   );
 });
 
-/// Search page: natural-language (CLIP) search, filter chips, explore grid.
+/// Search page: natural-language (CLIP) search and full-library browsing.
 class SearchScreen extends ConsumerStatefulWidget {
   const SearchScreen({super.key});
 
@@ -110,115 +112,60 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
           ),
         ],
       ),
-      body: !_dirty
-          ? _ExploreGrid()
-          : results.when(
-              loading: () => const Center(child: CircularProgressIndicator()),
-              error: (e, _) => Center(child: Text('$e')),
-              data: (items) {
-                if (items.isEmpty) {
-                  return const Center(child: Text('No results'));
-                }
-                return GridView.builder(
-                  padding: const EdgeInsets.all(2),
-                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                    crossAxisCount: 3,
-                    mainAxisSpacing: 2,
-                    crossAxisSpacing: 2,
-                  ),
-                  itemCount: items.length,
-                  itemBuilder: (context, i) {
-                    final a = items[i];
-                    return GestureDetector(
-                      onTap: () => context.push(
-                        '${AppRoutes.viewer}?ids=${Uri.encodeComponent(
-                          items.map((e) => e.id ?? '').join(','),
-                        )}&index=$i',
-                      ),
-                      child: Stack(
-                        fit: StackFit.expand,
-                        children: [
-                          ThumbhashPlaceholder(thumbhash: a.thumbhash),
-                          ImmichNetworkImage(
-                            imageUrl: _thumbnailUrl(a.id ?? ''),
-                            fit: BoxFit.cover,
-                            memCacheWidth: 400,
-                            errorWidget: (_, __, ___) =>
-                                const Icon(Icons.broken_image),
-                          ),
-                          if (a.type == AssetTypeEnum.vIDEO)
-                            const Align(
-                              alignment: Alignment.bottomRight,
-                              child: Padding(
-                                padding: EdgeInsets.all(4),
-                                child:
-                                    Icon(Icons.play_circle_outline, size: 18),
-                              ),
-                            ),
-                        ],
-                      ),
-                    );
-                  },
-                );
-              },
+      body: results.when(
+        loading: () => const Center(child: CircularProgressIndicator()),
+        error: (e, _) => Center(child: Text('$e')),
+        data: (items) {
+          if (items.isEmpty) {
+            return Center(
+              child: Text(_dirty ? 'No results' : 'Nothing to show'),
+            );
+          }
+          return GridView.builder(
+            padding: const EdgeInsets.all(2),
+            gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+              crossAxisCount: 3,
+              mainAxisSpacing: 2,
+              crossAxisSpacing: 2,
             ),
+            itemCount: items.length,
+            itemBuilder: (context, i) {
+              final a = items[i];
+              return GestureDetector(
+                onTap: () => context.push(
+                  '${AppRoutes.viewer}?ids=${Uri.encodeComponent(
+                    items.map((e) => e.id ?? '').join(','),
+                  )}&index=$i',
+                ),
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    ThumbhashPlaceholder(thumbhash: a.thumbhash),
+                    ImmichNetworkImage(
+                      imageUrl: _thumbnailUrl(a.id ?? ''),
+                      fit: BoxFit.cover,
+                      memCacheWidth: 400,
+                      errorWidget: (_, __, ___) =>
+                          const Icon(Icons.broken_image),
+                    ),
+                    if (a.type == AssetTypeEnum.vIDEO)
+                      const Align(
+                        alignment: Alignment.bottomRight,
+                        child: Padding(
+                          padding: EdgeInsets.all(4),
+                          child: Icon(Icons.play_circle_outline, size: 18),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            },
+          );
+        },
+      ),
     );
   }
 
   String _thumbnailUrl(String id) =>
       ref.read(assetRepositoryProvider).thumbnailUrl(id);
-}
-
-/// "Explore" grid shown before the user types: a random sample of the library.
-class _ExploreGrid extends ConsumerWidget {
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final repo = ref.watch(searchRepositoryProvider);
-    return FutureBuilder<List<AssetResponseDto>>(
-      future: repo.random(size: 60),
-      builder: (context, snap) {
-        if (!snap.hasData) {
-          return snap.hasError
-              ? Center(child: Text('${snap.error}'))
-              : const Center(child: CircularProgressIndicator());
-        }
-        final items = sortAssetsNewestFirst(snap.data!);
-        if (items.isEmpty) {
-          return const Center(child: Text('Nothing to explore'));
-        }
-        return GridView.builder(
-          padding: const EdgeInsets.all(2),
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-            crossAxisCount: 3,
-            mainAxisSpacing: 2,
-            crossAxisSpacing: 2,
-          ),
-          itemCount: items.length,
-          itemBuilder: (context, i) {
-            final a = items[i];
-            return GestureDetector(
-              onTap: () => context.push(
-                '${AppRoutes.viewer}?ids=${Uri.encodeComponent(
-                  items.map((e) => e.id ?? '').join(','),
-                )}&index=$i',
-              ),
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  ThumbhashPlaceholder(thumbhash: a.thumbhash),
-                  ImmichNetworkImage(
-                    imageUrl: ref
-                        .read(assetRepositoryProvider)
-                        .thumbnailUrl(a.id ?? ''),
-                    fit: BoxFit.cover,
-                    memCacheWidth: 400,
-                  ),
-                ],
-              ),
-            );
-          },
-        );
-      },
-    );
-  }
 }

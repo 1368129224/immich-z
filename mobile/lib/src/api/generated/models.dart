@@ -12285,24 +12285,24 @@ class TagsUpdate {
 }
 
 class TimeBucketAssetResponseDto {
-  final List<String>? city;
-  final List<String>? country;
+  final List<String?>? city;
+  final List<String?>? country;
   final List<String>? createdAt;
-  final List<int>? duration;
+  final List<int?>? duration;
   final List<String>? fileCreatedAt;
   final List<String>? id;
   final List<bool>? isFavorite;
   final List<bool>? isImage;
   final List<bool>? isTrashed;
-  final List<double>? latitude;
-  final List<String>? livePhotoVideoId;
+  final List<double?>? latitude;
+  final List<String?>? livePhotoVideoId;
   final List<double>? localOffsetHours;
-  final List<double>? longitude;
+  final List<double?>? longitude;
   final List<String>? ownerId;
-  final List<String>? projectionType;
+  final List<String?>? projectionType;
   final List<double>? ratio;
-  final List<List<String>>? stack;
-  final List<String>? thumbhash;
+  final List<List<String>?>? stack;
+  final List<String?>? thumbhash;
   final List<AssetVisibility>? visibility;
 
   const TimeBucketAssetResponseDto({
@@ -12330,69 +12330,69 @@ class TimeBucketAssetResponseDto {
   factory TimeBucketAssetResponseDto.fromJson(Map<String, dynamic>? json) {
     if (json == null) return const TimeBucketAssetResponseDto();
     return TimeBucketAssetResponseDto(
-      city: ((json["city"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
-      country: ((json["country"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
+      city: ((json["city"] as List<dynamic>?)?.map((e) => e?.toString()).toList()),
+      country: ((json["country"] as List<dynamic>?)?.map((e) => e?.toString()).toList()),
       createdAt: ((json["createdAt"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
-      duration: (json["duration"] as List<dynamic>?)?.map((e) => (e as num).toInt()).toList(),
+      duration: ((json["duration"] as List<dynamic>?)?.map((e) => (e as num?)?.toInt()).toList()),
       fileCreatedAt: ((json["fileCreatedAt"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
       id: ((json["id"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
       isFavorite: ((json["isFavorite"] as List<dynamic>?)?.map((e) => (e as bool?)).whereType<bool>().toList()),
       isImage: ((json["isImage"] as List<dynamic>?)?.map((e) => (e as bool?)).whereType<bool>().toList()),
       isTrashed: ((json["isTrashed"] as List<dynamic>?)?.map((e) => (e as bool?)).whereType<bool>().toList()),
-      latitude: ((json["latitude"] as List<dynamic>?)?.map((e) => (e as num?)?.toDouble()).whereType<double>().toList()),
-      livePhotoVideoId: ((json["livePhotoVideoId"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
+      latitude: ((json["latitude"] as List<dynamic>?)?.map((e) => (e as num?)?.toDouble()).toList()),
+      livePhotoVideoId: ((json["livePhotoVideoId"] as List<dynamic>?)?.map((e) => e?.toString()).toList()),
       localOffsetHours: ((json["localOffsetHours"] as List<dynamic>?)?.map((e) => (e as num?)?.toDouble()).whereType<double>().toList()),
-      longitude: ((json["longitude"] as List<dynamic>?)?.map((e) => (e as num?)?.toDouble()).whereType<double>().toList()),
+      longitude: ((json["longitude"] as List<dynamic>?)?.map((e) => (e as num?)?.toDouble()).toList()),
       ownerId: ((json["ownerId"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
-      projectionType: ((json["projectionType"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
+      projectionType: ((json["projectionType"] as List<dynamic>?)?.map((e) => e?.toString()).toList()),
       ratio: ((json["ratio"] as List<dynamic>?)?.map((e) => (e as num?)?.toDouble()).whereType<double>().toList()),
-      stack: ((json["stack"] as List<dynamic>?)?.map((e) => ((e as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList())).whereType<List<String>>().toList()),
-      thumbhash: ((json["thumbhash"] as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList()),
+      stack: ((json["stack"] as List<dynamic>?)?.map((e) => ((e as List<dynamic>?)?.map((e) => e?.toString()).whereType<String>().toList())).toList()),
+      thumbhash: ((json["thumbhash"] as List<dynamic>?)?.map((e) => e?.toString()).toList()),
       visibility: ((json["visibility"] as List<dynamic>?)?.map((e) => _assetVisibilityFromJson(e?.toString())).whereType<AssetVisibility>().toList()),
     );
   }
 
   Map<String, dynamic> toJson() => {
-    if (city != null) "city": city,
-    if (country != null) "country": country,
+    if (city != null) "city": city?.map((e) => e).toList(),
+    if (country != null) "country": country?.map((e) => e).toList(),
     if (createdAt != null) "createdAt": createdAt,
-    if (duration != null) "duration": duration,
+    if (duration != null) "duration": duration?.map((e) => e).toList(),
     if (fileCreatedAt != null) "fileCreatedAt": fileCreatedAt,
     if (id != null) "id": id,
     if (isFavorite != null) "isFavorite": isFavorite,
     if (isImage != null) "isImage": isImage,
     if (isTrashed != null) "isTrashed": isTrashed,
-    if (latitude != null) "latitude": latitude,
-    if (livePhotoVideoId != null) "livePhotoVideoId": livePhotoVideoId,
+    if (latitude != null) "latitude": latitude?.map((e) => e).toList(),
+    if (livePhotoVideoId != null) "livePhotoVideoId": livePhotoVideoId?.map((e) => e).toList(),
     if (localOffsetHours != null) "localOffsetHours": localOffsetHours,
-    if (longitude != null) "longitude": longitude,
+    if (longitude != null) "longitude": longitude?.map((e) => e).toList(),
     if (ownerId != null) "ownerId": ownerId,
-    if (projectionType != null) "projectionType": projectionType,
+    if (projectionType != null) "projectionType": projectionType?.map((e) => e).toList(),
     if (ratio != null) "ratio": ratio,
     if (stack != null) "stack": stack?.map((e) => e).toList(),
-    if (thumbhash != null) "thumbhash": thumbhash,
+    if (thumbhash != null) "thumbhash": thumbhash?.map((e) => e).toList(),
     if (visibility != null) "visibility": visibility?.map((e) => e?.value).toList(),
   };
 
   TimeBucketAssetResponseDto copyWith({
-    List<String>? city,
-    List<String>? country,
+    List<String?>? city,
+    List<String?>? country,
     List<String>? createdAt,
-    List<int>? duration,
+    List<int?>? duration,
     List<String>? fileCreatedAt,
     List<String>? id,
     List<bool>? isFavorite,
     List<bool>? isImage,
     List<bool>? isTrashed,
-    List<double>? latitude,
-    List<String>? livePhotoVideoId,
+    List<double?>? latitude,
+    List<String?>? livePhotoVideoId,
     List<double>? localOffsetHours,
-    List<double>? longitude,
+    List<double?>? longitude,
     List<String>? ownerId,
-    List<String>? projectionType,
+    List<String?>? projectionType,
     List<double>? ratio,
-    List<List<String>>? stack,
-    List<String>? thumbhash,
+    List<List<String>?>? stack,
+    List<String?>? thumbhash,
     List<AssetVisibility>? visibility,
   }) {
     return TimeBucketAssetResponseDto(

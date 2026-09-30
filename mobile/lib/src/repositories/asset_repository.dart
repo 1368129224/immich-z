@@ -322,14 +322,16 @@ DateTime? _date(List<String>? list, int i) {
   return v == null ? null : DateTime.tryParse(v);
 }
 
-String? _str(List<String>? list, int i) =>
-    (list != null && i < list.length && list[i].isNotEmpty) ? list[i] : null;
+String? _str(List<String?>? list, int i) {
+  final value = list != null && i < list.length ? list[i] : null;
+  return value == null || value.isEmpty ? null : value;
+}
 
-double? _num(List<double>? list, int i) =>
+double? _num(List<double?>? list, int i) =>
     (list != null && i < list.length) ? list[i] : null;
 
-String? _dur(List<int>? list, int i) =>
-    (list != null && i < list.length) ? list[i].toString() : null;
+String? _dur(List<int?>? list, int i) =>
+    (list != null && i < list.length) ? list[i]?.toString() : null;
 
 bool _flag(List<bool>? list, int i, {bool fallback = false}) =>
     (list != null && i < list.length) ? list[i] : fallback;
@@ -339,5 +341,5 @@ String? _visibility(List<AssetVisibility>? list, int i) {
   return list[i].value;
 }
 
-int? _stackCount(List<List<String>>? list, int i) =>
-    (list != null && i < list.length) ? list[i].length : null;
+int? _stackCount(List<List<String>?>? list, int i) =>
+    (list != null && i < list.length) ? list[i]?.length : null;

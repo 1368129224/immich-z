@@ -191,7 +191,11 @@ def dart_type(schema: dict | None, nullable_override: bool = False) -> str:
     if t == "boolean":
         return "bool"
     if t == "array":
-        return "List<%s>" % dart_type(schema.get("items") or {})
+        item_schema = schema.get("items") or {}
+        item_type = dart_type(item_schema)
+        if item_type != "dynamic" and is_nullable(item_schema):
+            item_type += "?"
+        return "List<%s>" % item_type
     if t == "object":
         addl = schema.get("additionalProperties")
         if isinstance(addl, dict) and addl:
@@ -364,6 +368,9 @@ def parse_expr(t: str, expr: str) -> str:
         inner = m.group(1)
         if inner == "dynamic":
             return "(%s as List<dynamic>?)" % expr
+        if inner.endswith("?"):
+            return "((%s as List<dynamic>?)?.map((e) => %s).toList())" % (
+                expr, parse_expr(inner, "e"))
         return "((%s as List<dynamic>?)?.map((e) => %s).whereType<%s>().toList())" % (
             expr, parse_expr(inner, "e"), inner)
     m = re.match(r"^Map<String, (.+)>$", t)

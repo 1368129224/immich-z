@@ -174,7 +174,14 @@ class SessionController extends StateNotifier<SessionState> {
 
   Future<void> restore() async {
     state = state.copyWith(isLoading: true, clearError: true);
-    final cfg = await _store.readServerConfig();
+    ServerConfig? cfg;
+    try {
+      cfg = await _store.readServerConfig();
+    } catch (e) {
+      // Storage must never wedge the login screen: fall through logged out.
+      state = SessionState(isLoading: false, error: e.toString());
+      return;
+    }
     if (cfg == null || cfg.accessToken == null) {
       state = SessionState(isLoading: false);
       return;

@@ -1,7 +1,10 @@
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// Everything the app needs to reach a server, persisted in the platform
 /// keystore / keychain.
@@ -65,8 +68,58 @@ class SecureStore {
     (ref) => SecureStore(const FlutterSecureStorage(aOptions: _android)),
   );
 
+  static const _prefsPrefix = 'secure_fallback.';
+
+  Future<String?> _readRaw(String key) async {
+    try {
+      final v = await _storage.read(key: key);
+      if (v != null) return v;
+    } on PlatformException catch (e) {
+      debugPrint('SecureStore: keychain read failed, trying prefs: $e');
+    } catch (e) {
+      debugPrint('SecureStore: secure read failed, trying prefs: $e');
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString('$_prefsPrefix$key');
+    } catch (e) {
+      debugPrint('SecureStore: prefs read failed: $e');
+      return null;
+    }
+  }
+
+  Future<void> _writeRaw(String key, String value) async {
+    try {
+      await _storage.write(key: key, value: value);
+      // Keychain works: drop any stale prefs mirror.
+      try {
+        final prefs = await SharedPreferences.getInstance();
+        await prefs.remove('$_prefsPrefix$key');
+      } catch (_) {}
+      return;
+    } on PlatformException catch (e) {
+      debugPrint('SecureStore: keychain write failed, using prefs: $e');
+    } catch (e) {
+      debugPrint('SecureStore: secure write failed, using prefs: $e');
+    }
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('$_prefsPrefix$key', value);
+  }
+
+  Future<void> _deleteRaw(String key) async {
+    try {
+      await _storage.delete(key: key);
+    } catch (e) {
+      debugPrint('SecureStore: secure delete failed: $e');
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('$_prefsPrefix$key');
+    } catch (_) {}
+  }
+
   Future<ServerConfig?> readServerConfig() async {
-    final raw = await _storage.read(key: _kServerConfig);
+    final raw = await _readRaw(_kServerConfig);
     if (raw == null || raw.isEmpty) return null;
     try {
       return ServerConfig.fromJson(jsonDecode(raw) as Map<String, dynamic>);
@@ -76,7 +129,7 @@ class SecureStore {
   }
 
   Future<void> writeServerConfig(ServerConfig c) =>
-      _storage.write(key: _kServerConfig, value: jsonEncode(c.toJson()));
+      _writeRaw(_kServerConfig, jsonEncode(c.toJson()));
 
-  Future<void> clearServerConfig() => _storage.delete(key: _kServerConfig);
+  Future<void> clearServerConfig() => _deleteRaw(_kServerConfig);
 }

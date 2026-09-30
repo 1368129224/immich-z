@@ -61,18 +61,16 @@ class ImmichApiClient {
     Options? options,
     ProgressCallback? onSendProgress,
     CancelToken? cancelToken}) async {
-    final uri = Uri.parse('$baseUrl$path').replace(
-      queryParameters: (queryParameters ?? const {})
-          .map((k, v) => MapEntry(k, v?.toString()))
-          .cast<String, dynamic>(),
-    );
+    final params =
+        Map<String, dynamic>.from(queryParameters ?? const {});
+    params.removeWhere((k, v) => v == null);
     try {
       return await _dio.fetch<dynamic>(
         RequestOptions(
           method: method,
           path: path,
           baseUrl: baseUrl,
-          queryParameters: (queryParameters ?? const {})..removeWhere((k, v) => v == null),
+          queryParameters: params,
           data: data,
           responseType: responseType ?? ResponseType.json,
           onSendProgress: onSendProgress,

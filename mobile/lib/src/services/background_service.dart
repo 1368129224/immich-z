@@ -6,7 +6,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
 
 import '../api/generated/client.dart';
-import '../api/generated/models.dart';
 import 'device_media_service.dart';
 import 'notification_service.dart';
 import 'upload_service.dart';

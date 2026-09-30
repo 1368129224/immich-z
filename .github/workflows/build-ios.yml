@@ -50,19 +50,37 @@ jobs:
       - run: flutter config --no-analytics
       - run: flutter pub get
 
-      # No signing identity is available, so skip CocoaPods codesign setup.
-      - name: Build unsigned .app
-        run: flutter build ios --release --no-codesign
+      # flutter build ios always validates the Development Team for device
+      # builds (even with --no-codesign), so generate the Xcode project with
+      # Flutter and then compile it directly with signing disabled — the same
+      # approach as a manual `xcodebuild CODE_SIGNING_ALLOWED=NO` build.
+      - name: Generate iOS project (no build)
+        run: flutter build ios --config-only --no-codesign
+
+      - name: Install CocoaPods dependencies
+        run: cd ios && pod install
+
+      - name: Build unsigned .app with xcodebuild
+        run: |
+          xcodebuild \
+            -workspace ios/Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/ios/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
 
       - name: Package .app into an .ipa
         run: |
-          APP="build/ios/iphoneos/Runner.app"
+          APP="build/ios/DerivedData/Build/Products/Release-iphoneos/Runner.app"
           test -d "$APP" || { echo "::error::$APP not found"; exit 1; }
           rm -rf Payload && mkdir Payload
-          # cp -R (not ln -s): zip stores symlinks as symlinks unless -y,
-          # which produces a broken Payload.
           cp -R "$APP" Payload/
-          zip -qry ImmichZ-unsigned.ipa Payload
+          /usr/bin/zip --symlinks -qry ImmichZ-unsigned.ipa Payload
           ls -lh ImmichZ-unsigned.ipa
 
       - name: Upload unsigned IPA

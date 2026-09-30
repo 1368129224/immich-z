@@ -5,7 +5,6 @@ import 'package:go_router/go_router.dart';
 
 import '../../api/generated/models.dart';
 import '../../providers/repository_providers.dart';
-import '../../providers/session_provider.dart';
 import '../../providers/theme_provider.dart';
 import '../../repositories/asset_repository.dart';
 import '../../routing/app_router.dart';

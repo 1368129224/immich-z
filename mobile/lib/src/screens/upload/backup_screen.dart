@@ -2,11 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../../providers/repository_providers.dart';
-import '../../providers/session_provider.dart';
 import '../../services/background_service.dart';
 import '../../services/device_media_service.dart';
 import '../../services/upload_service.dart';
-import '../../utils/format.dart';
 
 /// Backup configuration: which albums to sync, Wi-Fi/charging constraints and
 /// the manual "start now" trigger.

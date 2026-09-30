@@ -6,7 +6,6 @@ import 'package:go_router/go_router.dart';
 import '../../api/generated/models.dart';
 import '../../providers/repository_providers.dart';
 import '../../routing/app_router.dart';
-import '../../utils/format.dart';
 import '../../widgets/thumbhash_placeholder.dart';
 
 /// Which search backend is currently driving the results.

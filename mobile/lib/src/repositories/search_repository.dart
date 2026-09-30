@@ -1,8 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:collection/collection.dart';
-
 import '../api/generated/client.dart';
 import '../api/generated/models.dart';
 

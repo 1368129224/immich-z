@@ -6,7 +6,6 @@ import 'package:go_router/go_router.dart';
 import '../../api/generated/models.dart';
 import '../../providers/repository_providers.dart';
 import '../../routing/app_router.dart';
-import '../../utils/format.dart';
 
 final albumsProvider = FutureProvider<List<AlbumResponseDto>>((ref) async {
   return ref.watch(albumRepositoryProvider).all();

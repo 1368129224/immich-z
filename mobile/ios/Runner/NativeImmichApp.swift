@@ -1,0 +1,757 @@
+import Foundation
+import Security
+import SwiftUI
+import UIKit
+
+@MainActor
+private func nativeData(from url: URL, using session: URLSession = .shared) async throws -> (Data, URLResponse) {
+  let (data, response) = try await session.data(from: url)
+  return (data, response)
+}
+
+private func nativeData(for request: URLRequest, using session: URLSession = .shared) async throws -> (Data, URLResponse) {
+  let (data, response) = try await session.data(for: request)
+  return (data, response)
+}
+
+// MARK: - Native session and API
+
+private struct NativeServerConfig: Codable {
+  var serverUrl: String
+  var apiEndpoint: String?
+  var accessToken: String?
+  var apiKey: String?
+  var deviceId: String?
+
+  var credential: String? { accessToken ?? apiKey }
+}
+
+private enum NativeSessionStore {
+  private static let service = "flutter_secure_storage_service"
+  private static let legacyService = "com.it_nomads.flutter_secure_storage_service"
+  private static let account = "immich.server_config"
+  private static let fallbackKey = "flutter.secure_fallback.immich.server_config"
+  private static let unprefixedFallbackKey = "secure_fallback.immich.server_config"
+
+  static func read() -> NativeServerConfig? {
+    var query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+      kSecReturnData as String: true,
+      kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    // FlutterSecureStorage stores the key as the generic-password account.
+    var result: CFTypeRef?
+    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    if status == errSecSuccess, let data = result as? Data,
+       let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
+      return config
+    }
+
+    // Search known legacy service name and service-less variants as well.
+    query[kSecAttrService as String] = legacyService
+    result = nil
+    if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+       let data = result as? Data,
+       let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
+      return config
+    }
+    query.removeValue(forKey: kSecAttrService as String)
+    result = nil
+    if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+       let data = result as? Data,
+       let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
+      return config
+    }
+    // Preserve compatibility with Flutter's documented SharedPreferences
+    // fallback used by unsigned iOS builds without Keychain entitlements.
+    for key in [fallbackKey, unprefixedFallbackKey] {
+      if let raw = UserDefaults.standard.string(forKey: key),
+         let data = raw.data(using: .utf8),
+         let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
+        return config
+      }
+    }
+    // SharedPreferences persists fallback values in a plist dictionary.
+    if let preferences = readPreferencesFallback() {
+      return try? JSONDecoder().decode(NativeServerConfig.self, from: preferences)
+    }
+    return nil
+  }
+
+  static func save(_ config: NativeServerConfig) throws {
+    let data = try JSONEncoder().encode(config)
+    let query: [String: Any] = [
+      kSecClass as String: kSecClassGenericPassword,
+      kSecAttrService as String: service,
+      kSecAttrAccount as String: account,
+    ]
+    let attributes: [String: Any] = [kSecValueData as String: data]
+    let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+    let writeStatus: OSStatus
+    if status == errSecItemNotFound {
+      var insert = query
+      insert[kSecValueData as String] = data
+      writeStatus = SecItemAdd(insert as CFDictionary, nil)
+    } else {
+      writeStatus = status
+    }
+    if writeStatus == errSecSuccess {
+      UserDefaults.standard.removeObject(forKey: fallbackKey)
+      UserDefaults.standard.removeObject(forKey: unprefixedFallbackKey)
+    } else {
+      // SharedPreferences uses the flutter. prefix for the legacy API.
+      UserDefaults.standard.set(String(data: data, encoding: .utf8), forKey: fallbackKey)
+    }
+  }
+}
+
+private enum NativeAPIError: LocalizedError {
+  case invalidServer
+  case unauthorized
+  case http(Int, String)
+  case invalidResponse
+
+  var errorDescription: String? {
+    switch self {
+    case .invalidServer: return "无法连接 Immich 服务器，请检查服务器地址。"
+    case .unauthorized: return "认证失败。请检查服务器地址和凭据。"
+    case let .http(code, message): return "服务器请求失败（\(code)）：\(message)"
+    case .invalidResponse: return "服务器返回了无法识别的数据。"
+    }
+  }
+}
+
+@MainActor
+private final class NativeImmichClient {
+  let config: NativeServerConfig
+  private let session: URLSession
+
+  init(config: NativeServerConfig, session: URLSession = .shared) {
+    self.config = config
+    self.session = session
+  }
+
+  static func normalize(_ raw: String) -> String {
+    var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if !value.hasPrefix("http://") && !value.hasPrefix("https://") { value = "https://" + value }
+    while value.hasSuffix("/") { value.removeLast() }
+    return value
+  }
+
+  static func discover(_ raw: String) async throws -> String {
+    let base = normalize(raw)
+    guard let url = URL(string: base), url.host != nil else { throw NativeAPIError.invalidServer }
+    var candidates = [String]()
+    if let wellKnown = URL(string: base + "/.well-known/immich"),
+       let (data, response) = try? await nativeData(from: wellKnown),
+       (response as? HTTPURLResponse)?.statusCode == 200,
+       let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+       let api = object["api"] as? String, !api.isEmpty {
+      candidates.append(api.hasPrefix("http") ? api : base + api)
+    }
+    candidates.append(contentsOf: [base + "/api", base])
+    for candidate in candidates {
+      guard let ping = URL(string: candidate + "/server/ping"),
+            let (data, response) = try? await nativeData(from: ping),
+            (response as? HTTPURLResponse)?.statusCode == 200,
+            let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+      let pong = (object["res"] as? String) == "pong" || (object["res"] as? Bool) == true
+      guard pong else { continue }
+      return candidate
+    }
+    throw NativeAPIError.invalidServer
+  }
+
+  static func login(server: String, email: String, password: String) async throws -> NativeServerConfig {
+    let endpoint = try await discover(server)
+    let temporary = NativeImmichClient(config: NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint))
+    let result = try await temporary.send(path: "auth/login", method: "POST", body: ["email": email, "password": password])
+    guard let token = result["accessToken"] as? String, !token.isEmpty else { throw NativeAPIError.invalidResponse }
+    let config = NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint, accessToken: token)
+    try await NativeImmichClient(config: config).verifySession()
+    return config
+  }
+
+  static func login(server: String, apiKey: String) async throws -> NativeServerConfig {
+    let endpoint = try await discover(server)
+    let config = NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint, apiKey: apiKey)
+    try await NativeImmichClient(config: config).verifySession()
+    return config
+  }
+
+  func verifySession() async throws {
+    _ = try await send(path: "users/me")
+  }
+
+  private func send(path: String, method: String = "GET", query: [URLQueryItem] = [], body: [String: Any]? = nil) async throws -> [String: Any] {
+    let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
+    guard var components = URLComponents(string: base + "/" + path) else { throw NativeAPIError.invalidServer }
+    if !query.isEmpty { components.queryItems = query }
+    guard let url = components.url else { throw NativeAPIError.invalidServer }
+    var request = URLRequest(url: url)
+    request.httpMethod = method
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    if let token = config.accessToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    if let key = config.apiKey { request.setValue(key, forHTTPHeaderField: "x-api-key") }
+    if let body {
+      request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+      request.httpBody = try JSONSerialization.data(withJSONObject: body)
+    }
+    let (data, response) = try await nativeData(for: request, using: session)
+    guard let http = response as? HTTPURLResponse else { throw NativeAPIError.invalidResponse }
+    guard (200..<300).contains(http.statusCode) else {
+      if http.statusCode == 401 || http.statusCode == 403 { throw NativeAPIError.unauthorized }
+      let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["message"] as? String ?? ""
+      throw NativeAPIError.http(http.statusCode, message)
+    }
+    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NativeAPIError.invalidResponse }
+    return object
+  }
+
+  func timelineBuckets() async throws -> [NativeBucket] {
+    let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
+    guard var components = URLComponents(string: base + "/timeline/buckets") else { throw NativeAPIError.invalidServer }
+    components.queryItems = [
+      URLQueryItem(name: "order", value: "desc"),
+      URLQueryItem(name: "orderBy", value: "takenAt"),
+      URLQueryItem(name: "visibility", value: "timeline"),
+    ]
+    guard let url = components.url else { throw NativeAPIError.invalidServer }
+    var request = URLRequest(url: url)
+    applyAuth(to: &request)
+    let (data, response) = try await nativeData(for: request, using: session)
+    try check(response: response, data: data)
+    guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw NativeAPIError.invalidResponse }
+    return rows.compactMap { row in
+      guard let id = row["timeBucket"] as? String else { return nil }
+      return NativeBucket(id: id, count: row["count"] as? Int ?? 0)
+    }
+  }
+
+  func assets(in bucket: NativeBucket) async throws -> [NativeAsset] {
+    let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
+    guard var components = URLComponents(string: base + "/timeline/bucket") else { throw NativeAPIError.invalidServer }
+    let bucketValue = bucket.id.count == 10 ? bucket.id + "T00:00:00.000Z" : bucket.id
+    components.queryItems = [
+      URLQueryItem(name: "timeBucket", value: bucketValue),
+      URLQueryItem(name: "order", value: "desc"),
+      URLQueryItem(name: "orderBy", value: "takenAt"),
+      URLQueryItem(name: "visibility", value: "timeline"),
+    ]
+    guard let url = components.url else { throw NativeAPIError.invalidServer }
+    var request = URLRequest(url: url)
+    applyAuth(to: &request)
+    let (data, response) = try await nativeData(for: request, using: session)
+    try check(response: response, data: data)
+    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let ids = object["id"] as? [Any] else { throw NativeAPIError.invalidResponse }
+    func strings(_ key: String) -> [Any] { object[key] as? [Any] ?? [] }
+    let dates = strings("fileCreatedAt")
+    let created = strings("createdAt")
+    let images = strings("isImage")
+    let favorites = strings("isFavorite")
+    let hashes = strings("thumbhash")
+    return ids.enumerated().compactMap { index, rawID in
+      guard let id = rawID as? String else { return nil }
+      let dateString = (dates[safe: index] as? String) ?? (created[safe: index] as? String) ?? bucket.id
+      let date = ISO8601DateFormatter().date(from: dateString) ?? Self.parseDate(dateString) ?? .distantPast
+      return NativeAsset(
+        id: id,
+        date: date,
+        isImage: images[safe: index] as? Bool ?? true,
+        isFavorite: favorites[safe: index] as? Bool ?? false,
+        thumbhash: hashes[safe: index] as? String
+      )
+    }
+  }
+
+  func originalURL(for asset: NativeAsset) -> URL? {
+    let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
+    return URL(string: base + "/assets/\(asset.id)/original")
+  }
+
+  func thumbnailURL(for asset: NativeAsset) -> URL? {
+    let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
+    var components = URLComponents(string: base + "/assets/\(asset.id)/thumbnail")
+    components?.queryItems = [URLQueryItem(name: "size", value: "thumbnail")]
+    return components?.url
+  }
+
+  func imageData(for url: URL) async throws -> Data {
+    var request = URLRequest(url: url)
+    applyAuth(to: &request)
+    let (data, response) = try await nativeData(for: request, using: session)
+    try check(response: response, data: data)
+    return data
+  }
+
+  private func applyAuth(to request: inout URLRequest) {
+    request.setValue(config.deviceId ?? "immichz-ios", forHTTPHeaderField: "x-immich-device-id")
+    if let token = config.accessToken { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
+    if let key = config.apiKey { request.setValue(key, forHTTPHeaderField: "x-api-key") }
+  }
+
+  private func check(response: URLResponse, data: Data) throws {
+    guard let http = response as? HTTPURLResponse else { throw NativeAPIError.invalidResponse }
+    guard (200..<300).contains(http.statusCode) else {
+      if http.statusCode == 401 || http.statusCode == 403 { throw NativeAPIError.unauthorized }
+      throw NativeAPIError.http(http.statusCode, "")
+    }
+  }
+
+  private static func parseDate(_ value: String) -> Date? {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    for format in ["yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX", "yyyy-MM-dd'T'HH:mm:ssXXXXX", "yyyy-MM-dd"] {
+      formatter.dateFormat = format
+      if let date = formatter.date(from: value) { return date }
+    }
+    return nil
+  }
+}
+
+private extension Array {
+  subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
+}
+
+private struct NativeBucket: Identifiable {
+  let id: String
+  let count: Int
+}
+
+private struct NativeAsset: Identifiable {
+  let id: String
+  let date: Date
+  let isImage: Bool
+  let isFavorite: Bool
+  let thumbhash: String?
+}
+
+// MARK: - SwiftUI app and login
+
+struct NativeImmichRootView: View {
+  let onUseFlutter: () -> Void
+  @State private var config: NativeServerConfig?
+  @State private var restoring = true
+  @State private var restoreError: String?
+
+  var body: some View {
+    Group {
+      if restoring {
+        ProgressView("正在恢复登录状态…")
+      } else if let config {
+        NativePhotosView(client: NativeImmichClient(config: config), onUseFlutter: onUseFlutter) {
+          NativeSessionStore.clear()
+          self.config = nil
+          restoreError = nil
+        }
+      } else {
+        NativeLoginView(error: restoreError, onUseFlutter: onUseFlutter) { config = $0 }
+      }
+    }
+    .task {
+      guard restoring else { return }
+      if let saved = NativeSessionStore.read(), saved.credential != nil {
+        do {
+          try await NativeImmichClient(config: saved).verifySession()
+          config = saved
+        } catch {
+          if let apiError = error as? NativeAPIError, case .unauthorized = apiError {
+            NativeSessionStore.clear()
+            restoreError = error.localizedDescription
+          } else {
+            // Keep credentials across offline or transient server failures.
+            restoreError = error.localizedDescription
+            config = saved
+          }
+        }
+      }
+      restoring = false
+    }
+  }
+}
+
+private extension NativeSessionStore {
+  static func clear() {
+    let services: [String?] = [service, legacyService, nil]
+    for serviceName in services {
+      var query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrAccount as String: account,
+      ]
+      if let serviceName {
+        query[kSecAttrService as String] = serviceName
+      }
+      SecItemDelete(query as CFDictionary)
+    }
+    UserDefaults.standard.removeObject(forKey: fallbackKey)
+    UserDefaults.standard.removeObject(forKey: unprefixedFallbackKey)
+  }
+
+  private static func readPreferencesFallback() -> Data? {
+    guard let bundleId = Bundle.main.bundleIdentifier,
+          let preferencesUrl = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Preferences", isDirectory: true)
+            .appendingPathComponent("\(bundleId).plist"),
+          let dictionary = NSDictionary(contentsOf: preferencesUrl) as? [String: Any],
+          let raw = (dictionary[fallbackKey] ?? dictionary[unprefixedFallbackKey]) as? String else {
+      return nil
+    }
+    return raw.data(using: .utf8)
+  }
+}
+
+private struct NativeLoginView: View {
+  let error: String?
+  let onUseFlutter: () -> Void
+  let onLogin: (NativeServerConfig) -> Void
+  @State private var server = ""
+  @State private var email = ""
+  @State private var password = ""
+  @State private var apiKey = ""
+  @State private var useAPIKey = false
+  @State private var busy = false
+  @State private var loginError: String?
+
+  var body: some View {
+    NavigationView {
+      Form {
+        Section {
+          TextField("https://immich.example.com", text: $server)
+            .textInputAutocapitalization(.never)
+            .keyboardType(.URL)
+            .autocorrectionDisabled()
+          Toggle("使用 API Key 登录", isOn: $useAPIKey)
+        } header: { Text("Immich 服务器") }
+
+        Section {
+          if useAPIKey {
+            SecureField("API Key", text: $apiKey)
+              .textInputAutocapitalization(.never)
+              .autocorrectionDisabled()
+          } else {
+            TextField("邮箱", text: $email)
+              .textInputAutocapitalization(.never)
+              .keyboardType(.emailAddress)
+              .autocorrectionDisabled()
+            SecureField("密码", text: $password)
+          }
+        } header: { Text("登录凭据") }
+
+        if let message = loginError ?? error {
+          Section { Text(message).foregroundColor(.red) }
+        }
+
+        Section {
+          Button {
+            Task { await login() }
+          } label: {
+            HStack {
+              Spacer()
+              if busy { ProgressView() } else { Text("登录") }
+              Spacer()
+            }
+          }
+          .disabled(busy || server.isEmpty || (useAPIKey ? apiKey.isEmpty : email.isEmpty || password.isEmpty))
+        }
+      }
+      .navigationTitle("Immich")
+      .toolbar {
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Button("使用完整应用", action: onUseFlutter)
+        }
+      }
+    }
+    .navigationViewStyle(.stack)
+  }
+
+  @MainActor private func login() async {
+    busy = true
+    loginError = nil
+    defer { busy = false }
+    do {
+      let value = useAPIKey
+        ? try await NativeImmichClient.login(server: server, apiKey: apiKey)
+        : try await NativeImmichClient.login(server: server, email: email, password: password)
+      try NativeSessionStore.save(value)
+      onLogin(value)
+    } catch {
+      loginError = error.localizedDescription
+    }
+  }
+}
+
+// MARK: - Native Photos timeline
+
+@MainActor
+private final class NativeTimelineModel: ObservableObject {
+  @Published private(set) var assets: [NativeAsset] = []
+  @Published private(set) var isLoading = false
+  @Published private(set) var hasOlder = true
+  @Published var error: String?
+
+  private let client: NativeImmichClient
+  private var buckets: [NativeBucket] = []
+  private var nextBucket = 0
+  private let pageSize = 4
+
+  init(client: NativeImmichClient) { self.client = client }
+
+  func loadInitial() async {
+    guard !isLoading else { return }
+    isLoading = true
+    error = nil
+    defer { isLoading = false }
+    do {
+      buckets = try await client.timelineBuckets()
+      nextBucket = 0
+      assets = []
+      hasOlder = !buckets.isEmpty
+      try await loadNextPage()
+    } catch { self.error = error.localizedDescription }
+  }
+
+  func loadOlder() async {
+    guard !isLoading, hasOlder else { return }
+    isLoading = true
+    defer { isLoading = false }
+    do {
+      error = nil
+      try await loadNextPage()
+    } catch { error = error.localizedDescription }
+  }
+
+  func retry() async {
+    if buckets.isEmpty {
+      await loadInitial()
+    } else {
+      await loadOlder()
+    }
+  }
+
+  private func loadNextPage() async throws {
+    guard nextBucket < buckets.count else { hasOlder = false; return }
+    let end = min(nextBucket + pageSize, buckets.count)
+    let page = buckets[nextBucket..<end]
+    var result: [NativeAsset] = []
+    for bucket in page { result.append(contentsOf: try await client.assets(in: bucket)) }
+    nextBucket = end
+    hasOlder = nextBucket < buckets.count
+    var seen = Set<String>()
+    assets = (assets + result).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
+  }
+}
+
+private struct NativePhotosView: View {
+  let client: NativeImmichClient
+  let onUseFlutter: () -> Void
+  let onLogout: () -> Void
+  @StateObject private var model: NativeTimelineModel
+  @State private var zoom: CGFloat = 1
+  @State private var zoomStart: CGFloat = 1
+  @State private var selected: NativeAsset?
+  @State private var loadingOlderAnchor: String?
+  @State private var initialPositioned = false
+
+  init(client: NativeImmichClient, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void) {
+    self.client = client
+    self.onUseFlutter = onUseFlutter
+    self.onLogout = onLogout
+    _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
+  }
+
+  private var minimumTile: CGFloat { min(420, max(48, 92 * zoom)) }
+  private let bottomAnchor = "timeline-bottom-anchor"
+
+  var body: some View {
+    NavigationView {
+      GeometryReader { geometry in
+        ScrollViewReader { proxy in
+          ScrollView {
+            LazyVStack(spacing: 2) {
+              if model.hasOlder && !model.assets.isEmpty {
+                ProgressView()
+                  .frame(maxWidth: .infinity)
+                  .padding(.vertical, 16)
+                  .id("older-loader")
+                  .onAppear { if initialPositioned { requestOlder(proxy: proxy) } }
+              }
+              ForEach(dayGroups, id: \.date) { group in
+                VStack(alignment: .leading, spacing: 3) {
+                  Text(group.date, style: .date)
+                    .font(.headline)
+                    .padding(.horizontal, 12)
+                    .padding(.top, 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                  LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
+                    ForEach(group.assets) { asset in
+                      Button { selected = asset } label: {
+                        NativeThumbnail(client: client, asset: asset)
+                          .frame(width: tileWidth(in: geometry.size.width), height: tileWidth(in: geometry.size.width))
+                          .clipped()
+                          .overlay(alignment: .bottomTrailing) {
+                            if !asset.isImage {
+                              Image(systemName: "video.fill")
+                                .font(.caption2)
+                                .foregroundColor(.white)
+                                .padding(5)
+                                .shadow(radius: 2)
+                            }
+                          }
+                      }
+                      .buttonStyle(.plain)
+                      .id(asset.id)
+                    }
+                  }
+                }
+              }
+              if model.isLoading { ProgressView().padding() }
+              if let message = model.error {
+                VStack(spacing: 8) {
+                  Text(message).font(.footnote).multilineTextAlignment(.center)
+                  Button("重试") { Task { await model.retry() } }
+                }.padding()
+              }
+              // Newest photos are at the bottom; older pages are inserted above.
+              Color.clear.frame(height: 1).id(bottomAnchor)
+            }
+          }
+          .background(Color(uiColor: .systemBackground))
+          .simultaneousGesture(MagnificationGesture()
+            .onChanged { value in zoom = min(4.5, max(0.52, zoomStart * value)) }
+            .onEnded { _ in zoomStart = zoom })
+          .refreshable {
+            await model.loadInitial()
+            await Task.yield()
+            withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+          }
+          .onAppear {
+            guard model.assets.isEmpty, !model.isLoading else { return }
+            Task {
+              await model.loadInitial()
+              await Task.yield()
+              if !model.assets.isEmpty {
+                withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+              }
+              initialPositioned = true
+            }
+          }
+        }
+      }
+      .navigationTitle("照片")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .navigationBarLeading) {
+          Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
+        }
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Menu {
+            Button(action: { Task { await model.loadInitial() } }) {
+              Label("刷新", systemImage: "arrow.clockwise")
+            }
+            Button(action: onUseFlutter) {
+              Label("使用完整应用", systemImage: "square.grid.2x2")
+            }
+            Button(action: onLogout) {
+              Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
+            }
+          } label: { Image(systemName: "ellipsis.circle") }
+        }
+      }
+      .sheet(item: $selected) { asset in
+        NativeAssetViewer(client: client, asset: asset)
+      }
+    }
+    .navigationViewStyle(.stack)
+    .animation(.interactiveSpring(response: 0.22, dampingFraction: 0.82), value: zoom)
+  }
+
+  private var dayGroups: [NativeDayGroup] {
+    let calendar = Calendar.current
+    let groups = Dictionary(grouping: model.assets) { calendar.startOfDay(for: $0.date) }
+    return groups.keys.sorted().map { NativeDayGroup(date: $0, assets: groups[$0] ?? []) }
+  }
+
+  private func tileWidth(in width: CGFloat) -> CGFloat {
+    let gap: CGFloat = 2
+    let columns = max(1, Int((width + gap) / (minimumTile + gap)))
+    return (width - CGFloat(columns - 1) * gap) / CGFloat(columns)
+  }
+
+  private func requestOlder(proxy: ScrollViewProxy) {
+    guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading else { return }
+    let anchor = model.assets.first?.id
+    loadingOlderAnchor = anchor ?? "pending"
+    Task {
+      await model.loadOlder()
+      if let anchor {
+        await Task.yield()
+        withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) }
+      }
+      loadingOlderAnchor = nil
+    }
+  }
+}
+
+private struct NativeDayGroup {
+  let date: Date
+  let assets: [NativeAsset]
+}
+
+private struct NativeThumbnail: View {
+  let client: NativeImmichClient
+  let asset: NativeAsset
+  @State private var image: UIImage?
+
+  var body: some View {
+    Group {
+      if let image {
+        Image(uiImage: image).resizable().scaledToFill()
+      } else {
+        Rectangle().fill(Color(uiColor: .secondarySystemBackground))
+          .overlay { ProgressView().scaleEffect(0.7) }
+      }
+    }
+    .task(id: asset.id) {
+      guard let url = client.thumbnailURL(for: asset) else { return }
+      do {
+        let data = try await client.imageData(for: url)
+        image = UIImage(data: data)
+      } catch { image = nil }
+    }
+  }
+}
+
+private struct NativeAssetViewer: View {
+  let client: NativeImmichClient
+  let asset: NativeAsset
+  @Environment(\.dismiss) private var dismiss
+  @State private var image: UIImage?
+
+  var body: some View {
+    NavigationView {
+      ZStack {
+        Color.black.ignoresSafeArea()
+        if let image { Image(uiImage: image).resizable().scaledToFit() }
+        else { ProgressView().tint(.white) }
+      }
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .navigationBarLeading) {
+          Button("关闭") { dismiss() }.foregroundColor(.white)
+        }
+        ToolbarItem(placement: .principal) {
+          Text(asset.date, style: .date).foregroundColor(.white)
+        }
+      }
+      .task {
+        guard let url = client.originalURL(for: asset) else { return }
+        if let data = try? await client.imageData(for: url) { image = UIImage(data: data) }
+      }
+    }
+    .navigationViewStyle(.stack)
+  }
+}

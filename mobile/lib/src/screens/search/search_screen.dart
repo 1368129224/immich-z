@@ -56,7 +56,6 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
   Widget build(BuildContext context) {
     final mode = ref.watch(searchModeProvider);
     final results = ref.watch(searchResultsProvider);
-    final theme = Theme.of(context);
 
     return Scaffold(
       appBar: AppBar(
@@ -113,7 +112,6 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
                 if (items.isEmpty) {
                   return const Center(child: Text('No results'));
                 }
-                final repo = ref.read(searchRepositoryProvider);
                 return GridView.builder(
                   padding: const EdgeInsets.all(2),
                   gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(

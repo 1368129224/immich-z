@@ -207,9 +207,18 @@ class SessionController extends StateNotifier<SessionState> {
     final c = _client;
     if (c == null) return;
     try {
-      final version = await c.getServerVersion().catchError((_) => null);
-      final config = await c.getUserConfig().catchError((_) => null);
-      final oauth = await c.getAuthStatus().catchError((_) => null);
+      ServerVersionResponseDto? version;
+      UserConfigDto? config;
+      try {
+        version = await c.getServerVersion();
+      } catch (_) {
+        version = null;
+      }
+      try {
+        config = await c.getUserConfig();
+      } catch (_) {
+        config = null;
+      }
       state = state.copyWith(
         serverVersion: version,
         capabilities: ServerCapabilities(

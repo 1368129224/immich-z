@@ -190,8 +190,6 @@ class _AssetPageState extends ConsumerState<_AssetPage> {
   Widget build(BuildContext context) {
     final repo = ref.read(assetRepositoryProvider);
     final value = widget.asset;
-    final isVideo =
-        value?.value?.type == AssetTypeEnum.vIDEO || value?.value == null;
 
     // While the asset is unknown, render the image endpoint; the server
     // returns a thumbnail-prefixed original that works for both.

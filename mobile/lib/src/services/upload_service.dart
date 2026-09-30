@@ -358,7 +358,6 @@ class UploadService {
           continue;
         }
 
-        final length = await file.length();
         final bytes = await file.readAsBytes();
         final res = await client.uploadAsset(
           bytes,
@@ -366,7 +365,7 @@ class UploadService {
           deviceAssetId: item.localId,
           deviceId: 'immich-z-${Platform.operatingSystem}',
           fileCreatedAt: item.createdAt,
-          fileModifiedAt: await asset.modifiedDateTime,
+          fileModifiedAt: asset.modifiedDateTime,
           isFavorite: false,
           onSendProgress: (sent, total) {
             final p = total == 0 ? 0.0 : sent / total;

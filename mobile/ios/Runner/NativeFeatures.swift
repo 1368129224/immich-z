@@ -72,7 +72,7 @@ struct NativeDeviceThumbnail: View {
       let options = PHImageRequestOptions()
       options.isNetworkAccessAllowed = false
       options.deliveryMode = .opportunistic
-      PHImageManager.default().requestImage(for: source, targetSize: CGSize(width: 320, height: 320), contentMode: .aspectFill, options: options) { result, _ in
+      PHImageManager.default().requestImage(for: source, targetSize: CGSize(width: 240, height: 240), contentMode: .aspectFill, options: options) { result, _ in
         Task { @MainActor in image = result }
       }
     }

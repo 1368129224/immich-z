@@ -554,6 +554,7 @@ struct NativePhotosView: View {
   let onUseFlutter: () -> Void
   let onLogout: () -> Void
   @StateObject private var model: NativeTimelineModel
+  @StateObject private var cloud = NativeCloudStatus()
   @State private var zoom: CGFloat = 1
   @State private var zoomStart: CGFloat = 1
   @State private var selected: NativeAsset?
@@ -569,7 +570,7 @@ struct NativePhotosView: View {
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
   }
 
-  private var minimumTile: CGFloat { min(420, max(48, 92 * zoom)) }
+  private var minimumTile: CGFloat { min(420, max(24, 92 * zoom)) }
   private let bottomAnchor = "timeline-bottom-anchor"
 
   var body: some View {
@@ -586,13 +587,7 @@ struct NativePhotosView: View {
                   .onAppear { if initialPositioned { requestOlder(proxy: proxy) } }
               }
               ForEach(dayGroups, id: \.date) { group in
-                VStack(alignment: .leading, spacing: 3) {
-                  Text(group.date, style: .date)
-                    .font(.headline)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 12)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                  LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
                     ForEach(group.assets) { entry in
                       Button {
                         selected = entry.server
@@ -604,59 +599,77 @@ struct NativePhotosView: View {
                         }
                         .frame(width: tileWidth(in: geometry.size.width), height: tileWidth(in: geometry.size.width))
                         .clipped()
-                        .overlay(alignment: .bottomTrailing) {
-                          if entry.local != nil { Image(systemName: "iphone").foregroundColor(.white).padding(5) }
-                          else if entry.server?.isImage == false { Image(systemName: "video.fill").foregroundColor(.white).padding(5) }
+                        .overlay(alignment: .topLeading) {
+                          if entry.id == group.assets.first?.id {
+                            Text(group.date, style: .date).font(.caption2).bold()
+                              .foregroundColor(.white).lineLimit(1).minimumScaleFactor(0.6)
+                              .padding(3).background(.black.opacity(0.65)).allowsHitTesting(false)
+                          }
                         }
+                        .overlay(alignment: .bottomTrailing) {
+                          Image(systemName: cloudSymbol(for: entry))
+                            .font(.system(size: minimumTile < 44 ? 10 : 15, weight: .semibold))
+                            .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            .padding(3)
+                        }
+                        .accessibilityLabel("\(entry.date.formatted()), \(cloudDescription(for: entry))")
                       }
                       .buttonStyle(.plain)
                       .id(entry.id)
                     }
                   }
-                }
               }
-              if device.authorized && !device.assets.isEmpty {
-                Text("本机与服务器同一时间轴 · 尚未核实去重")
-                  .font(.footnote).foregroundColor(.secondary).padding(.horizontal)
-              } else if !device.authorized {
-                Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding()
-              }
-              if model.isLoading { ProgressView().padding() }
-              if let message = model.error {
-                VStack(spacing: 8) {
-                  Text(message).font(.footnote).multilineTextAlignment(.center)
-                  Button("重试") { Task { await model.retry() } }
-                }.padding()
-              }
-              // Newest photos are at the bottom; older pages are inserted above.
+              // The anchor is the final item, never below permission/error banners.
               Color.clear.frame(height: 1).id(bottomAnchor)
             }
           }
           .background(Color(uiColor: .systemBackground))
           .simultaneousGesture(MagnificationGesture()
-            .onChanged { value in zoom = min(4.5, max(0.52, zoomStart * value)) }
+            .onChanged { value in zoom = min(4.5, max(0.27, zoomStart * value)) }
             .onEnded { _ in zoomStart = zoom })
           .refreshable {
+            cloud.reset()
             await model.loadInitial()
+            Task { await cloud.check(device.assets, client: client) }
             await Task.yield()
             withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
           }
           .onChange(of: device.assets.count) { _ in
+            Task { await cloud.check(device.assets, client: client) }
             guard !initialPositioned, !mergedAssets.isEmpty else { return }
-            withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-            initialPositioned = true
+            DispatchQueue.main.async {
+              proxy.scrollTo(bottomAnchor, anchor: .bottom)
+              initialPositioned = true
+            }
           }
           .onAppear {
-            guard model.assets.isEmpty, !model.isLoading else { return }
-            Task {
-              await model.loadInitial()
-              await Task.yield()
-              if !mergedAssets.isEmpty && !initialPositioned {
-                withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+            if !initialPositioned && !mergedAssets.isEmpty {
+              DispatchQueue.main.async {
+                proxy.scrollTo(bottomAnchor, anchor: .bottom)
                 initialPositioned = true
               }
             }
+            guard model.assets.isEmpty, !model.isLoading else { return }
+            Task {
+              await model.loadInitial()
+              if !mergedAssets.isEmpty && !initialPositioned {
+                DispatchQueue.main.async {
+                  proxy.scrollTo(bottomAnchor, anchor: .bottom)
+                  initialPositioned = true
+                }
+              }
+              await cloud.check(device.assets, client: client)
+            }
           }
+        }
+      }
+      .safeAreaInset(edge: .bottom, spacing: 0) {
+        if !device.authorized {
+          Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
+        }
+        if model.isLoading { ProgressView().padding(6) }
+        if let message = model.error {
+          HStack { Text(message).font(.caption).lineLimit(2); Button("重试") { Task { await model.retry() } } }.padding(6)
         }
       }
       .navigationTitle("照片")
@@ -667,7 +680,7 @@ struct NativePhotosView: View {
         }
         ToolbarItem(placement: .navigationBarTrailing) {
           Menu {
-            Button(action: { Task { await model.loadInitial() } }) {
+            Button(action: { Task { cloud.reset(); await model.loadInitial(); await cloud.check(device.assets, client: client) } }) {
               Label("刷新", systemImage: "arrow.clockwise")
             }
             Button(action: onUseFlutter) {
@@ -685,11 +698,16 @@ struct NativePhotosView: View {
       .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
     }
     .navigationViewStyle(.stack)
-    .animation(.interactiveSpring(response: 0.22, dampingFraction: 0.82), value: zoom)
+    // Reflow only when the adaptive column count changes; animating every cell
+    // during each pinch sample causes large timelines to stutter.
+    .transaction { $0.disablesAnimations = true }
   }
 
+  private var matchedServerIDs: Set<String> { Set(cloud.matchedServerIDs.values) }
+
   private var mergedAssets: [NativeGridItem] {
-    (model.assets.map { NativeGridItem(server: $0, local: nil) }
+    (model.assets.filter { !matchedServerIDs.contains($0.id) }
+      .map { NativeGridItem(server: $0, local: nil) }
       + device.assets.map { NativeGridItem(server: nil, local: $0) })
       .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
   }
@@ -697,6 +715,18 @@ struct NativePhotosView: View {
   private var dayGroups: [NativeDayGroup] {
     let groups = Dictionary(grouping: mergedAssets) { Calendar.current.startOfDay(for: $0.date) }
     return groups.keys.sorted().map { NativeDayGroup(date: $0, assets: groups[$0] ?? []) }
+  }
+
+  private func cloudSymbol(for entry: NativeGridItem) -> String {
+    guard let local = entry.local else { return "cloud" }
+    if cloud.matchedServerIDs[local.id] != nil { return "checkmark.icloud" }
+    return cloud.checkedIDs.contains(local.id) ? "icloud.slash" : "questionmark.circle"
+  }
+
+  private func cloudDescription(for entry: NativeGridItem) -> String {
+    guard let local = entry.local else { return "仅服务器" }
+    if cloud.matchedServerIDs[local.id] != nil { return "已上传并存在于本机" }
+    return cloud.checkedIDs.contains(local.id) ? "未上传" : "上传状态未核实"
   }
 
   private func tileWidth(in width: CGFloat) -> CGFloat {
@@ -725,6 +755,15 @@ private struct NativeDayGroup {
   let assets: [NativeGridItem]
 }
 
+private enum NativeThumbnailCache {
+  static let images: NSCache<NSString, UIImage> = {
+    let cache = NSCache<NSString, UIImage>()
+    cache.countLimit = 450
+    cache.totalCostLimit = 100 * 1024 * 1024
+    return cache
+  }()
+}
+
 struct NativeThumbnail: View {
   let client: NativeImmichClient
   let asset: NativeAsset
@@ -740,10 +779,14 @@ struct NativeThumbnail: View {
       }
     }
     .task(id: asset.id) {
+      let key = NSString(string: "\(client.config.serverUrl):\(asset.id)")
+      if let cached = NativeThumbnailCache.images.object(forKey: key) { image = cached; return }
       guard let url = client.thumbnailURL(for: asset) else { return }
       do {
         let data = try await client.imageData(for: url)
-        image = UIImage(data: data)
+        guard !Task.isCancelled, let decoded = UIImage(data: data) else { return }
+        NativeThumbnailCache.images.setObject(decoded, forKey: key, cost: data.count)
+        image = decoded
       } catch { image = nil }
     }
   }

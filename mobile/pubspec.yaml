@@ -1,0 +1,68 @@
+name: immich_z
+description: A feature-complete Immich client for iOS and Android, built from the public Immich REST API.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # ---- networking -------------------------------------------------------
+  dio: ^5.7.0
+  http: ^1.2.2
+
+  # ---- state & di -------------------------------------------------------
+  flutter_riverpod: ^2.6.1
+  hooks_riverpod: ^2.6.1
+  flutter_hooks: ^0.20.5
+
+  # ---- local storage ----------------------------------------------------
+  path_provider: ^2.1.4
+  shared_preferences: ^2.3.3
+  flutter_secure_storage: ^9.2.3
+
+  # ---- media ------------------------------------------------------------
+  photo_manager: ^3.6.2
+  cached_network_image: ^3.3.1
+  photo_view: ^0.15.0
+  video_player: ^2.9.2
+  chewie: ^1.8.9
+  image: ^4.5.2
+
+  # ---- ui ---------------------------------------------------------------
+  go_router: ^14.8.0
+  material_color_utilities: ^0.11.1
+  flutter_slidable: ^3.1.1
+  infinite_scroll_pagination: ^4.0.0
+  flutter_map: ^8.0.1
+  latlong2: ^0.9.1
+  intl: ^0.20.2
+  collection: ^1.18.0
+  equatable: ^2.0.5
+  uuid: ^4.4.2
+  package_info_plus: ^8.1.2
+  device_info_plus: ^11.1.1
+  connectivity_plus: ^6.1.2
+  share_plus: ^10.1.4
+  permission_handler: ^11.3.1
+
+  # ---- background work --------------------------------------------------
+  workmanager: ^0.5.2
+  flutter_local_notifications: ^18.0.1
+  flutter_background_service: ^5.0.5
+
+  # ---- logging ----------------------------------------------------------
+  logging: ^1.2.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/

@@ -118,6 +118,7 @@ class TimelineRepository {
   /// Assets inside one bucket.
   Future<TimeBucketAssetResponseDto> bucket({
     required DateTime timeBucket,
+    String? bucketId,
     AssetVisibility? visibility,
     bool? isFavorite,
     bool? isTrashed,
@@ -133,7 +134,7 @@ class TimelineRepository {
     AssetOrderBy orderBy = AssetOrderBy.takenAt,
   }) =>
       _client.getTimeBucket(
-        timeBucket: timeBucket.toUtc().toIso8601String(),
+        timeBucket: _bucketParameter(bucketId, timeBucket),
         visibility: visibility,
         isFavorite: isFavorite,
         isTrashed: isTrashed,
@@ -148,6 +149,14 @@ class TimelineRepository {
         order: order,
         orderBy: orderBy,
       );
+}
+
+String _bucketParameter(String? bucketId, DateTime date) {
+  final value = bucketId ??
+      '${date.year.toString().padLeft(4, '0')}-'
+          '${date.month.toString().padLeft(2, '0')}-'
+          '${date.day.toString().padLeft(2, '0')}';
+  return value.length == 10 ? '${value}T00:00:00.000Z' : value;
 }
 
 /// Repository for asset details and bulk mutations.

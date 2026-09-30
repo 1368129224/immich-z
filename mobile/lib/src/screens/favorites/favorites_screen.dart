@@ -29,6 +29,7 @@ final favoritesProvider = FutureProvider<List<AssetResponseDto>>((ref) async {
     if (when == null) continue;
     final bucket = await timeline.bucket(
       timeBucket: when,
+      bucketId: b.timeBucket,
       isFavorite: true,
     );
     for (final item in flattenBucket(bucket)) {

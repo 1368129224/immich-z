@@ -28,6 +28,7 @@ final trashProvider = FutureProvider<List<AssetResponseDto>>((ref) async {
     if (when == null) continue;
     final bucket = await timeline.bucket(
       timeBucket: when,
+      bucketId: b.timeBucket,
       isTrashed: true,
     );
     for (final item in flattenBucket(bucket)) {

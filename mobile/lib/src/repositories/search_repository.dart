@@ -5,6 +5,30 @@ import '../api/generated/client.dart';
 import '../api/generated/models.dart';
 
 /// One search result row, normalised across metadata / smart search.
+SearchFilter metadataQueryFilter(String query) {
+  final pattern = StringPatternFilter(like: '%${query.trim()}%');
+  return SearchFilter(
+    or_: [
+      SearchFilterBranch(originalFileName: pattern),
+      SearchFilterBranch(originalPath: pattern),
+      SearchFilterBranch(description: pattern),
+    ],
+  );
+}
+
+List<AssetResponseDto> sortAssetsNewestFirst(
+  Iterable<AssetResponseDto> assets,
+) {
+  final sorted = assets.toList();
+  DateTime dateOf(AssetResponseDto asset) =>
+      DateTime.tryParse(asset.localDateTime ?? '') ??
+      DateTime.tryParse(asset.fileCreatedAt ?? '') ??
+      DateTime.tryParse(asset.createdAt ?? '') ??
+      DateTime.fromMillisecondsSinceEpoch(0);
+  sorted.sort((a, b) => dateOf(b).compareTo(dateOf(a)));
+  return sorted;
+}
+
 class SearchHit {
   SearchHit({
     required this.id,
@@ -158,6 +182,40 @@ class SearchRepository {
     return _hits(res);
   }
 
+  /// Returns every page for collection screens that need a complete list.
+  /// Uses the v3 cursor so album/person libraries do not silently stop at one
+  /// page; the seen-cursor guard protects against broken server pagination.
+  Future<List<AssetResponseDto>> metadataAll({
+    required SearchFilter filter,
+    int pageSize = 1000,
+  }) async {
+    final assets = <AssetResponseDto>[];
+    final seenCursors = <String>{};
+    String? cursor;
+    for (var page = 0; page < 100; page++) {
+      final res = await _client.searchAssets(
+        body: MetadataSearchDto(
+          cursor: cursor,
+          filter: filter,
+          size: pageSize,
+          orderBy: const SearchOrder(
+            direction: AssetOrder.desc,
+            field: SearchOrderField.localDateTime,
+          ),
+          withStacked: true,
+        ),
+      );
+      final result = res.assets;
+      final items = result?.items ?? const <AssetResponseDto>[];
+      assets.addAll(items);
+      final nextCursor = result?.nextCursor;
+      if (items.isEmpty) break;
+      if (nextCursor == null || !seenCursors.add(nextCursor)) break;
+      cursor = nextCursor;
+    }
+    return sortAssetsNewestFirst(assets);
+  }
+
   List<SearchHit> _hits(SearchResponseDto res) {
     final items = res.assets?.items;
     if (items == null) return [];
@@ -192,8 +250,7 @@ class SearchRepository {
   Future<List<PlacesResponseDto>> places(String name) =>
       _client.searchPlaces(name: name);
 
-  Future<List<AssetResponseDto>> assetsByCity() =>
-      _client.getAssetsByCity();
+  Future<List<AssetResponseDto>> assetsByCity() => _client.getAssetsByCity();
 }
 
 /// Album CRUD, membership and activity.
@@ -483,8 +540,7 @@ class PartnerRepository {
       _client.getPartners(direction: direction);
 
   Future<PartnerResponseDto> create(String sharedWithId) =>
-      _client.createPartner(
-          body: PartnerCreateDto(sharedWithId: sharedWithId));
+      _client.createPartner(body: PartnerCreateDto(sharedWithId: sharedWithId));
 
   Future<PartnerResponseDto> update(
     String id, {
@@ -558,13 +614,11 @@ class SharedLinkRepository {
 
   Future<void> remove(String id) => _client.removeSharedLink(id: id);
 
-  Future<void> addAssets(String id, List<String> assetIds) =>
-      _client.addSharedLinkAssets(
-          id: id, body: AssetIdsDto(assetIds: assetIds));
+  Future<void> addAssets(String id, List<String> assetIds) => _client
+      .addSharedLinkAssets(id: id, body: AssetIdsDto(assetIds: assetIds));
 
-  Future<void> removeAssets(String id, List<String> assetIds) =>
-      _client.removeSharedLinkAssets(
-          id: id, body: AssetIdsDto(assetIds: assetIds));
+  Future<void> removeAssets(String id, List<String> assetIds) => _client
+      .removeSharedLinkAssets(id: id, body: AssetIdsDto(assetIds: assetIds));
 }
 
 /// Tags, stacks, maps, libraries, trash.

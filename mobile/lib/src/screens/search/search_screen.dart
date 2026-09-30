@@ -6,6 +6,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../api/generated/models.dart';
 import '../../providers/repository_providers.dart';
+import '../../repositories/search_repository.dart';
 import '../../routing/app_router.dart';
 import '../../widgets/thumbhash_placeholder.dart';
 
@@ -23,10 +24,16 @@ final searchResultsProvider =
   final repo = ref.watch(searchRepositoryProvider);
   if (mode == SearchMode.smart) {
     final hits = await repo.smart(query: query);
-    return hits.map((h) => h.remote).whereType<AssetResponseDto>().toList();
+    return sortAssetsNewestFirst(
+      hits.map((h) => h.remote).whereType<AssetResponseDto>(),
+    );
   }
-  final hits = await repo.metadata(query: query);
-  return hits.map((h) => h.remote).whereType<AssetResponseDto>().toList();
+  final hits = await repo.metadata(
+    filter: metadataQueryFilter(query),
+  );
+  return sortAssetsNewestFirst(
+    hits.map((h) => h.remote).whereType<AssetResponseDto>(),
+  );
 });
 
 /// Search page: natural-language (CLIP) search, filter chips, explore grid.
@@ -175,9 +182,10 @@ class _ExploreGrid extends ConsumerWidget {
               ? Center(child: Text('${snap.error}'))
               : const Center(child: CircularProgressIndicator());
         }
-        final items = snap.data!;
-        if (items.isEmpty)
+        final items = sortAssetsNewestFirst(snap.data!);
+        if (items.isEmpty) {
           return const Center(child: Text('Nothing to explore'));
+        }
         return GridView.builder(
           padding: const EdgeInsets.all(2),
           gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(

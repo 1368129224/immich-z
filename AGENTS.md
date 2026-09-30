@@ -149,6 +149,17 @@ treat CI as the source of truth for builds.
   Android `INTERNET` permission, iOS `NSAppTransportSecurity` +
   photo/camera/location usage descriptions.
 
+## Versioning rule (mandatory)
+
+- Before every push, increment the final numeric component of the
+  Flutter version in `mobile/pubspec.yaml` by exactly 1. The format is
+  `major.minor.patch+build`; increment `build` for every push, keeping the
+  semantic version at `0.0.1` unless intentionally changed. Never reuse a
+  version/build number for a new push. If one push adds commits after a failed
+  CI run, increment the build number again before pushing the follow-up.
+- The version declared in `pubspec.yaml` is propagated to Android and iOS by
+  Flutter's Gradle/Xcode build settings; do not hard-code separate app versions.
+
 ## Git conventions
 
 - Conventional commits: `feat:`, `fix:`, `fix(ci):`, `fix(login):`, `fix(api):`.

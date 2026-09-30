@@ -6,7 +6,7 @@ import 'package:go_router/go_router.dart';
 
 import '../../api/generated/models.dart';
 import '../../providers/repository_providers.dart';
-import '../../repositories/asset_repository.dart';
+import '../../repositories/search_repository.dart';
 import '../../routing/app_router.dart';
 import '../../utils/format.dart';
 
@@ -278,25 +278,10 @@ class _AlbumScreenState extends ConsumerState<AlbumScreen> {
 
 final _albumAssetsProvider =
     FutureProvider.family<List<AssetResponseDto>, String>((ref, albumId) async {
-  final buckets = await ref.watch(timelineRepositoryProvider).buckets(
-        albumId: albumId,
+  final assets = await ref.watch(searchRepositoryProvider).metadataAll(
+        filter: SearchFilter(
+          albumIds: IdsFilter(any: [albumId]),
+        ),
       );
-  final repo = ref.watch(timelineRepositoryProvider);
-  final out = <AssetResponseDto>[];
-  for (final b in buckets.take(6)) {
-    final bucket = await repo.bucket(
-      timeBucket: DateTime.tryParse(b.timeBucket ?? '') ?? DateTime.now(),
-      albumId: albumId,
-    );
-    final flat = flattenBucket(bucket);
-    final assetRepo = ref.watch(assetRepositoryProvider);
-    for (final f in flat) {
-      try {
-        out.add(await assetRepo.get(f.id));
-      } catch (_) {
-        // Skip assets that vanished mid-flight.
-      }
-    }
-  }
-  return out;
+  return sortAssetsNewestFirst(assets);
 });

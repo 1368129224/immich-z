@@ -405,7 +405,11 @@ class TimelineController extends StateNotifier<TimelineState> {
   Future<void> load() async {
     state = state.copyWith(isLoading: true, clearError: true, days: const []);
     try {
-      final buckets = await _repo.buckets();
+      final buckets = await _repo.buckets(
+        visibility: AssetVisibility.timeline,
+        order: AssetOrder.desc,
+        orderBy: AssetOrderBy.takenAt,
+      );
       _buckets = buckets;
       _nextBucket = 0;
       await loadMore();
@@ -427,7 +431,13 @@ class TimelineController extends StateNotifier<TimelineState> {
 
       final newDays = <TimelineDay>[];
       for (final b in slice) {
-        final bucket = await _repo.bucket(timeBucket: _bucketDate(b));
+        final bucket = await _repo.bucket(
+          timeBucket: _bucketDate(b),
+          bucketId: b.timeBucket,
+          visibility: AssetVisibility.timeline,
+          order: AssetOrder.desc,
+          orderBy: AssetOrderBy.takenAt,
+        );
         final assets = flattenBucket(bucket);
         if (assets.isEmpty) continue;
         newDays.add(TimelineDay(_bucketDate(b), assets));
@@ -443,20 +453,34 @@ class TimelineController extends StateNotifier<TimelineState> {
     }
   }
 
-  /// Timeline buckets are returned as `YYYY-MM-DDTHH:MM:SS.000Z` strings.
-  DateTime _bucketDate(TimeBucketsResponseDto b) =>
-      DateTime.tryParse(b.timeBucket ?? '')?.toLocal() ??
-      DateTime.fromMillisecondsSinceEpoch(0);
+  /// Buckets are date identifiers (typically YYYY-MM-DD) in UTC.
+  DateTime _bucketDate(TimeBucketsResponseDto b) {
+    final value = b.timeBucket ?? '';
+    if (value.length == 10) {
+      final date = DateTime.tryParse(value);
+      if (date != null) return DateTime(date.year, date.month, date.day);
+    }
+    return DateTime.tryParse(value)?.toLocal() ??
+        DateTime.fromMillisecondsSinceEpoch(0);
+  }
 
   /// Scrolls the timeline to the bucket containing `date`.
   Future<void> jumpTo(DateTime date) async {
     state = state.copyWith(isLoading: true, clearError: true);
     try {
-      final month = DateTime(date.year, date.month, 1);
-      final bucket = await _repo.bucket(timeBucket: month);
+      final selected = DateTime(date.year, date.month, date.day);
+      final bucket = await _repo.bucket(
+        timeBucket: selected,
+        bucketId: '${selected.year.toString().padLeft(4, '0')}-'
+            '${selected.month.toString().padLeft(2, '0')}-'
+            '${selected.day.toString().padLeft(2, '0')}',
+        visibility: AssetVisibility.timeline,
+        order: AssetOrder.desc,
+        orderBy: AssetOrderBy.takenAt,
+      );
       final assets = flattenBucket(bucket);
       state = state.copyWith(
-        days: [TimelineDay(month, assets)],
+        days: [TimelineDay(selected, assets)],
         isLoading: false,
         hasMore: _nextBucket < _buckets.length,
       );

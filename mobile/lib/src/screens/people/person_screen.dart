@@ -20,10 +20,12 @@ final personProvider =
 /// Every asset the person appears in.
 final personAssetsProvider =
     FutureProvider.family<List<AssetResponseDto>, String>((ref, id) async {
-  final List<SearchHit> hits = await ref
-      .watch(searchRepositoryProvider)
-      .smart(personIds: <String>[id], size: 200);
-  return hits.map((h) => h.remote).whereType<AssetResponseDto>().toList();
+  final assets = await ref.watch(searchRepositoryProvider).metadataAll(
+        filter: SearchFilter(
+          personIds: IdsFilter(any: [id]),
+        ),
+      );
+  return sortAssetsNewestFirst(assets);
 });
 
 /// Person detail screen: large avatar, birth date, and the asset grid.

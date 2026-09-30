@@ -147,14 +147,14 @@ class BackgroundService {
         requiresCharging: false,
         requiresBatteryNotLow: true,
       ),
-      existingWorkPolicy: ExistingWorkPolicy.keep,
+      existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
     );
     await Workmanager().registerPeriodicTask(
       'immich-z-sync',
       kSyncTaskName,
       frequency: const Duration(hours: 6),
       constraints: Constraints(networkType: NetworkType.connected),
-      existingWorkPolicy: ExistingWorkPolicy.keep,
+      existingWorkPolicy: ExistingPeriodicWorkPolicy.keep,
     );
   }
 

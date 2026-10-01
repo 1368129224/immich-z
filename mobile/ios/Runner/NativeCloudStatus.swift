@@ -27,23 +27,25 @@ final class NativeSyncCacheStore: @unchecked Sendable {
     var isDirty = false
     if let data = try? Data(contentsOf: fileURL),
        let decoded = try? JSONDecoder().decode(NativeCloudSyncCache.self, from: data) {
-      matchedServerIDs = decoded.matchedServerIDs
+      // Purge any legacy bogus entries where localId == serverId
+      matchedServerIDs = decoded.matchedServerIDs.filter { $0.key != $0.value }
       checkedIDs = Set(decoded.checkedIDs)
-      checksums = decoded.checksums
+      // Purge legacy 40-char hex checksums so they are re-hashed to Base64 SHA-1
+      checksums = decoded.checksums.filter { $0.value.count != 40 }
       for (localId, serverId) in matchedServerIDs {
         reverseMatches[serverId] = localId
       }
+      if matchedServerIDs.count != decoded.matchedServerIDs.count || checksums.count != decoded.checksums.count {
+        isDirty = true
+      }
     }
 
-    // Import from Flutter backup markers in UserDefaults if present
+    // Import from Flutter backup markers in UserDefaults if present (only marks as checked, not fake match)
     if let markersRaw = UserDefaults.standard.string(forKey: "flutter.backup_markers"),
        let markersData = markersRaw.data(using: .utf8),
        let ids = try? JSONSerialization.jsonObject(with: markersData) as? [String] {
       for id in ids {
-        if matchedServerIDs[id] == nil {
-          matchedServerIDs[id] = id
-          reverseMatches[id] = id
-          checkedIDs.insert(id)
+        if checkedIDs.insert(id).inserted {
           isDirty = true
         }
       }

@@ -297,16 +297,16 @@ final class NativeImmichClient {
     guard let rows = payload as? [[String: Any]] else { throw NativeAPIError.invalidJSON("/timeline/buckets") }
     return rows.compactMap { row in
       guard let id = row["timeBucket"] as? String else { return nil }
-      return NativeBucket(id: String(id.prefix(10)), count: row["count"] as? Int ?? 0)
+      return NativeBucket(id: id, count: row["count"] as? Int ?? 0)
     }
   }
 
   func assets(in bucket: NativeBucket) async throws -> [NativeAsset] {
     let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
     guard var components = URLComponents(string: base + "/timeline/bucket") else { throw NativeAPIError.invalidServer }
-    // v3.2.4 /timeline/bucket accepts the YYYY-MM-DD bucket identifier.
+    let bucketParam = bucket.id.count == 10 ? "\(bucket.id)T00:00:00.000Z" : bucket.id
     components.queryItems = [
-      URLQueryItem(name: "timeBucket", value: bucket.id),
+      URLQueryItem(name: "timeBucket", value: bucketParam),
       URLQueryItem(name: "order", value: "desc"),
       URLQueryItem(name: "orderBy", value: "takenAt"),
       URLQueryItem(name: "visibility", value: "timeline"),
@@ -329,7 +329,7 @@ final class NativeImmichClient {
     return ids.enumerated().compactMap { index, rawID in
       guard let id = rawID as? String else { return nil }
       let dateString = (dates[safe: index] as? String) ?? (created[safe: index] as? String) ?? bucket.id
-      let date = ISO8601DateFormatter().date(from: dateString) ?? Self.parseDate(dateString) ?? .distantPast
+      let date = Self.parseISODate(dateString) ?? .distantPast
       return NativeAsset(
         id: id,
         date: date,
@@ -392,11 +392,37 @@ final class NativeImmichClient {
     }
   }
 
+  private static let isoFormatterWithFractional: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+  }()
+
+  private static let isoFormatterStandard: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime]
+    return f
+  }()
+
+  static func parseISODate(_ value: String) -> Date? {
+    if let d = isoFormatterWithFractional.date(from: value) { return d }
+    if let d = isoFormatterStandard.date(from: value) { return d }
+    return parseDate(value)
+  }
+
   private static func parseDate(_ value: String) -> Date? {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone(secondsFromGMT: 0)
-    for format in ["yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX", "yyyy-MM-dd'T'HH:mm:ssXXXXX", "yyyy-MM-dd"] {
+    for format in [
+      "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXXXX",
+      "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
+      "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX",
+      "yyyy-MM-dd'T'HH:mm:ss.SSS",
+      "yyyy-MM-dd'T'HH:mm:ssXXXXX",
+      "yyyy-MM-dd'T'HH:mm:ss",
+      "yyyy-MM-dd"
+    ] {
       formatter.dateFormat = format
       if let date = formatter.date(from: value) { return date }
     }
@@ -589,7 +615,7 @@ private final class NativeTimelineModel: ObservableObject {
   private var nextBucket = 0
   private var searchFallbackEnabled = false
   private var searchCursor: String?
-  private let pageSize = 4
+  private let pageSize = 20
 
   init(client: NativeImmichClient) { self.client = client }
 
@@ -606,6 +632,10 @@ private final class NativeTimelineModel: ObservableObject {
       nextBucket = 0
       hasOlder = !buckets.isEmpty
       try await loadNextPage()
+      // If the first page of buckets had very few assets, load more to fill view
+      while assets.count < 100 && hasOlder {
+        try await loadNextPage()
+      }
     } catch {
       // Some compatible Immich servers or reverse proxies return a non-JSON
       // timeline response. Keep Photos usable via the standard metadata search.
@@ -651,7 +681,14 @@ private final class NativeTimelineModel: ObservableObject {
     let end = min(nextBucket + pageSize, buckets.count)
     let page = buckets[nextBucket..<end]
     var result: [NativeAsset] = []
-    for bucket in page { result.append(contentsOf: try await client.assets(in: bucket)) }
+    for bucket in page {
+      do {
+        let bucketAssets = try await client.assets(in: bucket)
+        result.append(contentsOf: bucketAssets)
+      } catch {
+        // Continue with remaining buckets even if one bucket query errors
+      }
+    }
     nextBucket = end
     hasOlder = nextBucket < buckets.count
     var seen = Set<String>()
@@ -967,21 +1004,29 @@ struct NativePhotosView: View {
 
   private func rebuildDayGroups() {
     let matchedLocalToServer = cloud.matchedServerIDs
-    let matchedServerIDs = Set(matchedLocalToServer.values)
     let serverAssetByID = Dictionary(model.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
+    var usedServerIDs = Set<String>()
     var merged: [NativeGridItem] = []
     merged.reserveCapacity(model.assets.count + device.assets.count)
 
-    for asset in model.assets where !matchedServerIDs.contains(asset.id) {
-      merged.append(NativeGridItem(server: asset, local: nil))
+    // 1. Process all local assets from the device
+    for localAsset in device.assets {
+      if let serverID = matchedLocalToServer[localAsset.id], let serverAsset = serverAssetByID[serverID] {
+        // Matched and server asset is loaded -> unified single item
+        merged.append(NativeGridItem(server: serverAsset, local: localAsset))
+        usedServerIDs.insert(serverAsset.id)
+      } else {
+        // Local only, or server asset not yet loaded in model
+        merged.append(NativeGridItem(server: nil, local: localAsset))
+      }
     }
 
-    for asset in device.assets {
-      if let serverID = matchedLocalToServer[asset.id], let serverAsset = serverAssetByID[serverID] {
-        merged.append(NativeGridItem(server: serverAsset, local: asset))
-      } else {
-        merged.append(NativeGridItem(server: nil, local: asset))
+    // 2. Process all server assets
+    for serverAsset in model.assets {
+      if !usedServerIDs.contains(serverAsset.id) {
+        // Server asset not already merged with a local asset -> display as remote item
+        merged.append(NativeGridItem(server: serverAsset, local: nil))
       }
     }
 

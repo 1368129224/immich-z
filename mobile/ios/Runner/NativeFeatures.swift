@@ -393,21 +393,26 @@ struct NativeResultGrid: View {
   private var merged: [NativeGridItem] {
     let matched = NativeSyncCacheStore.shared.matchedServerIDs
     let serverById = Dictionary(assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-    let matchedServerIDs = Set(matched.values)
 
+    var usedServerIDs = Set<String>()
     var items: [NativeGridItem] = []
     items.reserveCapacity(assets.count + localAssets.count)
 
-    for asset in assets where !matchedServerIDs.contains(asset.id) {
-      items.append(NativeGridItem(server: asset, local: nil))
-    }
-    for asset in localAssets {
-      if let serverID = matched[asset.id], let serverAsset = serverById[serverID] {
-        items.append(NativeGridItem(server: serverAsset, local: asset))
+    for localAsset in localAssets {
+      if let serverID = matched[localAsset.id], let serverAsset = serverById[serverID] {
+        items.append(NativeGridItem(server: serverAsset, local: localAsset))
+        usedServerIDs.insert(serverAsset.id)
       } else {
-        items.append(NativeGridItem(server: nil, local: asset))
+        items.append(NativeGridItem(server: nil, local: localAsset))
       }
     }
+
+    for serverAsset in assets {
+      if !usedServerIDs.contains(serverAsset.id) {
+        items.append(NativeGridItem(server: serverAsset, local: nil))
+      }
+    }
+
     return items.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
   }
 
@@ -767,6 +772,12 @@ private struct NativeLibraryView: View {
     return value
   }
 
+  private var appVersion: String {
+    let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
+    let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+    return buildNumber.isEmpty ? shortVersion : "\(shortVersion)+\(buildNumber)"
+  }
+
   var body: some View {
     NavigationView {
       List {
@@ -816,7 +827,7 @@ private struct NativeLibraryView: View {
         Section {
           HStack {
             Spacer()
-            Text("build \(buildCommit)")
+            Text("build \(buildCommit)  \(appVersion)")
               .font(.footnote.monospaced())
               .foregroundColor(.secondary)
             Spacer()

@@ -3,7 +3,7 @@ description: >-
   A feature-complete Immich client for iOS and Android, built from the public
   Immich REST API.
 publish_to: "none"
-version: 0.0.1+28
+version: 0.0.1+29
 
 environment:
   sdk: ">=3.5.0 <4.0.0"

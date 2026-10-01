@@ -744,23 +744,23 @@ struct NativePhotosView: View {
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
   }
 
-  private var firstGroupIDsInMonth: Set<UUID> {
+  private var firstGroupDatesInMonth: Set<Date> {
     var seenYearMonths = Set<Int>()
-    var result = Set<UUID>()
+    var result = Set<Date>()
     let calendar = Calendar.current
     for group in cachedDayGroups {
       let year = calendar.component(.year, from: group.date)
       let month = calendar.component(.month, from: group.date)
       let key = year * 100 + month
       if seenYearMonths.insert(key).inserted {
-        result.insert(group.id)
+        result.insert(group.date)
       }
     }
     return result
   }
 
   private func formatDateBadge(for group: NativeDayGroup) -> String {
-    let isFirstInMonth = firstGroupIDsInMonth.contains(group.id)
+    let isFirstInMonth = firstGroupDatesInMonth.contains(group.date)
     return NativeImmichClient.formatChineseDate(group.date, includeDay: !isFirstInMonth)
   }
 

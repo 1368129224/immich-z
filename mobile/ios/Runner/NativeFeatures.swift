@@ -35,7 +35,7 @@ final class NativeDeviceLibrary: ObservableObject {
     Task { [weak self] in
       let library = await Task.detached(priority: .userInitiated) {
         let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let results = PHAsset.fetchAssets(with: options)
         var entries: [NativeDeviceAsset] = []
         entries.reserveCapacity(results.count)
@@ -110,19 +110,18 @@ struct NativeDeviceThumbnail: View {
       }
       guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [asset.id], options: nil).firstObject else { return }
       let options = PHImageRequestOptions()
-      options.isNetworkAccessAllowed = false
-      options.deliveryMode = .fastFormat
+      options.isNetworkAccessAllowed = true
+      options.deliveryMode = .opportunistic
       options.resizeMode = .fast
       NativeLocalThumbnailCache.manager.requestImage(
         for: source,
-        targetSize: CGSize(width: 240, height: 240),
+        targetSize: CGSize(width: 450, height: 450),
         contentMode: .aspectFill,
         options: options
       ) { result, info in
         guard info?[PHImageCancelledKey] as? Bool != true,
               info?[PHImageErrorKey] == nil,
-              let result,
-              info?[PHImageResultIsDegradedKey] as? Bool != true else { return }
+              let result else { return }
         NativeLocalThumbnailCache.images.setObject(result, forKey: key, cost: Int(result.size.width * result.size.height * 4))
         Task { @MainActor in image = result }
       }
@@ -157,61 +156,54 @@ struct NativeDeviceViewer: View {
 struct NativeDeviceGrid: View {
   let title: String
   let assets: [NativeDeviceAsset]
-  @State private var zoom: CGFloat = 1
-  @GestureState private var pinchScale: CGFloat = 1
+  @State private var columns: Int = 3
   @State private var selected: NativeDeviceAsset?
-  @State private var positioned = false
-  private let bottom = "device-bottom"
-  private var minimumTile: CGFloat { min(420, max(24, 92 * zoom * pinchScale)) }
 
   var body: some View {
-    GeometryReader { geometry in
-      ScrollViewReader { proxy in
-        ScrollView {
-          LazyVStack(alignment: .leading, spacing: 2) {
-            let groups = Dictionary(grouping: assets) { Calendar.current.startOfDay(for: $0.date) }
-            ForEach(groups.keys.sorted(), id: \.self) { day in
-              Text(day, style: .date).font(.headline).padding(.horizontal)
-              LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
-                ForEach(groups[day] ?? []) { asset in
-                  Button { selected = asset } label: {
-                    NativeDeviceThumbnail(asset: asset)
-                      .frame(maxWidth: .infinity)
-                      .aspectRatio(1, contentMode: .fit)
-                      .clipped()
-                      .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: asset.isVideo ? "video.fill" : "iphone")
-                          .font(.system(size: minimumTile < 44 ? 10 : 15, weight: .semibold))
-                          .foregroundColor(.white).shadow(color: .black, radius: 2)
-                          .padding(3)
+    ScrollView {
+      LazyVStack(alignment: .leading, spacing: 4) {
+        let groups = Dictionary(grouping: assets) { Calendar.current.startOfDay(for: $0.date) }
+        ForEach(groups.keys.sorted(by: >), id: \.self) { day in
+          VStack(alignment: .leading, spacing: 2) {
+            Text(day, style: .date).font(.headline).padding(.horizontal)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
+              ForEach(groups[day] ?? []) { asset in
+                Button { selected = asset } label: {
+                  Color.clear
+                    .aspectRatio(1, contentMode: .fit)
+                    .overlay(
+                      GeometryReader { geo in
+                        NativeDeviceThumbnail(asset: asset)
+                          .frame(width: geo.size.width, height: geo.size.height)
+                          .clipped()
                       }
-                      .contentShape(Rectangle())
-                  }
-                  .buttonStyle(.plain)
-                  .accessibilityLabel("设备照片，\(asset.date.formatted())")
+                    )
+                    .clipped()
+                    .overlay(alignment: .bottomTrailing) {
+                      Image(systemName: asset.isVideo ? "video.fill" : "iphone")
+                        .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
+                        .foregroundColor(.white).shadow(color: .black, radius: 2)
+                        .padding(3)
+                    }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .accessibilityLabel("设备照片，\(asset.date.formatted())")
               }
             }
-            Color.clear.frame(height: 1).id(bottom)
           }
-        }
-        .simultaneousGesture(MagnificationGesture()
-          .updating($pinchScale) { value, scale, _ in
-            scale = value
-          }
-          .onEnded { value in
-            zoom = min(4.5, max(0.27, zoom * value))
-          })
-        .onChange(of: assets.count) { _ in
-          guard !positioned, !assets.isEmpty else { return }
-          proxy.scrollTo(bottom, anchor: .bottom)
-          positioned = true
-        }
-        .onAppear {
-          if !assets.isEmpty && !positioned { proxy.scrollTo(bottom, anchor: .bottom); positioned = true }
         }
       }
     }
+    .gesture(
+      MagnificationGesture()
+        .onEnded { value in
+          withAnimation(.easeInOut(duration: 0.2)) {
+            if value > 1.25 { columns = max(1, columns - 1) }
+            else if value < 0.8 { columns = min(6, columns + 1) }
+          }
+        }
+    )
     .sheet(item: $selected) { NativeDeviceViewer(asset: $0) }
     .navigationTitle(title)
   }
@@ -373,75 +365,68 @@ struct NativeResultGrid: View {
   let loadMore: () -> Void
   @State private var selected: NativeAsset?
   @State private var selectedLocal: NativeDeviceAsset?
+  @State private var columns: Int = 3
 
   private var merged: [NativeGridItem] {
     (assets.map { NativeGridItem(server: $0, local: nil) } + localAssets.map { NativeGridItem(server: nil, local: $0) })
-      .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
+      .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
   }
-  @State private var positioned = false
-  @State private var zoom: CGFloat = 1
-  @GestureState private var pinchScale: CGFloat = 1
-  private let bottom = "results-bottom"
-  private var minimumTile: CGFloat { min(420, max(24, 92 * zoom * pinchScale)) }
 
   var body: some View {
-    GeometryReader { geometry in
-      ScrollViewReader { proxy in
-        ScrollView {
-          LazyVStack(spacing: 2) {
-            if hasOlder && !assets.isEmpty {
-              ProgressView().frame(maxWidth: .infinity).padding(8)
-                .onAppear {
-                  guard positioned else { return }
-                  let anchor = merged.last?.id
-                  loadMore()
-                  if let anchor { proxy.scrollTo(anchor, anchor: .bottom) }
-                }
-            }
-            let groups = Dictionary(grouping: merged) { Calendar.current.startOfDay(for: $0.date) }
-            ForEach(groups.keys.sorted(), id: \.self) { day in
-              Text(day, style: .date).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
-              LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
-                ForEach(groups[day] ?? []) { entry in
-                  Button {
-                    selected = entry.server
-                    selectedLocal = entry.local
-                  } label: {
-                    Group {
-                      if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
-                      else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
-                    }
-                    .frame(maxWidth: .infinity)
+    ScrollView {
+      LazyVStack(spacing: 4) {
+        let groups = Dictionary(grouping: merged) { Calendar.current.startOfDay(for: $0.date) }
+        ForEach(groups.keys.sorted(by: >), id: \.self) { day in
+          VStack(alignment: .leading, spacing: 2) {
+            Text(day, style: .date).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
+              ForEach(groups[day] ?? []) { entry in
+                Button {
+                  selected = entry.server
+                  selectedLocal = entry.local
+                } label: {
+                  Color.clear
                     .aspectRatio(1, contentMode: .fit)
+                    .overlay(
+                      GeometryReader { geo in
+                        Group {
+                          if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
+                          else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
+                        }
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                      }
+                    )
                     .clipped()
                     .overlay(alignment: .bottomTrailing) {
                       Image(systemName: entry.local != nil ? "iphone" : "cloud")
-                        .font(.system(size: minimumTile < 44 ? 10 : 15, weight: .semibold))
+                        .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
                         .foregroundColor(.white).shadow(color: .black, radius: 2)
                         .padding(3)
                     }
                     .contentShape(Rectangle())
-                  }.buttonStyle(.plain).id(entry.id)
                 }
+                .buttonStyle(.plain)
+                .id(entry.id)
               }
             }
-            Color.clear.frame(height: 1).id(bottom)
           }
         }
-        .simultaneousGesture(MagnificationGesture()
-          .updating($pinchScale) { value, scale, _ in
-            scale = value
-          }
-          .onEnded { value in
-            zoom = min(4.5, max(0.27, zoom * value))
-          })
-        .onChange(of: merged.count) { _ in
-          guard !positioned, !merged.isEmpty else { return }
-          proxy.scrollTo(bottom, anchor: .bottom)
-          positioned = true
+        if hasOlder && !assets.isEmpty {
+          ProgressView().frame(maxWidth: .infinity).padding(16)
+            .onAppear { loadMore() }
         }
       }
     }
+    .gesture(
+      MagnificationGesture()
+        .onEnded { value in
+          withAnimation(.easeInOut(duration: 0.2)) {
+            if value > 1.25 { columns = max(1, columns - 1) }
+            else if value < 0.8 { columns = min(6, columns + 1) }
+          }
+        }
+    )
     .sheet(item: $selected) { NativeAssetViewer(client: client, asset: $0) }
     .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
   }
@@ -511,20 +496,26 @@ private struct NativeSearchView: View {
                       ForEach(section.items) { tile in
                         Button { term = tile.name; runSearch() } label: {
                           VStack(alignment: .leading, spacing: 4) {
-                            Group {
-                              if let asset = tile.asset {
-                                NativeThumbnail(client: client, asset: asset)
-                              } else {
-                                Rectangle().fill(Color(uiColor: .secondarySystemBackground))
-                                  .overlay {
-                                    Image(systemName: "photo")
-                                      .foregroundColor(.secondary)
+                            Color.clear
+                              .frame(width: 108, height: 108)
+                              .overlay(
+                                GeometryReader { geo in
+                                  Group {
+                                    if let asset = tile.asset {
+                                      NativeThumbnail(client: client, asset: asset)
+                                    } else {
+                                      Rectangle().fill(Color(uiColor: .secondarySystemBackground))
+                                        .overlay {
+                                          Image(systemName: "photo")
+                                            .foregroundColor(.secondary)
+                                        }
+                                    }
                                   }
-                              }
-                            }
-                            .frame(width: 108, height: 108)
-                            .aspectRatio(1, contentMode: .fit)
-                            .clipped()
+                                  .frame(width: geo.size.width, height: geo.size.height)
+                                  .clipped()
+                                }
+                              )
+                              .clipped()
                             Text(tile.name).font(.caption).lineLimit(1)
                           }.frame(width: 108)
                         }.buttonStyle(.plain)

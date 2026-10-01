@@ -12,7 +12,8 @@ final class NativeSyncCacheStore: @unchecked Sendable {
   static let shared = NativeSyncCacheStore()
   private let lock = NSLock()
   private let fileURL: URL
-  private(set) var matchedServerIDs: [String: String] = [:]
+  private(set) var matchedServerIDs: [String: String] = [:] // localId -> serverId
+  private(set) var reverseMatches: [String: String] = [:]   // serverId -> localId
   private(set) var checkedIDs: Set<String> = []
   private(set) var checksums: [String: String] = [:]
   private let saveQueue = DispatchQueue(label: "immich.sync.cache.save", qos: .utility)
@@ -29,6 +30,9 @@ final class NativeSyncCacheStore: @unchecked Sendable {
       matchedServerIDs = decoded.matchedServerIDs
       checkedIDs = Set(decoded.checkedIDs)
       checksums = decoded.checksums
+      for (localId, serverId) in matchedServerIDs {
+        reverseMatches[serverId] = localId
+      }
     }
 
     // Import from Flutter backup markers in UserDefaults if present
@@ -38,6 +42,7 @@ final class NativeSyncCacheStore: @unchecked Sendable {
       for id in ids {
         if matchedServerIDs[id] == nil {
           matchedServerIDs[id] = id
+          reverseMatches[id] = id
           checkedIDs.insert(id)
           isDirty = true
         }
@@ -49,12 +54,29 @@ final class NativeSyncCacheStore: @unchecked Sendable {
     }
   }
 
+  func isMatched(localId: String?) -> Bool {
+    guard let localId else { return false }
+    lock.lock(); defer { lock.unlock() }
+    return matchedServerIDs[localId] != nil
+  }
+
+  func serverID(for localId: String) -> String? {
+    lock.lock(); defer { lock.unlock() }
+    return matchedServerIDs[localId]
+  }
+
+  func localID(for serverId: String) -> String? {
+    lock.lock(); defer { lock.unlock() }
+    return reverseMatches[serverId]
+  }
+
   func update(matches: [String: String] = [:], checked: Set<String> = [], newChecksums: [String: String] = [:]) {
     lock.lock()
     var changed = false
     for (k, v) in matches {
       if matchedServerIDs[k] != v {
         matchedServerIDs[k] = v
+        reverseMatches[v] = k
         changed = true
       }
     }
@@ -79,6 +101,7 @@ final class NativeSyncCacheStore: @unchecked Sendable {
   func clear() {
     lock.lock()
     matchedServerIDs.removeAll()
+    reverseMatches.removeAll()
     checkedIDs.removeAll()
     checksums.removeAll()
     lock.unlock()
@@ -234,32 +257,103 @@ final class NativeCloudStatus: ObservableObject {
   }
 
   nonisolated private static func checksum(for deviceAsset: NativeDeviceAsset, allowNetwork: Bool) async -> String? {
-    guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [deviceAsset.id], options: nil).firstObject else { return nil }
-    let resources = PHAssetResource.assetResources(for: asset)
-    let preferredTypes: [PHAssetResourceType] = deviceAsset.isVideo ? [.video, .fullSizeVideo] : [.photo, .fullSizePhoto]
-    guard let resource = preferredTypes.lazy.compactMap({ type in resources.first(where: { $0.type == type }) }).first
-      ?? resources.first(where: { $0.type != .adjustmentData && $0.type != .pairedVideo })
-      ?? resources.first else { return nil }
+    guard let phAsset = PHAsset.fetchAssets(withLocalIdentifiers: [deviceAsset.id], options: nil).firstObject else { return nil }
+    guard let resource = phAsset.getResource() else { return nil }
 
-    let options = PHAssetResourceRequestOptions()
-    options.isNetworkAccessAllowed = allowNetwork
-    let digest = NativeSHA1Accumulator()
-    return await withCheckedContinuation { continuation in
-      PHAssetResourceManager.default().requestData(for: resource, options: options, dataReceivedHandler: { bytes in
-        digest.append(bytes)
-      }, completionHandler: { error in
-        continuation.resume(returning: error == nil ? digest.hex() : nil)
-      })
+    final class RequestRef: @unchecked Sendable {
+      var id: PHAssetResourceDataRequestID?
+    }
+    let requestRef = RequestRef()
+
+    return await withTaskCancellationHandler(operation: {
+      if Task.isCancelled { return nil }
+      let options = PHAssetResourceRequestOptions()
+      options.isNetworkAccessAllowed = allowNetwork
+
+      return await withCheckedContinuation { continuation in
+        var hasher = Insecure.SHA1()
+        requestRef.id = PHAssetResourceManager.default().requestData(
+          for: resource,
+          options: options,
+          dataReceivedHandler: { bytes in
+            hasher.update(data: bytes)
+          },
+          completionHandler: { error in
+            if error != nil {
+              continuation.resume(returning: nil)
+            } else {
+              // Immich canonical checksum format: Base64 encoded SHA1 hash
+              let base64Hash = Data(hasher.finalize()).base64EncodedString()
+              continuation.resume(returning: base64Hash)
+            }
+          }
+        )
+      }
+    }, onCancel: {
+      if let requestId = requestRef.id {
+        PHAssetResourceManager.default().cancelDataRequest(requestId)
+      }
+    })
+  }
+}
+
+// Resource selection mirrors official Immich app PHAssetExtensions.swift
+extension PHAsset {
+  func getResource() -> PHAssetResource? {
+    let resources = PHAssetResource.assetResources(for: self)
+    let filteredResources = resources.filter { $0.isMediaResource && isValidResourceType($0.type) }
+
+    guard !filteredResources.isEmpty else { return nil }
+
+    if filteredResources.count == 1 {
+      return filteredResources.first
+    }
+
+    if let currentResource = filteredResources.first(where: { $0.isCurrent }) {
+      return currentResource
+    }
+
+    if let fullSizeResource = filteredResources.first(where: { isFullSizeResourceType($0.type) }) {
+      return fullSizeResource
+    }
+
+    return filteredResources.first
+  }
+
+  private func isValidResourceType(_ type: PHAssetResourceType) -> Bool {
+    switch mediaType {
+    case .image:
+      return [.photo, .alternatePhoto, .fullSizePhoto].contains(type)
+    case .video:
+      return [.video, .fullSizeVideo, .fullSizePairedVideo].contains(type)
+    default:
+      return false
+    }
+  }
+
+  private func isFullSizeResourceType(_ type: PHAssetResourceType) -> Bool {
+    switch mediaType {
+    case .image:
+      return type == .fullSizePhoto
+    case .video:
+      return type == .fullSizeVideo
+    default:
+      return false
     }
   }
 }
 
-private final class NativeSHA1Accumulator {
-  private var hasher = Insecure.SHA1()
-  private let lock = NSLock()
-  func append(_ data: Data) { lock.lock(); hasher.update(data: data); lock.unlock() }
-  func hex() -> String {
-    lock.lock(); defer { lock.unlock() }
-    return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+// Resource properties mirror official Immich app PHAssetResourceExtensions.swift
+extension PHAssetResource {
+  var isCurrent: Bool {
+    return (value(forKey: "isCurrent") as? Bool) ?? false
+  }
+
+  var isMediaResource: Bool {
+    var isMedia = type != .adjustmentData
+    if #available(iOS 17, *) {
+      isMedia = isMedia && type != .photoProxy
+    }
+    return isMedia
   }
 }

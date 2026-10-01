@@ -966,15 +966,25 @@ struct NativePhotosView: View {
   }
 
   private func rebuildDayGroups() {
-    let matchedIDs = Set(cloud.matchedServerIDs.values)
+    let matchedLocalToServer = cloud.matchedServerIDs
+    let matchedServerIDs = Set(matchedLocalToServer.values)
+    let serverAssetByID = Dictionary(model.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+
     var merged: [NativeGridItem] = []
     merged.reserveCapacity(model.assets.count + device.assets.count)
-    for asset in model.assets where !matchedIDs.contains(asset.id) {
+
+    for asset in model.assets where !matchedServerIDs.contains(asset.id) {
       merged.append(NativeGridItem(server: asset, local: nil))
     }
+
     for asset in device.assets {
-      merged.append(NativeGridItem(server: nil, local: asset))
+      if let serverID = matchedLocalToServer[asset.id], let serverAsset = serverAssetByID[serverID] {
+        merged.append(NativeGridItem(server: serverAsset, local: asset))
+      } else {
+        merged.append(NativeGridItem(server: nil, local: asset))
+      }
     }
+
     merged.sort { lhs, rhs in
       if lhs.date == rhs.date { return lhs.id < rhs.id }
       return lhs.date < rhs.date

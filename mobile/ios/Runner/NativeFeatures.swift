@@ -391,8 +391,24 @@ struct NativeResultGrid: View {
   @State private var columns: Int = 3
 
   private var merged: [NativeGridItem] {
-    (assets.map { NativeGridItem(server: $0, local: nil) } + localAssets.map { NativeGridItem(server: nil, local: $0) })
-      .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
+    let matched = NativeSyncCacheStore.shared.matchedServerIDs
+    let serverById = Dictionary(assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let matchedServerIDs = Set(matched.values)
+
+    var items: [NativeGridItem] = []
+    items.reserveCapacity(assets.count + localAssets.count)
+
+    for asset in assets where !matchedServerIDs.contains(asset.id) {
+      items.append(NativeGridItem(server: asset, local: nil))
+    }
+    for asset in localAssets {
+      if let serverID = matched[asset.id], let serverAsset = serverById[serverID] {
+        items.append(NativeGridItem(server: serverAsset, local: asset))
+      } else {
+        items.append(NativeGridItem(server: nil, local: asset))
+      }
+    }
+    return items.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
   }
 
   var body: some View {
@@ -463,15 +479,40 @@ struct NativeResultGrid: View {
   }
 }
 
+enum NativeAssetState {
+  case local   // device only, not synced to server -> icloud.slash
+  case remote  // server only, not on device -> cloud
+  case merged  // synced on both server and device -> checkmark.icloud
+}
+
 struct NativeGridItem: Identifiable {
   let server: NativeAsset?
   let local: NativeDeviceAsset?
-  var id: String { server.map { "server:\($0.id)" } ?? "local:\(local?.id ?? "")" }
+
+  var id: String {
+    if let server, let local { return "merged:\(server.id):\(local.id)" }
+    if let server { return "server:\(server.id)" }
+    return "local:\(local?.id ?? "")"
+  }
+
   var date: Date { server?.date ?? local?.date ?? .distantPast }
+
   var isVideo: Bool {
     if let server { return !server.isImage }
     if let local { return local.isVideo }
     return false
+  }
+
+  var state: NativeAssetState {
+    if let local {
+      if server != nil || NativeSyncCacheStore.shared.isMatched(localId: local.id) {
+        return .merged
+      } else {
+        return .local
+      }
+    } else {
+      return .remote
+    }
   }
 
   func cloudSymbol(matchedServerIDs: [String: String] = NativeSyncCacheStore.shared.matchedServerIDs) -> String {

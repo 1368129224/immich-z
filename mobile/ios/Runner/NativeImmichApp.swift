@@ -1,3 +1,4 @@
+import Combine
 import CryptoKit
 import Foundation
 import Photos
@@ -673,6 +674,7 @@ struct NativePhotosView: View {
   @State private var isSelecting = false
   @State private var initialPositioned = false
   @State private var loadingOlderAnchor: String?
+  @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
 
   init(client: NativeImmichClient, device: NativeDeviceLibrary, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void) {
@@ -825,6 +827,12 @@ struct NativePhotosView: View {
           if !initialPositioned && !cachedDayGroups.isEmpty {
             scrollToBottom(proxy: proxy, animated: false)
           }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .immichScrollPhotosToBottom)) { _ in
+          let now = Date()
+          guard now.timeIntervalSince(lastScrollToBottomTime) > 0.25 else { return }
+          lastScrollToBottomTime = now
+          scrollToBottom(proxy: proxy, animated: true)
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
           if !device.authorized {
@@ -1141,4 +1149,8 @@ struct NativeAssetViewer: View {
     }
     .navigationViewStyle(.stack)
   }
+}
+
+extension Notification.Name {
+  static let immichScrollPhotosToBottom = Notification.Name("ImmichScrollPhotosToBottom")
 }

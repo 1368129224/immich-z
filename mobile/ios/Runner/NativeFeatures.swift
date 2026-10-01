@@ -1,6 +1,7 @@
 import Foundation
 import Photos
 import SwiftUI
+import UIKit
 
 // First native vertical slice against the official Immich v3.2.4 OpenAPI.
 // The complete Flutter app remains available for features not yet ported.
@@ -788,21 +789,153 @@ struct NativeFilteredView: View {
   }
 }
 
+final class TabBarFinderView: UIView {
+  var onSetup: ((UIView) -> Void)?
+
+  override func didMoveToWindow() {
+    super.didMoveToWindow()
+    if window != nil {
+      onSetup?(self)
+    }
+  }
+}
+
+private struct TabBarDoubleTapHelper: UIViewRepresentable {
+  let onPhotosDoubleTap: () -> Void
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(onPhotosDoubleTap: onPhotosDoubleTap)
+  }
+
+  func makeUIView(context: Context) -> TabBarFinderView {
+    let view = TabBarFinderView()
+    view.backgroundColor = .clear
+    view.isUserInteractionEnabled = false
+    view.onSetup = { [weak coordinator = context.coordinator] v in
+      coordinator?.setup(from: v)
+    }
+    DispatchQueue.main.async {
+      context.coordinator.setup(from: view)
+    }
+    return view
+  }
+
+  func updateUIView(_ uiView: TabBarFinderView, context: Context) {
+    context.coordinator.onPhotosDoubleTap = onPhotosDoubleTap
+    context.coordinator.setup(from: uiView)
+  }
+
+  final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+    var onPhotosDoubleTap: () -> Void
+    private weak var tabBar: UITabBar?
+    private var doubleTapGesture: UITapGestureRecognizer?
+
+    init(onPhotosDoubleTap: @escaping () -> Void) {
+      self.onPhotosDoubleTap = onPhotosDoubleTap
+    }
+
+    func setup(from view: UIView) {
+      guard let tabBar = findTabBar(from: view) else { return }
+      if self.tabBar === tabBar { return }
+      if let existing = doubleTapGesture, let oldBar = self.tabBar {
+        oldBar.removeGestureRecognizer(existing)
+      }
+      self.tabBar = tabBar
+
+      let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
+      doubleTap.numberOfTapsRequired = 2
+      doubleTap.cancelsTouchesInView = false
+      doubleTap.delaysTouchesEnded = false
+      doubleTap.delegate = self
+      tabBar.addGestureRecognizer(doubleTap)
+      self.doubleTapGesture = doubleTap
+    }
+
+    private func findTabBar(from view: UIView) -> UITabBar? {
+      var responder: UIResponder? = view
+      while let r = responder {
+        if let tc = r as? UITabBarController { return tc.tabBar }
+        if let vc = r as? UIViewController, let tc = vc.tabBarController { return tc.tabBar }
+        responder = r.next
+      }
+      if let window = view.window ?? UIApplication.shared.connectedScenes
+        .compactMap({ ($0 as? UIWindowScene)?.keyWindow })
+        .first {
+        return findTabBarIn(view: window)
+      }
+      return nil
+    }
+
+    private func findTabBarIn(view: UIView) -> UITabBar? {
+      if let bar = view as? UITabBar { return bar }
+      for sub in view.subviews {
+        if let bar = findTabBarIn(view: sub) { return bar }
+      }
+      return nil
+    }
+
+    @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+      guard let tabBar = self.tabBar ?? gesture.view as? UITabBar else { return }
+      let location = gesture.location(in: tabBar)
+      let width = tabBar.bounds.width
+      guard width > 0 else { return }
+      let tabWidth = width / 4.0
+      if location.x >= 0 && location.x <= tabWidth && location.y >= 0 && location.y <= tabBar.bounds.height {
+        onPhotosDoubleTap()
+      }
+    }
+
+    func gestureRecognizer(
+      _ gestureRecognizer: UIGestureRecognizer,
+      shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+      true
+    }
+  }
+}
+
 struct NativeTabShell: View {
   let client: NativeImmichClient
   let onUseFlutter: () -> Void
   let onLogout: () -> Void
   @StateObject private var device = NativeDeviceLibrary()
+  @State private var selectedTab = 0
+  @State private var lastTab0Tap: Date = .distantPast
+
   var body: some View {
-    TabView {
+    let tabBinding = Binding<Int>(
+      get: { selectedTab },
+      set: { newTab in
+        if newTab == 0 {
+          let now = Date()
+          if now.timeIntervalSince(lastTab0Tap) < 0.55 {
+            NotificationCenter.default.post(name: .immichScrollPhotosToBottom, object: nil)
+          }
+          lastTab0Tap = now
+        }
+        selectedTab = newTab
+      }
+    )
+
+    TabView(selection: tabBinding) {
       NativePhotosView(client: client, device: device, onUseFlutter: onUseFlutter, onLogout: onLogout)
         .tabItem { Label("照片", systemImage: "photo.on.rectangle") }
+        .tag(0)
       NativeSearchView(client: client)
         .tabItem { Label("搜索", systemImage: "magnifyingglass") }
+        .tag(1)
       NativeAlbumsView(client: client, device: device)
         .tabItem { Label("相册", systemImage: "rectangle.stack") }
+        .tag(2)
       NativeLibraryView(client: client, device: device)
         .tabItem { Label("资源库", systemImage: "square.grid.2x2") }
+        .tag(3)
     }
+    .background(
+      TabBarDoubleTapHelper {
+        selectedTab = 0
+        NotificationCenter.default.post(name: .immichScrollPhotosToBottom, object: nil)
+      }
+    )
   }
 }

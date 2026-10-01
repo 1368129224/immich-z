@@ -595,6 +595,8 @@ struct NativePhotosView: View {
   @StateObject private var cloud = NativeCloudStatus()
   @State private var zoom: CGFloat = 1
   @State private var zoomStart: CGFloat = 1
+  @State private var gridColumnCount = 4
+  @State private var cachedDayGroups: [NativeDayGroup] = []
   @State private var selected: NativeAsset?
   @State private var selectedLocal: NativeDeviceAsset?
   @State private var loadingOlderAnchor: String?
@@ -624,9 +626,9 @@ struct NativePhotosView: View {
                   .id("older-loader")
                   .onAppear { if initialPositioned { requestOlder(proxy: proxy) } }
               }
-              ForEach(dayGroups, id: \.date) { group in
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
-                    ForEach(group.assets) { entry in
+              ForEach(cachedDayGroups, id: \.date) { group in
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: gridColumnCount), spacing: 2) {
+                  ForEach(group.assets) { entry in
                       Button {
                         selected = entry.server
                         selectedLocal = entry.local
@@ -635,7 +637,8 @@ struct NativePhotosView: View {
                           if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
                           else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
                         }
-                        .frame(width: tileWidth(in: geometry.size.width), height: tileWidth(in: geometry.size.width))
+                        .frame(maxWidth: .infinity)
+                        .aspectRatio(1, contentMode: .fit)
                         .clipped()
                         .overlay(alignment: .topLeading) {
                           if entry.id == group.assets.first?.id {
@@ -663,25 +666,47 @@ struct NativePhotosView: View {
           }
           .background(Color(uiColor: .systemBackground))
           .simultaneousGesture(MagnificationGesture()
-            .onChanged { value in zoom = min(4.5, max(0.27, zoomStart * value)) }
-            .onEnded { _ in zoomStart = zoom })
+            .onChanged { value in
+              let proposedZoom = min(4.5, max(0.27, zoomStart * value))
+              let tileMinimum = min(420, max(24, 92 * proposedZoom))
+              let columns = max(1, Int((geometry.size.width + 2) / (tileMinimum + 2)))
+              // Keep pinch samples out of the view state; reflow only when the
+              // user crosses a discrete grid-density boundary.
+              if columns != gridColumnCount {
+                gridColumnCount = columns
+                zoom = proposedZoom
+              }
+            }
+            .onEnded { value in
+              let finalZoom = min(4.5, max(0.27, zoomStart * value))
+              zoomStart = finalZoom
+              zoom = finalZoom
+              updateGridColumns(for: geometry.size.width)
+            })
+          .onChange(of: geometry.size.width) { width in updateGridColumns(for: width) }
+          .onChange(of: model.assets.count) { _ in rebuildDayGroups() }
+          .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
           .refreshable {
             cloud.reset()
             await model.loadInitial()
+            rebuildDayGroups()
             Task { await cloud.check(device.assets, client: client) }
             await Task.yield()
             withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
           }
           .onChange(of: device.assets.count) { _ in
+            rebuildDayGroups()
             Task { await cloud.check(device.assets, client: client) }
-            guard !initialPositioned, !mergedAssets.isEmpty else { return }
+            guard !initialPositioned, !cachedDayGroups.isEmpty else { return }
             DispatchQueue.main.async {
               proxy.scrollTo(bottomAnchor, anchor: .bottom)
               initialPositioned = true
             }
           }
           .onAppear {
-            if !initialPositioned && !mergedAssets.isEmpty {
+            updateGridColumns(for: geometry.size.width)
+            rebuildDayGroups()
+            if !initialPositioned && !cachedDayGroups.isEmpty {
               DispatchQueue.main.async {
                 proxy.scrollTo(bottomAnchor, anchor: .bottom)
                 initialPositioned = true
@@ -690,7 +715,8 @@ struct NativePhotosView: View {
             guard model.assets.isEmpty, !model.isLoading else { return }
             Task {
               await model.loadInitial()
-              if !mergedAssets.isEmpty && !initialPositioned {
+              rebuildDayGroups()
+              if !cachedDayGroups.isEmpty && !initialPositioned {
                 DispatchQueue.main.async {
                   proxy.scrollTo(bottomAnchor, anchor: .bottom)
                   initialPositioned = true
@@ -727,7 +753,7 @@ struct NativePhotosView: View {
         }
         ToolbarItem(placement: .navigationBarTrailing) {
           Menu {
-            Button(action: { Task { cloud.reset(); await model.loadInitial(); await cloud.check(device.assets, client: client) } }) {
+            Button(action: { Task { cloud.reset(); await model.loadInitial(); rebuildDayGroups(); await cloud.check(device.assets, client: client) } }) {
               Label("刷新", systemImage: "arrow.clockwise")
             }
             Button(action: onUseFlutter) {
@@ -750,18 +776,20 @@ struct NativePhotosView: View {
     .transaction { $0.disablesAnimations = true }
   }
 
-  private var matchedServerIDs: Set<String> { Set(cloud.matchedServerIDs.values) }
-
-  private var mergedAssets: [NativeGridItem] {
-    (model.assets.filter { !matchedServerIDs.contains($0.id) }
+  private func rebuildDayGroups() {
+    let matchedIDs = Set(cloud.matchedServerIDs.values)
+    let merged = (model.assets.filter { !matchedIDs.contains($0.id) }
       .map { NativeGridItem(server: $0, local: nil) }
       + device.assets.map { NativeGridItem(server: nil, local: $0) })
       .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
+    let groups = Dictionary(grouping: merged) { Calendar.current.startOfDay(for: $0.date) }
+    cachedDayGroups = groups.keys.sorted().map { NativeDayGroup(date: $0, assets: groups[$0] ?? []) }
   }
 
-  private var dayGroups: [NativeDayGroup] {
-    let groups = Dictionary(grouping: mergedAssets) { Calendar.current.startOfDay(for: $0.date) }
-    return groups.keys.sorted().map { NativeDayGroup(date: $0, assets: groups[$0] ?? []) }
+  private func updateGridColumns(for width: CGFloat) {
+    guard width > 0 else { return }
+    let tileMinimum = min(420, max(24, 92 * zoom))
+    gridColumnCount = max(1, Int((width + 2) / (tileMinimum + 2)))
   }
 
   private func cloudSymbol(for entry: NativeGridItem) -> String {
@@ -776,15 +804,9 @@ struct NativePhotosView: View {
     return cloud.checkedIDs.contains(local.id) ? "未上传" : "上传状态未核实"
   }
 
-  private func tileWidth(in width: CGFloat) -> CGFloat {
-    let gap: CGFloat = 2
-    let columns = max(1, Int((width + gap) / (minimumTile + gap)))
-    return (width - CGFloat(columns - 1) * gap) / CGFloat(columns)
-  }
-
   private func requestOlder(proxy: ScrollViewProxy) {
     guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading else { return }
-    let anchor = mergedAssets.first?.id
+    let anchor = cachedDayGroups.first?.assets.first?.id
     loadingOlderAnchor = anchor ?? "pending"
     Task {
       await model.loadOlder()

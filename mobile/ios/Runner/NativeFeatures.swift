@@ -10,6 +10,8 @@ final class NativeDeviceLibrary: ObservableObject {
   @Published private(set) var authorized = false
   @Published private(set) var assets: [NativeDeviceAsset] = []
   @Published private(set) var albums: [NativeDeviceAlbum] = []
+  @Published private(set) var isLoading = false
+  private var refreshGeneration = 0
 
   init() { refresh() }
 
@@ -21,22 +23,44 @@ final class NativeDeviceLibrary: ObservableObject {
   func refresh() {
     let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     authorized = status == .authorized || status == .limited
-    guard authorized else { assets = []; albums = []; return }
-    let options = PHFetchOptions()
-    options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
-    let results = PHAsset.fetchAssets(with: options)
-    var entries: [NativeDeviceAsset] = []
-    results.enumerateObjects { item, _, _ in
-      entries.append(NativeDeviceAsset(id: item.localIdentifier, date: item.creationDate ?? .distantPast, isVideo: item.mediaType == .video))
+    guard authorized else {
+      assets = []
+      albums = []
+      isLoading = false
+      return
     }
-    assets = entries
-    let collections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
-    var localAlbums: [NativeDeviceAlbum] = []
-    collections.enumerateObjects { collection, _, _ in
-      let count = PHAsset.fetchAssets(in: collection, options: nil).count
-      localAlbums.append(NativeDeviceAlbum(id: collection.localIdentifier, name: collection.localizedTitle ?? "未命名", count: count))
+    refreshGeneration += 1
+    let generation = refreshGeneration
+    isLoading = true
+    Task { [weak self] in
+      let library = await Task.detached(priority: .userInitiated) {
+        let options = PHFetchOptions()
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+        let results = PHAsset.fetchAssets(with: options)
+        var entries: [NativeDeviceAsset] = []
+        entries.reserveCapacity(results.count)
+        results.enumerateObjects { item, _, _ in
+          entries.append(NativeDeviceAsset(
+            id: item.localIdentifier,
+            date: item.creationDate ?? .distantPast,
+            isVideo: item.mediaType == .video,
+            contentVersion: Int((item.modificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+          ))
+        }
+        let collections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
+        var localAlbums: [NativeDeviceAlbum] = []
+        collections.enumerateObjects { collection, _, _ in
+          let count = PHAsset.fetchAssets(in: collection, options: nil).count
+          localAlbums.append(NativeDeviceAlbum(id: collection.localIdentifier, name: collection.localizedTitle ?? "未命名", count: count))
+        }
+        localAlbums.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        return (entries, localAlbums)
+      }.value
+      guard let self, self.refreshGeneration == generation else { return }
+      self.assets = library.0
+      self.albums = library.1
+      self.isLoading = false
     }
-    albums = localAlbums.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
   }
 
   func assets(in album: NativeDeviceAlbum) -> [NativeDeviceAsset] {
@@ -47,16 +71,27 @@ final class NativeDeviceLibrary: ObservableObject {
   }
 }
 
-struct NativeDeviceAsset: Identifiable {
+struct NativeDeviceAsset: Identifiable, Sendable {
   let id: String
   let date: Date
   let isVideo: Bool
+  let contentVersion: Int
 }
 
-struct NativeDeviceAlbum: Identifiable {
+struct NativeDeviceAlbum: Identifiable, Sendable {
   let id: String
   let name: String
   let count: Int
+}
+
+private enum NativeLocalThumbnailCache {
+  static let images: NSCache<NSString, UIImage> = {
+    let cache = NSCache<NSString, UIImage>()
+    cache.countLimit = 500
+    cache.totalCostLimit = 80 * 1024 * 1024
+    return cache
+  }()
+  static let manager = PHCachingImageManager()
 }
 
 struct NativeDeviceThumbnail: View {
@@ -67,12 +102,28 @@ struct NativeDeviceThumbnail: View {
       if let image { Image(uiImage: image).resizable().scaledToFill() }
       else { Rectangle().fill(Color(uiColor: .secondarySystemBackground)) }
     }
-    .task(id: asset.id) {
+    .task(id: "\(asset.id):\(asset.contentVersion)") {
+      let key = NSString(string: "\(asset.id):\(asset.contentVersion)")
+      if let cached = NativeLocalThumbnailCache.images.object(forKey: key) {
+        image = cached
+        return
+      }
       guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [asset.id], options: nil).firstObject else { return }
       let options = PHImageRequestOptions()
       options.isNetworkAccessAllowed = false
-      options.deliveryMode = .opportunistic
-      PHImageManager.default().requestImage(for: source, targetSize: CGSize(width: 240, height: 240), contentMode: .aspectFill, options: options) { result, _ in
+      options.deliveryMode = .fastFormat
+      options.resizeMode = .fast
+      NativeLocalThumbnailCache.manager.requestImage(
+        for: source,
+        targetSize: CGSize(width: 240, height: 240),
+        contentMode: .aspectFill,
+        options: options
+      ) { result, info in
+        guard info?[PHImageCancelledKey] as? Bool != true,
+              info?[PHImageErrorKey] == nil,
+              let result,
+              info?[PHImageResultIsDegradedKey] as? Bool != true else { return }
+        NativeLocalThumbnailCache.images.setObject(result, forKey: key, cost: Int(result.size.width * result.size.height * 4))
         Task { @MainActor in image = result }
       }
     }
@@ -124,7 +175,8 @@ struct NativeDeviceGrid: View {
                 ForEach(groups[day] ?? []) { asset in
                   Button { selected = asset } label: {
                     NativeDeviceThumbnail(asset: asset)
-                      .frame(height: max(72, min(320, 120 * zoom)))
+                      .frame(maxWidth: .infinity)
+                      .aspectRatio(1, contentMode: .fit)
                       .clipped()
                       .overlay(alignment: .bottomTrailing) {
                         if asset.isVideo { Image(systemName: "video.fill").foregroundColor(.white).padding(5) }
@@ -349,7 +401,7 @@ struct NativeResultGrid: View {
                       if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
                       else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
                     }
-                    .frame(height: min(320, max(72, 120 * zoom))).clipped()
+                    .frame(maxWidth: .infinity).aspectRatio(1, contentMode: .fit).clipped()
                     .overlay(alignment: .bottomTrailing) {
                       if entry.local != nil { Image(systemName: "iphone").foregroundColor(.white).padding(4) }
                     }

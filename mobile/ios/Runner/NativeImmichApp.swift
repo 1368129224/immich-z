@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Photos
 import Security
@@ -106,6 +107,67 @@ private enum NativeSessionStore {
       UserDefaults.standard.set(String(data: data, encoding: .utf8), forKey: fallbackKey)
     }
   }
+}
+
+private actor NativeThumbnailDiskCache {
+  static let shared = NativeThumbnailDiskCache()
+  private let directory: URL
+  private var writesSincePrune = 0
+
+  private init() {
+    directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+      .appendingPathComponent("ImmichZThumbnails", isDirectory: true)
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  }
+
+  func data(for key: String) -> Data? {
+    try? Data(contentsOf: fileURL(for: key), options: .mappedIfSafe)
+  }
+
+  func store(_ data: Data, for key: String) {
+    let url = fileURL(for: key)
+    try? data.write(to: url, options: .atomic)
+    writesSincePrune += 1
+    if writesSincePrune >= 128 {
+      writesSincePrune = 0
+      pruneIfNeeded()
+    }
+  }
+
+  private func pruneIfNeeded() {
+    let files = (try? FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+      options: [.skipsHiddenFiles]
+    )) ?? []
+    let entries = files.compactMap { url -> (URL, Int, Date)? in
+      guard let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+            let size = values.fileSize else { return nil }
+      return (url, size, values.contentModificationDate ?? .distantPast)
+    }
+    var total = entries.reduce(0) { $0 + $1.1 }
+    guard total > 384 * 1024 * 1024 else { return }
+    for (url, size, _) in entries.sorted(by: { $0.2 < $1.2 }) {
+      try? FileManager.default.removeItem(at: url)
+      total -= size
+      if total <= 320 * 1024 * 1024 { break }
+    }
+  }
+
+  private func fileURL(for key: String) -> URL {
+    let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+    return directory.appendingPathComponent(digest).appendingPathExtension("thumb")
+  }
+}
+
+private enum NativeThumbnailPipeline {
+  static let networkSession: URLSession = {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.urlCache = nil
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    configuration.httpMaximumConnectionsPerHost = 5
+    return URLSession(configuration: configuration)
+  }()
 }
 
 private enum NativeAPIError: LocalizedError {
@@ -290,12 +352,22 @@ final class NativeImmichClient {
   }
 
   func imageData(for url: URL) async throws -> Data {
+    try await imageData(for: url, using: session, cacheable: false)
+  }
+
+  func thumbnailData(for url: URL) async throws -> Data {
+    try await imageData(for: url, using: NativeThumbnailPipeline.networkSession, cacheable: true)
+  }
+
+  private func imageData(for url: URL, using imageSession: URLSession, cacheable: Bool) async throws -> Data {
     guard let endpoint = URL(string: config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")),
           url.scheme == endpoint.scheme, url.host == endpoint.host, url.port == endpoint.port,
           url.path.hasPrefix(endpoint.path + "/") else { throw NativeAPIError.invalidServer }
     var request = URLRequest(url: url)
+    request.cachePolicy = cacheable ? .returnCacheDataElseLoad : .useProtocolCachePolicy
+    request.setValue("image/*", forHTTPHeaderField: "Accept")
     applyAuth(to: &request)
-    let (data, response) = try await nativeData(for: request, using: session)
+    let (data, response) = try await nativeData(for: request, using: imageSession)
     try check(response: response, data: data)
     return data
   }
@@ -633,7 +705,15 @@ struct NativePhotosView: View {
                   .id("older-loader")
                   .onAppear { if initialPositioned { requestOlder(proxy: proxy) } }
               }
-              if !model.isLoading && model.error == nil &&
+              if model.assets.isEmpty && (model.isLoading || device.isLoading) {
+                VStack(spacing: 10) {
+                  ProgressView()
+                  Text("正在加载照片缩略图…")
+                    .font(.caption).foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 240)
+              }
+              if !model.isLoading && !device.isLoading && model.error == nil &&
                   cachedDayGroups.isEmpty && (device.assets.isEmpty || !device.authorized) {
                 VStack(spacing: 8) {
                   Image(systemName: "photo.on.rectangle.angled")
@@ -963,6 +1043,30 @@ private enum NativeThumbnailCache {
   }()
 }
 
+@MainActor
+private final class NativeThumbnailRequestLimiter {
+  static let shared = NativeThumbnailRequestLimiter()
+  private let maximumActive = 5
+  private var active = 0
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  func acquire() async {
+    if active < maximumActive {
+      active += 1
+    } else {
+      await withCheckedContinuation { waiters.append($0) }
+    }
+  }
+
+  func release() {
+    if waiters.isEmpty {
+      active = max(0, active - 1)
+    } else {
+      waiters.removeFirst().resume()
+    }
+  }
+}
+
 struct NativeThumbnail: View {
   let client: NativeImmichClient
   let asset: NativeAsset
@@ -974,19 +1078,61 @@ struct NativeThumbnail: View {
         Image(uiImage: image).resizable().scaledToFill()
       } else {
         Rectangle().fill(Color(uiColor: .secondarySystemBackground))
-          .overlay { ProgressView().scaleEffect(0.7) }
       }
     }
-    .task(id: asset.id) {
-      let key = NSString(string: "\(client.config.serverUrl):\(asset.id)")
-      if let cached = NativeThumbnailCache.images.object(forKey: key) { image = cached; return }
+    .task(id: "\(client.config.serverUrl):\(asset.id)") {
+      image = nil
+      let credential = client.config.accessToken ?? client.config.apiKey ?? ""
+      let accountDigest = SHA256.hash(data: Data("\(client.config.serverUrl):\(credential)".utf8))
+        .map { String(format: "%02x", $0) }.joined()
+      let cacheKey = "\(accountDigest):\(asset.id)"
+      let key = NSString(string: cacheKey)
+      if let cached = NativeThumbnailCache.images.object(forKey: key) {
+        image = cached
+        return
+      }
+      if let cachedData = await NativeThumbnailDiskCache.shared.data(for: cacheKey),
+         let cachedImage = UIImage(data: cachedData) {
+        NativeThumbnailCache.images.setObject(
+          cachedImage,
+          forKey: key,
+          cost: Int(cachedImage.size.width * cachedImage.size.height * 4)
+        )
+        image = cachedImage
+        return
+      } else {
+        image = UIImage(systemName: "photo")
+      }
       guard let url = client.thumbnailURL(for: asset) else { return }
+      await NativeThumbnailRequestLimiter.shared.acquire()
+      defer { NativeThumbnailRequestLimiter.shared.release() }
+      guard !Task.isCancelled else { return }
       do {
-        let data = try await client.imageData(for: url)
+        let data = try await client.thumbnailData(for: url)
         guard !Task.isCancelled, let decoded = UIImage(data: data) else { return }
-        NativeThumbnailCache.images.setObject(decoded, forKey: key, cost: data.count)
-        image = decoded
+        let squareImage = await Task.detached(priority: .utility) {
+          Self.makeSquareThumbnail(from: decoded)
+        }.value
+        guard !Task.isCancelled, let cachedData = squareImage.jpegData(compressionQuality: 0.82) else { return }
+        await NativeThumbnailDiskCache.shared.store(cachedData, for: cacheKey)
+        NativeThumbnailCache.images.setObject(
+          squareImage,
+          forKey: key,
+          cost: Int(squareImage.size.width * squareImage.size.height * 4)
+        )
+        image = squareImage
       } catch { image = nil }
+    }
+  }
+
+  private static func makeSquareThumbnail(from image: UIImage) -> UIImage {
+    let side = min(image.size.width, image.size.height)
+    let origin = CGPoint(x: (image.size.width - side) / 2, y: (image.size.height - side) / 2)
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = min(2, image.scale)
+    format.opaque = true
+    return UIGraphicsImageRenderer(size: CGSize(width: side, height: side), format: format).image { _ in
+      image.draw(at: CGPoint(x: -origin.x, y: -origin.y))
     }
   }
 }

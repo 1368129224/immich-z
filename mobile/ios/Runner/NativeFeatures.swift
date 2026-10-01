@@ -158,20 +158,21 @@ struct NativeDeviceGrid: View {
   let title: String
   let assets: [NativeDeviceAsset]
   @State private var zoom: CGFloat = 1
-  @State private var startZoom: CGFloat = 1
+  @GestureState private var pinchScale: CGFloat = 1
   @State private var selected: NativeDeviceAsset?
   @State private var positioned = false
   private let bottom = "device-bottom"
+  private var minimumTile: CGFloat { min(420, max(24, 92 * zoom * pinchScale)) }
 
   var body: some View {
     GeometryReader { geometry in
       ScrollViewReader { proxy in
         ScrollView {
-          LazyVStack(alignment: .leading, spacing: 4) {
+          LazyVStack(alignment: .leading, spacing: 2) {
             let groups = Dictionary(grouping: assets) { Calendar.current.startOfDay(for: $0.date) }
             ForEach(groups.keys.sorted(), id: \.self) { day in
               Text(day, style: .date).font(.headline).padding(.horizontal)
-              LazyVGrid(columns: [GridItem(.adaptive(minimum: min(320, max(72, 120 * zoom))), spacing: 2)], spacing: 2) {
+              LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
                 ForEach(groups[day] ?? []) { asset in
                   Button { selected = asset } label: {
                     NativeDeviceThumbnail(asset: asset)
@@ -179,8 +180,12 @@ struct NativeDeviceGrid: View {
                       .aspectRatio(1, contentMode: .fit)
                       .clipped()
                       .overlay(alignment: .bottomTrailing) {
-                        if asset.isVideo { Image(systemName: "video.fill").foregroundColor(.white).padding(5) }
+                        Image(systemName: asset.isVideo ? "video.fill" : "iphone")
+                          .font(.system(size: minimumTile < 44 ? 10 : 15, weight: .semibold))
+                          .foregroundColor(.white).shadow(color: .black, radius: 2)
+                          .padding(3)
                       }
+                      .contentShape(Rectangle())
                   }
                   .buttonStyle(.plain)
                   .accessibilityLabel("设备照片，\(asset.date.formatted())")
@@ -191,8 +196,12 @@ struct NativeDeviceGrid: View {
           }
         }
         .simultaneousGesture(MagnificationGesture()
-          .onChanged { zoom = min(2.7, max(0.6, startZoom * $0)) }
-          .onEnded { _ in startZoom = zoom })
+          .updating($pinchScale) { value, scale, _ in
+            scale = value
+          }
+          .onEnded { value in
+            zoom = min(4.5, max(0.27, zoom * value))
+          })
         .onChange(of: assets.count) { _ in
           guard !positioned, !assets.isEmpty else { return }
           proxy.scrollTo(bottom, anchor: .bottom)
@@ -371,14 +380,15 @@ struct NativeResultGrid: View {
   }
   @State private var positioned = false
   @State private var zoom: CGFloat = 1
-  @State private var startZoom: CGFloat = 1
+  @GestureState private var pinchScale: CGFloat = 1
   private let bottom = "results-bottom"
+  private var minimumTile: CGFloat { min(420, max(24, 92 * zoom * pinchScale)) }
 
   var body: some View {
     GeometryReader { geometry in
       ScrollViewReader { proxy in
         ScrollView {
-          LazyVStack(spacing: 4) {
+          LazyVStack(spacing: 2) {
             if hasOlder && !assets.isEmpty {
               ProgressView().frame(maxWidth: .infinity).padding(8)
                 .onAppear {
@@ -391,7 +401,7 @@ struct NativeResultGrid: View {
             let groups = Dictionary(grouping: merged) { Calendar.current.startOfDay(for: $0.date) }
             ForEach(groups.keys.sorted(), id: \.self) { day in
               Text(day, style: .date).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
-              LazyVGrid(columns: [GridItem(.adaptive(minimum: min(320, max(72, 120 * zoom))), spacing: 2)], spacing: 2) {
+              LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
                 ForEach(groups[day] ?? []) { entry in
                   Button {
                     selected = entry.server
@@ -401,10 +411,16 @@ struct NativeResultGrid: View {
                       if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
                       else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
                     }
-                    .frame(maxWidth: .infinity).aspectRatio(1, contentMode: .fit).clipped()
+                    .frame(maxWidth: .infinity)
+                    .aspectRatio(1, contentMode: .fit)
+                    .clipped()
                     .overlay(alignment: .bottomTrailing) {
-                      if entry.local != nil { Image(systemName: "iphone").foregroundColor(.white).padding(4) }
+                      Image(systemName: entry.local != nil ? "iphone" : "cloud")
+                        .font(.system(size: minimumTile < 44 ? 10 : 15, weight: .semibold))
+                        .foregroundColor(.white).shadow(color: .black, radius: 2)
+                        .padding(3)
                     }
+                    .contentShape(Rectangle())
                   }.buttonStyle(.plain).id(entry.id)
                 }
               }
@@ -413,8 +429,12 @@ struct NativeResultGrid: View {
           }
         }
         .simultaneousGesture(MagnificationGesture()
-          .onChanged { zoom = min(2.7, max(0.6, startZoom * $0)) }
-          .onEnded { _ in startZoom = zoom })
+          .updating($pinchScale) { value, scale, _ in
+            scale = value
+          }
+          .onEnded { value in
+            zoom = min(4.5, max(0.27, zoom * value))
+          })
         .onChange(of: merged.count) { _ in
           guard !positioned, !merged.isEmpty else { return }
           proxy.scrollTo(bottom, anchor: .bottom)
@@ -490,8 +510,21 @@ private struct NativeSearchView: View {
                     HStack {
                       ForEach(section.items) { tile in
                         Button { term = tile.name; runSearch() } label: {
-                          VStack(alignment: .leading) {
-                            if let asset = tile.asset { NativeThumbnail(client: client, asset: asset).frame(width: 108, height: 108).clipped() }
+                          VStack(alignment: .leading, spacing: 4) {
+                            Group {
+                              if let asset = tile.asset {
+                                NativeThumbnail(client: client, asset: asset)
+                              } else {
+                                Rectangle().fill(Color(uiColor: .secondarySystemBackground))
+                                  .overlay {
+                                    Image(systemName: "photo")
+                                      .foregroundColor(.secondary)
+                                  }
+                              }
+                            }
+                            .frame(width: 108, height: 108)
+                            .aspectRatio(1, contentMode: .fit)
+                            .clipped()
                             Text(tile.name).font(.caption).lineLimit(1)
                           }.frame(width: 108)
                         }.buttonStyle(.plain)

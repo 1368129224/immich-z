@@ -171,7 +171,8 @@ struct NativeDeviceGrid: View {
           ForEach(groups.keys.sorted(), id: \.self) { day in
             VStack(alignment: .leading, spacing: 2) {
               Text(NativeImmichClient.formatChineseDate(day)).font(.headline).padding(.horizontal)
-              LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
+              let gridSpacing: CGFloat = columns > 7 ? 1 : 2
+              LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
                 ForEach(groups[day] ?? []) { asset in
                   Button { selected = asset } label: {
                     Color.clear
@@ -185,11 +186,11 @@ struct NativeDeviceGrid: View {
                       )
                       .clipped()
                       .overlay(alignment: .bottomTrailing) {
-                        if asset.isVideo {
+                        if asset.isVideo && columns <= 7 {
                           Image(systemName: "play.fill")
-                            .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
+                            .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
                             .foregroundColor(.white).shadow(color: .black, radius: 2)
-                            .padding(3)
+                            .padding(columns > 4 ? 1.5 : 3)
                         }
                       }
                       .contentShape(Rectangle())
@@ -210,18 +211,13 @@ struct NativeDeviceGrid: View {
             if gestureBaseColumns == nil {
               gestureBaseColumns = base
             }
-            let target: Int
-            if value > 1.75 {
-              target = max(1, base - 2)
-            } else if value > 1.20 {
-              target = max(1, base - 1)
-            } else if value < 0.55 {
-              target = min(5, base + 2)
-            } else if value < 0.82 {
-              target = min(5, base + 1)
+            let delta: Double
+            if value >= 1.0 {
+              delta = -(value - 1.0) * 4.0
             } else {
-              target = base
+              delta = (1.0 / max(0.08, value) - 1.0) * 4.0
             }
+            let target = min(15, max(1, Int(round(Double(base) + delta))))
             if target != columns {
               UIImpactFeedbackGenerator(style: .light).impactOccurred()
               withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -446,7 +442,8 @@ struct NativeResultGrid: View {
         ForEach(groups.keys.sorted(by: >), id: \.self) { day in
           VStack(alignment: .leading, spacing: 2) {
             Text(NativeImmichClient.formatChineseDate(day)).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
+            let gridSpacing: CGFloat = columns > 7 ? 1 : 2
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
               ForEach(groups[day] ?? []) { entry in
                 Button {
                   selected = entry.server
@@ -466,18 +463,20 @@ struct NativeResultGrid: View {
                     )
                     .clipped()
                     .overlay(alignment: .bottomLeading) {
-                      if entry.isVideo {
+                      if entry.isVideo && columns <= 7 {
                         Image(systemName: "play.fill")
-                          .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
+                          .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
                           .foregroundColor(.white).shadow(color: .black, radius: 2)
-                          .padding(3)
+                          .padding(columns > 4 ? 1.5 : 3)
                       }
                     }
                     .overlay(alignment: .bottomTrailing) {
-                      Image(systemName: entry.cloudSymbol())
-                        .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
-                        .foregroundColor(.white).shadow(color: .black, radius: 2)
-                        .padding(3)
+                      if columns <= 7 {
+                        Image(systemName: entry.cloudSymbol())
+                          .font(.system(size: columns > 4 ? 7 : 13, weight: .semibold))
+                          .foregroundColor(.white).shadow(color: .black, radius: 2)
+                          .padding(columns > 4 ? 1.5 : 3)
+                      }
                     }
                     .contentShape(Rectangle())
                 }
@@ -500,18 +499,13 @@ struct NativeResultGrid: View {
           if gestureBaseColumns == nil {
             gestureBaseColumns = base
           }
-          let target: Int
-          if value > 1.75 {
-            target = max(1, base - 2)
-          } else if value > 1.20 {
-            target = max(1, base - 1)
-          } else if value < 0.55 {
-            target = min(5, base + 2)
-          } else if value < 0.82 {
-            target = min(5, base + 1)
+          let delta: Double
+          if value >= 1.0 {
+            delta = -(value - 1.0) * 4.0
           } else {
-            target = base
+            delta = (1.0 / max(0.08, value) - 1.0) * 4.0
           }
+          let target = min(15, max(1, Int(round(Double(base) + delta))))
           if target != columns {
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {

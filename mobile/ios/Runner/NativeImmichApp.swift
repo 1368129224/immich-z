@@ -801,7 +801,15 @@ struct NativePhotosView: View {
             }
             ForEach(cachedDayGroups, id: \.date) { group in
               VStack(alignment: .leading, spacing: 2) {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
+                if columns > 6 {
+                  Text(formatDateBadge(for: group))
+                    .font(.caption2.weight(.bold))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.top, 4)
+                }
+                let gridSpacing: CGFloat = columns > 7 ? 1 : 2
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
                   ForEach(group.assets) { entry in
                     Button {
                       if isSelecting {
@@ -825,7 +833,7 @@ struct NativePhotosView: View {
                         )
                         .clipped()
                         .overlay(alignment: .topLeading) {
-                          if entry.id == group.assets.first?.id {
+                          if columns <= 6 && entry.id == group.assets.first?.id {
                             Text(formatDateBadge(for: group))
                               .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
                               .foregroundColor(.white)
@@ -839,25 +847,27 @@ struct NativePhotosView: View {
                           }
                         }
                         .overlay(alignment: .bottomLeading) {
-                          if entry.isVideo {
+                          if entry.isVideo && columns <= 7 {
                             Image(systemName: "play.fill")
-                              .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
+                              .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
                               .foregroundColor(.white).shadow(color: .black, radius: 2)
-                              .padding(3)
+                              .padding(columns > 4 ? 1.5 : 3)
                           }
                         }
                         .overlay(alignment: .bottomTrailing) {
-                          Image(systemName: cloudSymbol(for: entry))
-                            .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
-                            .foregroundColor(.white).shadow(color: .black, radius: 2)
-                            .padding(3)
+                          if columns <= 7 {
+                            Image(systemName: cloudSymbol(for: entry))
+                              .font(.system(size: columns > 4 ? 7 : 13, weight: .semibold))
+                              .foregroundColor(.white).shadow(color: .black, radius: 2)
+                              .padding(columns > 4 ? 1.5 : 3)
+                          }
                         }
                         .overlay(alignment: .topTrailing) {
                           if selectedIDs.contains(entry.id) {
                             Image(systemName: "checkmark.circle.fill")
-                              .font(.system(size: 20, weight: .semibold))
+                              .font(.system(size: columns > 7 ? 12 : (columns > 4 ? 16 : 20), weight: .semibold))
                               .foregroundStyle(.white, .blue)
-                              .padding(4)
+                              .padding(columns > 7 ? 1 : 4)
                           }
                         }
                         .contentShape(Rectangle())
@@ -883,18 +893,13 @@ struct NativePhotosView: View {
               if gestureBaseColumns == nil {
                 gestureBaseColumns = base
               }
-              let target: Int
-              if value > 1.75 {
-                target = max(1, base - 2)
-              } else if value > 1.20 {
-                target = max(1, base - 1)
-              } else if value < 0.55 {
-                target = min(5, base + 2)
-              } else if value < 0.82 {
-                target = min(5, base + 1)
+              let delta: Double
+              if value >= 1.0 {
+                delta = -(value - 1.0) * 4.0
               } else {
-                target = base
+                delta = (1.0 / max(0.08, value) - 1.0) * 4.0
               }
+              let target = min(15, max(1, Int(round(Double(base) + delta))))
               if target != columns {
                 UIImpactFeedbackGenerator(style: .light).impactOccurred()
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
@@ -994,7 +999,10 @@ struct NativePhotosView: View {
                     Text("2 列 · 大图").tag(2)
                     Text("3 列 · 标准").tag(3)
                     Text("4 列 · 紧凑").tag(4)
-                    Text("5 列 · 微缩").tag(5)
+                    Text("5 列 · 密集").tag(5)
+                    Text("7 列 · 微缩").tag(7)
+                    Text("10 列 · 概览").tag(10)
+                    Text("15 列 · 全景").tag(15)
                   }
                 } label: {
                   Image(systemName: "square.grid.3x3")

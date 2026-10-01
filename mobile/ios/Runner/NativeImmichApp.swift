@@ -753,10 +753,19 @@ struct NativePhotosView: View {
                           }
                         }
                         .overlay(alignment: .bottomTrailing) {
-                          Image(systemName: cloudSymbol(for: entry))
-                            .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
-                            .foregroundColor(.white).shadow(color: .black, radius: 2)
-                            .padding(3)
+                          HStack(spacing: 2) {
+                            if shouldShowUnuploadedBadge(for: entry) {
+                              Image(systemName: "icloud.slash")
+                                .font(.system(size: columns > 4 ? 8 : 11, weight: .semibold))
+                                .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            }
+                            if entry.isVideo {
+                              Image(systemName: "play.fill")
+                                .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
+                                .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            }
+                          }
+                          .padding(3)
                         }
                         .overlay(alignment: .topTrailing) {
                           if selectedIDs.contains(entry.id) {
@@ -991,16 +1000,17 @@ struct NativePhotosView: View {
     selectedIDs.removeAll()
   }
 
-  private func cloudSymbol(for entry: NativeGridItem) -> String {
-    guard let local = entry.local else { return "cloud" }
-    if cloud.matchedServerIDs[local.id] != nil { return "checkmark.icloud" }
-    return cloud.checkedIDs.contains(local.id) ? "icloud.slash" : "questionmark.circle"
+  private func shouldShowUnuploadedBadge(for entry: NativeGridItem) -> Bool {
+    guard let local = entry.local else { return false }
+    return cloud.checkedIDs.contains(local.id) && cloud.matchedServerIDs[local.id] == nil
   }
 
   private func cloudDescription(for entry: NativeGridItem) -> String {
-    guard let local = entry.local else { return "仅服务器" }
-    if cloud.matchedServerIDs[local.id] != nil { return "已上传并存在于本机" }
-    return cloud.checkedIDs.contains(local.id) ? "未上传" : "上传状态未核实"
+    let typeName = entry.isVideo ? "视频" : "照片"
+    guard let local = entry.local else { return "云端\(typeName)" }
+    if cloud.matchedServerIDs[local.id] != nil { return "已备份\(typeName)" }
+    if cloud.checkedIDs.contains(local.id) { return "未上传\(typeName)" }
+    return "本地\(typeName)"
   }
 }
 

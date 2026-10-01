@@ -184,10 +184,12 @@ struct NativeDeviceGrid: View {
                       )
                       .clipped()
                       .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: asset.isVideo ? "video.fill" : "iphone")
-                          .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
-                          .foregroundColor(.white).shadow(color: .black, radius: 2)
-                          .padding(3)
+                        if asset.isVideo {
+                          Image(systemName: "play.fill")
+                            .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
+                            .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            .padding(3)
+                        }
                       }
                       .contentShape(Rectangle())
                   }
@@ -420,10 +422,12 @@ struct NativeResultGrid: View {
                     )
                     .clipped()
                     .overlay(alignment: .bottomTrailing) {
-                      Image(systemName: entry.local != nil ? "iphone" : "cloud")
-                        .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
-                        .foregroundColor(.white).shadow(color: .black, radius: 2)
-                        .padding(3)
+                      if entry.isVideo {
+                        Image(systemName: "play.fill")
+                          .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
+                          .foregroundColor(.white).shadow(color: .black, radius: 2)
+                          .padding(3)
+                      }
                     }
                     .contentShape(Rectangle())
                 }
@@ -458,6 +462,11 @@ struct NativeGridItem: Identifiable {
   let local: NativeDeviceAsset?
   var id: String { server.map { "server:\($0.id)" } ?? "local:\(local?.id ?? "")" }
   var date: Date { server?.date ?? local?.date ?? .distantPast }
+  var isVideo: Bool {
+    if let server { return !server.isImage }
+    if let local { return local.isVideo }
+    return false
+  }
 }
 
 private struct NativeSearchView: View {

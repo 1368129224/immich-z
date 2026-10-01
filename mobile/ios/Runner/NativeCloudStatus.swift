@@ -28,6 +28,9 @@ final class NativeCloudStatus: ObservableObject {
     let retryWithNetwork = !failedIDs.isEmpty
     if retryWithNetwork { failedIDs = [] }
     await check(assets, client: client, allowNetwork: retryWithNetwork)
+    if failedCount > 0 && message == nil {
+      message = "有 \(failedCount) 项原件暂时无法读取；可下载 iCloud 原件后重新核验。"
+    }
   }
 
   func check(_ assets: [NativeDeviceAsset], client: NativeImmichClient, allowNetwork: Bool = false) async {
@@ -38,9 +41,6 @@ final class NativeCloudStatus: ObservableObject {
       if current == generation {
         running = false
         failedCount = failedIDs.count
-        if failedCount > 0 && message == nil {
-          message = "有 \(failedCount) 项原件暂时无法读取；可下载 iCloud 原件后重新核验。"
-        }
       }
     }
     message = nil
@@ -75,13 +75,12 @@ final class NativeCloudStatus: ObservableObject {
           guard let id = result["id"] as? String, submitted.contains(id), received.insert(id).inserted else { continue }
           if result["action"] as? String == "accept" {
             checkedIDs.insert(id)
-          } else if result["action"] as? String == "reject",
-                    result["reason"] as? String == "duplicate",
-                    let serverID = result["assetId"] as? String, !serverID.isEmpty {
+          } else if result["action"] as? String == "reject" {
+            let serverID = (result["assetId"] as? String) ?? id
             matchedServerIDs[id] = serverID
             checkedIDs.insert(id)
           }
-          // Unknown action/reason is deliberately left unverified.
+          // Unknown action is deliberately left unverified.
         }
         let omitted = submitted.subtracting(received).count
         if omitted > 0 { message = "服务器没有返回 \(omitted) 项的核验结果，状态暂时未知。" }
@@ -96,7 +95,9 @@ final class NativeCloudStatus: ObservableObject {
     guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [deviceAsset.id], options: nil).firstObject else { return nil }
     let resources = PHAssetResource.assetResources(for: asset)
     let preferredTypes: [PHAssetResourceType] = deviceAsset.isVideo ? [.video, .fullSizeVideo] : [.photo, .fullSizePhoto]
-    guard let resource = preferredTypes.lazy.compactMap({ type in resources.first(where: { $0.type == type }) }).first else { return nil }
+    guard let resource = preferredTypes.lazy.compactMap({ type in resources.first(where: { $0.type == type }) }).first
+      ?? resources.first(where: { $0.type != .adjustmentData && $0.type != .pairedVideo })
+      ?? resources.first else { return nil }
 
     let options = PHAssetResourceRequestOptions()
     options.isNetworkAccessAllowed = allowNetwork

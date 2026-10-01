@@ -804,7 +804,6 @@ struct NativePhotosView: View {
         )
         .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
         .refreshable {
-          cloud.reset()
           await model.loadInitial()
           rebuildDayGroups()
           Task { await cloud.check(device.assets, client: client) }
@@ -826,8 +825,11 @@ struct NativePhotosView: View {
               await cloud.check(device.assets, client: client)
               scrollToBottom(proxy: proxy, animated: false)
             }
-          } else if !cachedDayGroups.isEmpty && !initialPositioned {
-            scrollToBottom(proxy: proxy, animated: false)
+          } else {
+            Task { await cloud.check(device.assets, client: client) }
+            if !cachedDayGroups.isEmpty && !initialPositioned {
+              scrollToBottom(proxy: proxy, animated: false)
+            }
           }
         }
         .onChange(of: model.assets.count) { _ in
@@ -904,7 +906,6 @@ struct NativePhotosView: View {
                   }
                   Button(action: {
                     Task {
-                      cloud.reset()
                       await model.loadInitial()
                       rebuildDayGroups()
                       await cloud.check(device.assets, client: client)
@@ -916,7 +917,10 @@ struct NativePhotosView: View {
                   Button(action: onUseFlutter) {
                     Label("使用完整应用", systemImage: "square.grid.2x2")
                   }
-                  Button(action: onLogout) {
+                  Button(action: {
+                    cloud.clearCache()
+                    onLogout()
+                  }) {
                     Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
                   }
                 } label: { Image(systemName: "ellipsis.circle") }

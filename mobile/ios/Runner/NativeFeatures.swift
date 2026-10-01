@@ -474,7 +474,7 @@ struct NativeGridItem: Identifiable {
     return false
   }
 
-  func cloudSymbol(matchedServerIDs: [String: String] = [:]) -> String {
+  func cloudSymbol(matchedServerIDs: [String: String] = NativeSyncCacheStore.shared.matchedServerIDs) -> String {
     if let local {
       if server != nil || matchedServerIDs[local.id] != nil {
         return "checkmark.icloud"

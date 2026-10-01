@@ -594,8 +594,7 @@ struct NativePhotosView: View {
   @StateObject private var model: NativeTimelineModel
   @StateObject private var cloud = NativeCloudStatus()
   @State private var zoom: CGFloat = 1
-  @State private var zoomStart: CGFloat = 1
-  @State private var gridColumnCount = 4
+  @GestureState private var pinchScale: CGFloat = 1
   @State private var cachedDayGroups: [NativeDayGroup] = []
   @State private var selected: NativeAsset?
   @State private var selectedLocal: NativeDeviceAsset?
@@ -610,7 +609,7 @@ struct NativePhotosView: View {
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
   }
 
-  private var minimumTile: CGFloat { min(420, max(24, 92 * zoom)) }
+  private var minimumTile: CGFloat { min(420, max(24, 92 * zoom * pinchScale)) }
   private let bottomAnchor = "timeline-bottom-anchor"
 
   var body: some View {
@@ -627,7 +626,7 @@ struct NativePhotosView: View {
                   .onAppear { if initialPositioned { requestOlder(proxy: proxy) } }
               }
               ForEach(cachedDayGroups, id: \.date) { group in
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: gridColumnCount), spacing: 2) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
                   ForEach(group.assets) { entry in
                       Button {
                         selected = entry.server
@@ -666,24 +665,12 @@ struct NativePhotosView: View {
           }
           .background(Color(uiColor: .systemBackground))
           .simultaneousGesture(MagnificationGesture()
-            .onChanged { value in
-              let proposedZoom = min(4.5, max(0.27, zoomStart * value))
-              let tileMinimum = min(420, max(24, 92 * proposedZoom))
-              let columns = max(1, Int((geometry.size.width + 2) / (tileMinimum + 2)))
-              // Keep pinch samples out of the view state; reflow only when the
-              // user crosses a discrete grid-density boundary.
-              if columns != gridColumnCount {
-                gridColumnCount = columns
-                zoom = proposedZoom
-              }
+            .updating($pinchScale) { value, scale, _ in
+              scale = value
             }
             .onEnded { value in
-              let finalZoom = min(4.5, max(0.27, zoomStart * value))
-              zoomStart = finalZoom
-              zoom = finalZoom
-              updateGridColumns(for: geometry.size.width)
+              zoom = min(4.5, max(0.27, zoom * value))
             })
-          .onChange(of: geometry.size.width) { width in updateGridColumns(for: width) }
           .onChange(of: model.assets.count) { _ in rebuildDayGroups() }
           .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
           .refreshable {
@@ -704,7 +691,6 @@ struct NativePhotosView: View {
             }
           }
           .onAppear {
-            updateGridColumns(for: geometry.size.width)
             rebuildDayGroups()
             if !initialPositioned && !cachedDayGroups.isEmpty {
               DispatchQueue.main.async {
@@ -771,9 +757,6 @@ struct NativePhotosView: View {
       .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
     }
     .navigationViewStyle(.stack)
-    // Reflow only when the adaptive column count changes; animating every cell
-    // during each pinch sample causes large timelines to stutter.
-    .transaction { $0.disablesAnimations = true }
   }
 
   private func rebuildDayGroups() {
@@ -798,12 +781,6 @@ struct NativePhotosView: View {
     cachedDayGroups = grouped.keys.sorted().map { date in
       NativeDayGroup(date: date, assets: grouped[date] ?? [])
     }
-  }
-
-  private func updateGridColumns(for width: CGFloat) {
-    guard width > 0 else { return }
-    let tileMinimum = min(420, max(24, 92 * zoom))
-    gridColumnCount = max(1, Int((width + 2) / (tileMinimum + 2)))
   }
 
   private func cloudSymbol(for entry: NativeGridItem) -> String {

@@ -410,6 +410,27 @@ final class NativeImmichClient {
     return parseDate(value)
   }
 
+  static func formatChineseDate(_ date: Date, includeDay: Bool = true) -> String {
+    let calendar = Calendar.current
+    let currentYear = calendar.component(.year, from: Date())
+    let year = calendar.component(.year, from: date)
+    let month = calendar.component(.month, from: date)
+    let day = calendar.component(.day, from: date)
+    if includeDay {
+      if year == currentYear {
+        return "\(month)月\(day)日"
+      } else {
+        return "\(year)年\(month)月\(day)日"
+      }
+    } else {
+      if year == currentYear {
+        return "\(month)月"
+      } else {
+        return "\(year)年\(month)月"
+      }
+    }
+  }
+
   private static func parseDate(_ value: String) -> Date? {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
@@ -704,6 +725,7 @@ struct NativePhotosView: View {
   @StateObject private var model: NativeTimelineModel
   @StateObject private var cloud = NativeCloudStatus()
   @State private var columns: Int = 3
+  @State private var gestureBaseColumns: Int? = nil
   @State private var cachedDayGroups: [NativeDayGroup] = []
   @State private var selected: NativeAsset?
   @State private var selectedLocal: NativeDeviceAsset?
@@ -720,6 +742,26 @@ struct NativePhotosView: View {
     self.onUseFlutter = onUseFlutter
     self.onLogout = onLogout
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
+  }
+
+  private var firstGroupIDsInMonth: Set<UUID> {
+    var seenYearMonths = Set<Int>()
+    var result = Set<UUID>()
+    let calendar = Calendar.current
+    for group in cachedDayGroups {
+      let year = calendar.component(.year, from: group.date)
+      let month = calendar.component(.month, from: group.date)
+      let key = year * 100 + month
+      if seenYearMonths.insert(key).inserted {
+        result.insert(group.id)
+      }
+    }
+    return result
+  }
+
+  private func formatDateBadge(for group: NativeDayGroup) -> String {
+    let isFirstInMonth = firstGroupIDsInMonth.contains(group.id)
+    return NativeImmichClient.formatChineseDate(group.date, includeDay: !isFirstInMonth)
   }
 
   var body: some View {
@@ -784,9 +826,16 @@ struct NativePhotosView: View {
                         .clipped()
                         .overlay(alignment: .topLeading) {
                           if entry.id == group.assets.first?.id {
-                            Text(group.date, style: .date).font(.caption2).bold()
-                              .foregroundColor(.white).lineLimit(1).minimumScaleFactor(0.6)
-                              .padding(3).background(.black.opacity(0.65)).allowsHitTesting(false)
+                            Text(formatDateBadge(for: group))
+                              .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
+                              .foregroundColor(.white)
+                              .lineLimit(1)
+                              .minimumScaleFactor(0.7)
+                              .padding(.horizontal, 4)
+                              .padding(.vertical, 2)
+                              .background(.black.opacity(0.65))
+                              .cornerRadius(3)
+                              .allowsHitTesting(false)
                           }
                         }
                         .overlay(alignment: .bottomLeading) {
@@ -827,16 +876,34 @@ struct NativePhotosView: View {
           }
         }
         .background(Color(uiColor: .systemBackground))
-        .gesture(
+        .simultaneousGesture(
           MagnificationGesture()
-            .onEnded { value in
-              withAnimation(.easeInOut(duration: 0.2)) {
-                if value > 1.25 {
-                  columns = max(1, columns - 1)
-                } else if value < 0.8 {
-                  columns = min(6, columns + 1)
+            .onChanged { value in
+              let base = gestureBaseColumns ?? columns
+              if gestureBaseColumns == nil {
+                gestureBaseColumns = base
+              }
+              let target: Int
+              if value > 1.75 {
+                target = max(1, base - 2)
+              } else if value > 1.20 {
+                target = max(1, base - 1)
+              } else if value < 0.55 {
+                target = min(5, base + 2)
+              } else if value < 0.82 {
+                target = min(5, base + 1)
+              } else {
+                target = base
+              }
+              if target != columns {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                  columns = target
                 }
               }
+            }
+            .onEnded { _ in
+              gestureBaseColumns = nil
             }
         )
         .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
@@ -1211,7 +1278,7 @@ struct NativeAssetViewer: View {
           Button("关闭") { dismiss() }.foregroundColor(.white)
         }
         ToolbarItem(placement: .principal) {
-          Text(asset.date, style: .date).foregroundColor(.white)
+          Text(NativeImmichClient.formatChineseDate(asset.date)).foregroundColor(.white)
         }
       }
       .task {

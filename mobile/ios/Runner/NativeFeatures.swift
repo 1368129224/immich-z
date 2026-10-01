@@ -158,6 +158,7 @@ struct NativeDeviceGrid: View {
   let title: String
   let assets: [NativeDeviceAsset]
   @State private var columns: Int = 3
+  @State private var gestureBaseColumns: Int? = nil
   @State private var selected: NativeDeviceAsset?
   @State private var positioned = false
   private let bottom = "device-bottom"
@@ -169,7 +170,7 @@ struct NativeDeviceGrid: View {
           let groups = Dictionary(grouping: assets) { Calendar.current.startOfDay(for: $0.date) }
           ForEach(groups.keys.sorted(), id: \.self) { day in
             VStack(alignment: .leading, spacing: 2) {
-              Text(day, style: .date).font(.headline).padding(.horizontal)
+              Text(NativeImmichClient.formatChineseDate(day)).font(.headline).padding(.horizontal)
               LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
                 ForEach(groups[day] ?? []) { asset in
                   Button { selected = asset } label: {
@@ -202,13 +203,34 @@ struct NativeDeviceGrid: View {
           Color.clear.frame(height: 1).id(bottom)
         }
       }
-      .gesture(
+      .simultaneousGesture(
         MagnificationGesture()
-          .onEnded { value in
-            withAnimation(.easeInOut(duration: 0.2)) {
-              if value > 1.25 { columns = max(1, columns - 1) }
-              else if value < 0.8 { columns = min(6, columns + 1) }
+          .onChanged { value in
+            let base = gestureBaseColumns ?? columns
+            if gestureBaseColumns == nil {
+              gestureBaseColumns = base
             }
+            let target: Int
+            if value > 1.75 {
+              target = max(1, base - 2)
+            } else if value > 1.20 {
+              target = max(1, base - 1)
+            } else if value < 0.55 {
+              target = min(5, base + 2)
+            } else if value < 0.82 {
+              target = min(5, base + 1)
+            } else {
+              target = base
+            }
+            if target != columns {
+              UIImpactFeedbackGenerator(style: .light).impactOccurred()
+              withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                columns = target
+              }
+            }
+          }
+          .onEnded { _ in
+            gestureBaseColumns = nil
           }
       )
       .onChange(of: assets.count) { _ in
@@ -389,6 +411,7 @@ struct NativeResultGrid: View {
   @State private var selected: NativeAsset?
   @State private var selectedLocal: NativeDeviceAsset?
   @State private var columns: Int = 3
+  @State private var gestureBaseColumns: Int? = nil
 
   private var merged: [NativeGridItem] {
     let matched = NativeSyncCacheStore.shared.matchedServerIDs
@@ -422,7 +445,7 @@ struct NativeResultGrid: View {
         let groups = Dictionary(grouping: merged) { Calendar.current.startOfDay(for: $0.date) }
         ForEach(groups.keys.sorted(by: >), id: \.self) { day in
           VStack(alignment: .leading, spacing: 2) {
-            Text(day, style: .date).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
+            Text(NativeImmichClient.formatChineseDate(day)).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
               ForEach(groups[day] ?? []) { entry in
                 Button {
@@ -470,13 +493,34 @@ struct NativeResultGrid: View {
         }
       }
     }
-    .gesture(
+    .simultaneousGesture(
       MagnificationGesture()
-        .onEnded { value in
-          withAnimation(.easeInOut(duration: 0.2)) {
-            if value > 1.25 { columns = max(1, columns - 1) }
-            else if value < 0.8 { columns = min(6, columns + 1) }
+        .onChanged { value in
+          let base = gestureBaseColumns ?? columns
+          if gestureBaseColumns == nil {
+            gestureBaseColumns = base
           }
+          let target: Int
+          if value > 1.75 {
+            target = max(1, base - 2)
+          } else if value > 1.20 {
+            target = max(1, base - 1)
+          } else if value < 0.55 {
+            target = min(5, base + 2)
+          } else if value < 0.82 {
+            target = min(5, base + 1)
+          } else {
+            target = base
+          }
+          if target != columns {
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+              columns = target
+            }
+          }
+        }
+        .onEnded { _ in
+          gestureBaseColumns = nil
         }
     )
     .sheet(item: $selected) { NativeAssetViewer(client: client, asset: $0) }

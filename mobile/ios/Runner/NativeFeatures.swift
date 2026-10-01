@@ -595,6 +595,12 @@ private struct NativeLibraryView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
   @State private var features: [String: Any] = [:]
+  private var buildCommit: String {
+    guard let value = Bundle.main.object(forInfoDictionaryKey: "ImmichZGitCommit") as? String,
+          !value.isEmpty,
+          value != "$(IMMICHZ_GIT_COMMIT)" else { return "unknown" }
+    return value
+  }
 
   var body: some View {
     NavigationView {
@@ -641,6 +647,16 @@ private struct NativeLibraryView: View {
               return LibraryRow(id: id, title: row["value"] as? String ?? row["name"] as? String ?? "标签", detail: "", assetID: id)
             }
           }
+        }
+        Section {
+          HStack {
+            Spacer()
+            Text("build \(buildCommit)")
+              .font(.footnote.monospaced())
+              .foregroundColor(.secondary)
+            Spacer()
+          }
+          .listRowBackground(Color.clear)
         }
       }
       .navigationTitle("资源库")

@@ -598,6 +598,14 @@ struct NativePhotosView: View {
   @State private var cachedDayGroups: [NativeDayGroup] = []
   @State private var selected: NativeAsset?
   @State private var selectedLocal: NativeDeviceAsset?
+  @State private var selectedIDs: Set<String> = []
+  @State private var isSelecting = false
+  @State private var selectionAnchor: String?
+  @State private var selectionFrames: [String: CGRect] = [:]
+  @State private var orderedAssetIDs: [String] = []
+  @State private var assetIndexByID: [String: Int] = [:]
+  @State private var itemByID: [String: NativeGridItem] = [:]
+  @State private var longPressedID: String?
   @State private var loadingOlderAnchor: String?
   @State private var initialPositioned = false
 
@@ -625,12 +633,29 @@ struct NativePhotosView: View {
                   .id("older-loader")
                   .onAppear { if initialPositioned { requestOlder(proxy: proxy) } }
               }
+              if !model.isLoading && model.error == nil &&
+                  cachedDayGroups.isEmpty && (device.assets.isEmpty || !device.authorized) {
+                VStack(spacing: 8) {
+                  Image(systemName: "photo.on.rectangle.angled")
+                    .font(.largeTitle).foregroundColor(.secondary)
+                  Text("暂无照片").font(.headline)
+                  Text("当前账号中没有可显示的照片。")
+                    .font(.caption).foregroundColor(.secondary)
+                }
+                .frame(maxWidth: .infinity, minHeight: 220)
+              }
               ForEach(cachedDayGroups, id: \.date) { group in
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: minimumTile), spacing: 2)], spacing: 2) {
                   ForEach(group.assets) { entry in
                       Button {
-                        selected = entry.server
-                        selectedLocal = entry.local
+                        if longPressedID == entry.id {
+                          longPressedID = nil
+                        } else if isSelecting {
+                          toggleSelection(entry.id)
+                        } else {
+                          selected = entry.server
+                          selectedLocal = entry.local
+                        }
                       } label: {
                         Group {
                           if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
@@ -652,9 +677,35 @@ struct NativePhotosView: View {
                             .foregroundColor(.white).shadow(color: .black, radius: 2)
                             .padding(3)
                         }
+                        .overlay(alignment: .topTrailing) {
+                          if selectedIDs.contains(entry.id) {
+                            Image(systemName: "checkmark.circle.fill")
+                              .font(.system(size: 20, weight: .semibold))
+                              .foregroundStyle(.white, .blue)
+                              .padding(4)
+                          }
+                        }
+                        .contentShape(Rectangle())
+                        .background {
+                          if isSelecting {
+                            GeometryReader { itemGeometry in
+                              Color.clear.preference(
+                                key: NativeGridFramesKey.self,
+                                value: [entry.id: itemGeometry.frame(in: .named("photos-grid"))]
+                              )
+                            }
+                          }
+                        }
                         .accessibilityLabel("\(entry.date.formatted()), \(cloudDescription(for: entry))")
                       }
                       .buttonStyle(.plain)
+                      .simultaneousGesture(LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                        longPressedID = entry.id
+                        enterSelection(startingWith: entry.id)
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                          if longPressedID == entry.id { longPressedID = nil }
+                        }
+                      })
                       .id(entry.id)
                     }
                   }
@@ -662,8 +713,10 @@ struct NativePhotosView: View {
               // The anchor is the final item, never below permission/error banners.
               Color.clear.frame(height: 1).id(bottomAnchor)
             }
+            .onPreferenceChange(NativeGridFramesKey.self) { selectionFrames = $0 }
           }
           .background(Color(uiColor: .systemBackground))
+          .coordinateSpace(name: "photos-grid")
           .simultaneousGesture(MagnificationGesture()
             .updating($pinchScale) { value, scale, _ in
               scale = value
@@ -671,7 +724,7 @@ struct NativePhotosView: View {
             .onEnded { value in
               zoom = min(4.5, max(0.27, zoom * value))
             })
-          .onChange(of: model.assets.count) { _ in rebuildDayGroups() }
+          .simultaneousGesture(selectionDragGesture)
           .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
           .refreshable {
             cloud.reset()
@@ -680,35 +733,29 @@ struct NativePhotosView: View {
             Task { await cloud.check(device.assets, client: client) }
             await Task.yield()
             withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+            initialPositioned = true
           }
           .onChange(of: device.assets.count) { _ in
             rebuildDayGroups()
             Task { await cloud.check(device.assets, client: client) }
-            guard !initialPositioned, !cachedDayGroups.isEmpty else { return }
-            DispatchQueue.main.async {
-              proxy.scrollTo(bottomAnchor, anchor: .bottom)
-              initialPositioned = true
-            }
           }
           .onAppear {
             rebuildDayGroups()
-            if !initialPositioned && !cachedDayGroups.isEmpty {
-              DispatchQueue.main.async {
-                proxy.scrollTo(bottomAnchor, anchor: .bottom)
-                initialPositioned = true
+            if model.assets.isEmpty && !model.isLoading {
+              Task {
+                await model.loadInitial()
+                rebuildDayGroups()
+                await cloud.check(device.assets, client: client)
               }
             }
-            guard model.assets.isEmpty, !model.isLoading else { return }
+          }
+          .onChange(of: model.assets.count) { _ in
+            rebuildDayGroups()
+            guard !initialPositioned, !cachedDayGroups.isEmpty else { return }
             Task {
-              await model.loadInitial()
-              rebuildDayGroups()
-              if !cachedDayGroups.isEmpty && !initialPositioned {
-                DispatchQueue.main.async {
-                  proxy.scrollTo(bottomAnchor, anchor: .bottom)
-                  initialPositioned = true
-                }
-              }
-              await cloud.check(device.assets, client: client)
+              await Task.yield()
+              withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+              initialPositioned = true
             }
           }
         }
@@ -735,20 +782,40 @@ struct NativePhotosView: View {
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
         ToolbarItem(placement: .navigationBarLeading) {
-          Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
+          if isSelecting {
+            Button("取消") { clearSelection() }
+          } else {
+            Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
+          }
+        }
+        ToolbarItem(placement: .principal) {
+          if isSelecting { Text("已选 \(selectedIDs.count) 项").font(.headline) }
         }
         ToolbarItem(placement: .navigationBarTrailing) {
-          Menu {
-            Button(action: { Task { cloud.reset(); await model.loadInitial(); rebuildDayGroups(); await cloud.check(device.assets, client: client) } }) {
-              Label("刷新", systemImage: "arrow.clockwise")
+          if isSelecting {
+            Button("全选") {
+              selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
             }
-            Button(action: onUseFlutter) {
-              Label("使用完整应用", systemImage: "square.grid.2x2")
-            }
-            Button(action: onLogout) {
-              Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
-            }
-          } label: { Image(systemName: "ellipsis.circle") }
+          } else {
+            Menu {
+              Button(action: {
+                Task {
+                  cloud.reset()
+                  await model.loadInitial()
+                  rebuildDayGroups()
+                  await cloud.check(device.assets, client: client)
+                }
+              }) {
+                Label("刷新", systemImage: "arrow.clockwise")
+              }
+              Button(action: onUseFlutter) {
+                Label("使用完整应用", systemImage: "square.grid.2x2")
+              }
+              Button(action: onLogout) {
+                Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
+              }
+            } label: { Image(systemName: "ellipsis.circle") }
+          }
         }
       }
       .sheet(item: $selected) { asset in
@@ -781,6 +848,61 @@ struct NativePhotosView: View {
     cachedDayGroups = grouped.keys.sorted().map { date in
       NativeDayGroup(date: date, assets: grouped[date] ?? [])
     }
+    orderedAssetIDs = cachedDayGroups.flatMap(\.assets).map(\.id)
+    assetIndexByID = Dictionary(uniqueKeysWithValues: orderedAssetIDs.enumerated().map { ($1, $0) })
+    itemByID = Dictionary(uniqueKeysWithValues: merged.map { ($0.id, $0) })
+  }
+
+  private var selectionDragGesture: some Gesture {
+    DragGesture(minimumDistance: 8, coordinateSpace: .named("photos-grid"))
+      .onChanged { value in
+        guard isSelecting, let item = nearestItem(to: value.location) else { return }
+        if selectionAnchor == nil { selectionAnchor = item.id }
+        selectRange(from: selectionAnchor, through: item.id)
+      }
+      .onEnded { _ in selectionAnchor = nil }
+  }
+
+  private func enterSelection(startingWith id: String) {
+    isSelecting = true
+    selectedIDs.insert(id)
+    selectionAnchor = id
+  }
+
+  private func toggleSelection(_ id: String) {
+    if selectedIDs.contains(id) { selectedIDs.remove(id) } else { selectedIDs.insert(id) }
+    if selectedIDs.isEmpty {
+      isSelecting = false
+      selectionAnchor = nil
+    }
+  }
+
+  private func clearSelection() {
+    isSelecting = false
+    selectedIDs.removeAll()
+    selectionAnchor = nil
+    selectionFrames.removeAll()
+    longPressedID = nil
+  }
+
+  private func selectRange(from firstID: String?, through lastID: String) {
+    guard let firstID,
+          let first = assetIndexByID[firstID],
+          let last = assetIndexByID[lastID] else { return }
+    let lower = min(first, last)
+    let upper = max(first, last)
+    selectedIDs.formUnion(orderedAssetIDs[lower...upper])
+  }
+
+  private func nearestItem(to point: CGPoint) -> NativeGridItem? {
+    for (id, frame) in selectionFrames where frame.contains(point) {
+      return itemByID[id]
+    }
+    let frames = selectionFrames
+    guard let match = frames.min(by: { lhs, rhs in
+      lhs.value.midpoint.distance(to: point) < rhs.value.midpoint.distance(to: point)
+    }) else { return nil }
+    return itemByID[match.key]
   }
 
   private func cloudSymbol(for entry: NativeGridItem) -> String {
@@ -807,6 +929,23 @@ struct NativePhotosView: View {
       }
       loadingOlderAnchor = nil
     }
+  }
+}
+
+private struct NativeGridFramesKey: PreferenceKey {
+  static var defaultValue: [String: CGRect] = [:]
+  static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+    value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+  }
+}
+
+private extension CGRect {
+  var midpoint: CGPoint { CGPoint(x: midX, y: midY) }
+}
+
+private extension CGPoint {
+  func distance(to other: CGPoint) -> CGFloat {
+    hypot(x - other.x, y - other.y)
   }
 }
 

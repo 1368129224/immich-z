@@ -778,12 +778,26 @@ struct NativePhotosView: View {
 
   private func rebuildDayGroups() {
     let matchedIDs = Set(cloud.matchedServerIDs.values)
-    let merged = (model.assets.filter { !matchedIDs.contains($0.id) }
-      .map { NativeGridItem(server: $0, local: nil) }
-      + device.assets.map { NativeGridItem(server: nil, local: $0) })
-      .sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
-    let groups = Dictionary(grouping: merged) { Calendar.current.startOfDay(for: $0.date) }
-    cachedDayGroups = groups.keys.sorted().map { NativeDayGroup(date: $0, assets: groups[$0] ?? []) }
+    var merged: [NativeGridItem] = []
+    merged.reserveCapacity(model.assets.count + device.assets.count)
+    for asset in model.assets where !matchedIDs.contains(asset.id) {
+      merged.append(NativeGridItem(server: asset, local: nil))
+    }
+    for asset in device.assets {
+      merged.append(NativeGridItem(server: nil, local: asset))
+    }
+    merged.sort { lhs, rhs in
+      if lhs.date == rhs.date { return lhs.id < rhs.id }
+      return lhs.date < rhs.date
+    }
+    var grouped: [Date: [NativeGridItem]] = [:]
+    for item in merged {
+      let date = Calendar.current.startOfDay(for: item.date)
+      grouped[date, default: []].append(item)
+    }
+    cachedDayGroups = grouped.keys.sorted().map { date in
+      NativeDayGroup(date: date, assets: grouped[date] ?? [])
+    }
   }
 
   private func updateGridColumns(for width: CGFloat) {

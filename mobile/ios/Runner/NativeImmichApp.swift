@@ -752,20 +752,19 @@ struct NativePhotosView: View {
                               .padding(3).background(.black.opacity(0.65)).allowsHitTesting(false)
                           }
                         }
-                        .overlay(alignment: .bottomTrailing) {
-                          HStack(spacing: 2) {
-                            if shouldShowUnuploadedBadge(for: entry) {
-                              Image(systemName: "icloud.slash")
-                                .font(.system(size: columns > 4 ? 8 : 11, weight: .semibold))
-                                .foregroundColor(.white).shadow(color: .black, radius: 2)
-                            }
-                            if entry.isVideo {
-                              Image(systemName: "play.fill")
-                                .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
-                                .foregroundColor(.white).shadow(color: .black, radius: 2)
-                            }
+                        .overlay(alignment: .bottomLeading) {
+                          if entry.isVideo {
+                            Image(systemName: "play.fill")
+                              .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
+                              .foregroundColor(.white).shadow(color: .black, radius: 2)
+                              .padding(3)
                           }
-                          .padding(3)
+                        }
+                        .overlay(alignment: .bottomTrailing) {
+                          Image(systemName: cloudSymbol(for: entry))
+                            .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
+                            .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            .padding(3)
                         }
                         .overlay(alignment: .topTrailing) {
                           if selectedIDs.contains(entry.id) {
@@ -1000,17 +999,21 @@ struct NativePhotosView: View {
     selectedIDs.removeAll()
   }
 
-  private func shouldShowUnuploadedBadge(for entry: NativeGridItem) -> Bool {
-    guard let local = entry.local else { return false }
-    return cloud.checkedIDs.contains(local.id) && cloud.matchedServerIDs[local.id] == nil
+  private func cloudSymbol(for entry: NativeGridItem) -> String {
+    entry.cloudSymbol(matchedServerIDs: cloud.matchedServerIDs)
   }
 
   private func cloudDescription(for entry: NativeGridItem) -> String {
     let typeName = entry.isVideo ? "视频" : "照片"
-    guard let local = entry.local else { return "云端\(typeName)" }
-    if cloud.matchedServerIDs[local.id] != nil { return "已备份\(typeName)" }
-    if cloud.checkedIDs.contains(local.id) { return "未上传\(typeName)" }
-    return "本地\(typeName)"
+    if let local = entry.local {
+      if entry.server != nil || cloud.matchedServerIDs[local.id] != nil {
+        return "已同步\(typeName)"
+      } else {
+        return "未同步\(typeName)"
+      }
+    } else {
+      return "云端\(typeName)"
+    }
   }
 }
 

@@ -421,13 +421,19 @@ struct NativeResultGrid: View {
                       }
                     )
                     .clipped()
-                    .overlay(alignment: .bottomTrailing) {
+                    .overlay(alignment: .bottomLeading) {
                       if entry.isVideo {
                         Image(systemName: "play.fill")
                           .font(.system(size: columns > 4 ? 8 : 11, weight: .bold))
                           .foregroundColor(.white).shadow(color: .black, radius: 2)
                           .padding(3)
                       }
+                    }
+                    .overlay(alignment: .bottomTrailing) {
+                      Image(systemName: entry.cloudSymbol())
+                        .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
+                        .foregroundColor(.white).shadow(color: .black, radius: 2)
+                        .padding(3)
                     }
                     .contentShape(Rectangle())
                 }
@@ -466,6 +472,18 @@ struct NativeGridItem: Identifiable {
     if let server { return !server.isImage }
     if let local { return local.isVideo }
     return false
+  }
+
+  func cloudSymbol(matchedServerIDs: [String: String] = [:]) -> String {
+    if let local {
+      if server != nil || matchedServerIDs[local.id] != nil {
+        return "checkmark.icloud"
+      } else {
+        return "icloud.slash"
+      }
+    } else {
+      return "cloud"
+    }
   }
 }
 

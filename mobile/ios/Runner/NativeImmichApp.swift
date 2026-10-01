@@ -639,7 +639,7 @@ private final class NativeTimelineModel: ObservableObject {
   private func loadSearchFallbackPage() async throws {
     let page = try await client.searchPage(cursor: searchCursor, filter: ["visibility": ["eq": "timeline"]])
     var seen = Set(assets.map(\.id))
-    assets = (assets + page.assets).filter { seen.insert($0.id).inserted }.sorted { $0.date > $1.date }
+    assets = (assets + page.assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
     searchCursor = page.next
     hasOlder = page.next != nil
     error = nil
@@ -654,7 +654,7 @@ private final class NativeTimelineModel: ObservableObject {
     nextBucket = end
     hasOlder = nextBucket < buckets.count
     var seen = Set<String>()
-    assets = (assets + result).filter { seen.insert($0.id).inserted }.sorted { $0.date > $1.date }
+    assets = (assets + result).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
   }
 }
 
@@ -671,6 +671,9 @@ struct NativePhotosView: View {
   @State private var selectedLocal: NativeDeviceAsset?
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
+  @State private var initialPositioned = false
+  @State private var loadingOlderAnchor: String?
+  private let bottomAnchor = "timeline-bottom-anchor"
 
   init(client: NativeImmichClient, device: NativeDeviceLibrary, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void) {
     self.client = client
@@ -682,212 +685,264 @@ struct NativePhotosView: View {
 
   var body: some View {
     NavigationView {
-      ScrollView {
-        LazyVStack(spacing: 4) {
-          if model.assets.isEmpty && (model.isLoading || device.isLoading) {
-            VStack(spacing: 10) {
+      ScrollViewReader { proxy in
+        ScrollView {
+          LazyVStack(spacing: 4) {
+            if model.hasOlder && !model.assets.isEmpty {
               ProgressView()
-              Text("正在加载照片…")
-                .font(.caption).foregroundColor(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+                .id("older-loader")
+                .onAppear {
+                  if initialPositioned {
+                    requestOlder(proxy: proxy)
+                  }
+                }
             }
-            .frame(maxWidth: .infinity, minHeight: 240)
-          }
-          if !model.isLoading && !device.isLoading && model.error == nil &&
-              cachedDayGroups.isEmpty && (device.assets.isEmpty || !device.authorized) {
-            VStack(spacing: 8) {
-              Image(systemName: "photo.on.rectangle.angled")
-                .font(.largeTitle).foregroundColor(.secondary)
-              Text("暂无照片").font(.headline)
-              Text("当前账号中没有可显示的照片。")
-                .font(.caption).foregroundColor(.secondary)
+            if model.assets.isEmpty && (model.isLoading || device.isLoading) {
+              VStack(spacing: 10) {
+                ProgressView()
+                Text("正在加载照片…")
+                  .font(.caption).foregroundColor(.secondary)
+              }
+              .frame(maxWidth: .infinity, minHeight: 240)
             }
-            .frame(maxWidth: .infinity, minHeight: 220)
-          }
-          ForEach(cachedDayGroups, id: \.date) { group in
-            VStack(alignment: .leading, spacing: 2) {
-              LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
-                ForEach(group.assets) { entry in
-                  Button {
-                    if isSelecting {
-                      toggleSelection(entry.id)
-                    } else {
-                      selected = entry.server
-                      selectedLocal = entry.local
-                    }
-                  } label: {
-                    Color.clear
-                      .aspectRatio(1, contentMode: .fit)
-                      .overlay(
-                        GeometryReader { geo in
-                          Group {
-                            if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
-                            else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
+            if !model.isLoading && !device.isLoading && model.error == nil &&
+                cachedDayGroups.isEmpty && (device.assets.isEmpty || !device.authorized) {
+              VStack(spacing: 8) {
+                Image(systemName: "photo.on.rectangle.angled")
+                  .font(.largeTitle).foregroundColor(.secondary)
+                Text("暂无照片").font(.headline)
+                Text("当前账号中没有可显示的照片。")
+                  .font(.caption).foregroundColor(.secondary)
+              }
+              .frame(maxWidth: .infinity, minHeight: 220)
+            }
+            ForEach(cachedDayGroups, id: \.date) { group in
+              VStack(alignment: .leading, spacing: 2) {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
+                  ForEach(group.assets) { entry in
+                    Button {
+                      if isSelecting {
+                        toggleSelection(entry.id)
+                      } else {
+                        selected = entry.server
+                        selectedLocal = entry.local
+                      }
+                    } label: {
+                      Color.clear
+                        .aspectRatio(1, contentMode: .fit)
+                        .overlay(
+                          GeometryReader { geo in
+                            Group {
+                              if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
+                              else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
+                            }
+                            .frame(width: geo.size.width, height: geo.size.height)
+                            .clipped()
                           }
-                          .frame(width: geo.size.width, height: geo.size.height)
-                          .clipped()
+                        )
+                        .clipped()
+                        .overlay(alignment: .topLeading) {
+                          if entry.id == group.assets.first?.id {
+                            Text(group.date, style: .date).font(.caption2).bold()
+                              .foregroundColor(.white).lineLimit(1).minimumScaleFactor(0.6)
+                              .padding(3).background(.black.opacity(0.65)).allowsHitTesting(false)
+                          }
                         }
-                      )
-                      .clipped()
-                      .overlay(alignment: .topLeading) {
-                        if entry.id == group.assets.first?.id {
-                          Text(group.date, style: .date).font(.caption2).bold()
-                            .foregroundColor(.white).lineLimit(1).minimumScaleFactor(0.6)
-                            .padding(3).background(.black.opacity(0.65)).allowsHitTesting(false)
+                        .overlay(alignment: .bottomTrailing) {
+                          Image(systemName: cloudSymbol(for: entry))
+                            .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
+                            .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            .padding(3)
                         }
-                      }
-                      .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: cloudSymbol(for: entry))
-                          .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
-                          .foregroundColor(.white).shadow(color: .black, radius: 2)
-                          .padding(3)
-                      }
-                      .overlay(alignment: .topTrailing) {
-                        if selectedIDs.contains(entry.id) {
-                          Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(.white, .blue)
-                            .padding(4)
+                        .overlay(alignment: .topTrailing) {
+                          if selectedIDs.contains(entry.id) {
+                            Image(systemName: "checkmark.circle.fill")
+                              .font(.system(size: 20, weight: .semibold))
+                              .foregroundStyle(.white, .blue)
+                              .padding(4)
+                          }
                         }
-                      }
-                      .contentShape(Rectangle())
-                      .accessibilityLabel("\(entry.date.formatted()), \(cloudDescription(for: entry))")
+                        .contentShape(Rectangle())
+                        .accessibilityLabel("\(entry.date.formatted()), \(cloudDescription(for: entry))")
+                    }
+                    .buttonStyle(.plain)
+                    .onLongPressGesture(minimumDuration: 0.45) {
+                      enterSelection(startingWith: entry.id)
+                    }
+                    .id(entry.id)
                   }
-                  .buttonStyle(.plain)
-                  .onLongPressGesture(minimumDuration: 0.45) {
-                    enterSelection(startingWith: entry.id)
-                  }
-                  .id(entry.id)
                 }
               }
             }
-          }
-          if model.hasOlder && !model.assets.isEmpty {
-            ProgressView()
-              .frame(maxWidth: .infinity)
-              .padding(.vertical, 24)
-              .onAppear {
-                Task { await model.loadOlder() }
-              }
+            Color.clear.frame(height: 1).id(bottomAnchor)
           }
         }
-      }
-      .background(Color(uiColor: .systemBackground))
-      .gesture(
-        MagnificationGesture()
-          .onEnded { value in
-            withAnimation(.easeInOut(duration: 0.2)) {
-              if value > 1.25 {
-                columns = max(1, columns - 1)
-              } else if value < 0.8 {
-                columns = min(6, columns + 1)
+        .background(Color(uiColor: .systemBackground))
+        .gesture(
+          MagnificationGesture()
+            .onEnded { value in
+              withAnimation(.easeInOut(duration: 0.2)) {
+                if value > 1.25 {
+                  columns = max(1, columns - 1)
+                } else if value < 0.8 {
+                  columns = min(6, columns + 1)
+                }
               }
             }
-          }
-      )
-      .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
-      .refreshable {
-        cloud.reset()
-        await model.loadInitial()
-        rebuildDayGroups()
-        Task { await cloud.check(device.assets, client: client) }
-      }
-      .onChange(of: device.assets.count) { _ in
-        rebuildDayGroups()
-        Task { await cloud.check(device.assets, client: client) }
-      }
-      .onAppear {
-        rebuildDayGroups()
-        if model.assets.isEmpty && !model.isLoading {
-          Task {
-            await model.loadInitial()
-            rebuildDayGroups()
-            await cloud.check(device.assets, client: client)
+        )
+        .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
+        .refreshable {
+          cloud.reset()
+          await model.loadInitial()
+          rebuildDayGroups()
+          Task { await cloud.check(device.assets, client: client) }
+          scrollToBottom(proxy: proxy, animated: false)
+        }
+        .onChange(of: device.assets.count) { _ in
+          rebuildDayGroups()
+          Task { await cloud.check(device.assets, client: client) }
+          if !initialPositioned && !cachedDayGroups.isEmpty {
+            scrollToBottom(proxy: proxy, animated: false)
           }
         }
-      }
-      .onChange(of: model.assets.count) { _ in
-        rebuildDayGroups()
-      }
-      .safeAreaInset(edge: .bottom, spacing: 0) {
-        if !device.authorized {
-          Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
-        }
-        if model.isLoading { ProgressView().padding(6) }
-        if let message = cloud.message {
-          HStack(spacing: 8) {
-            Text(message).font(.caption).lineLimit(3)
-            Spacer(minLength: 4)
-            Button("重试核验") { Task { await cloud.retry(device.assets, client: client) } }
-              .font(.caption).fixedSize()
-          }
-          .padding(6)
-        }
-        if let message = model.error {
-          HStack { Text(message).font(.caption).lineLimit(2); Button("重试") { Task { await model.retry() } } }.padding(6)
-        }
-      }
-      .navigationTitle("照片")
-      .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .navigationBarLeading) {
-          if isSelecting {
-            Button("取消") { clearSelection() }
-          } else {
-            Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
-          }
-        }
-        ToolbarItem(placement: .principal) {
-          if isSelecting {
-            Text("已选 \(selectedIDs.count) 项").font(.headline)
-          }
-        }
-        ToolbarItem(placement: .navigationBarTrailing) {
-          if isSelecting {
-            Button("全选") {
-              selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
+        .onAppear {
+          rebuildDayGroups()
+          if model.assets.isEmpty && !model.isLoading {
+            Task {
+              await model.loadInitial()
+              rebuildDayGroups()
+              await cloud.check(device.assets, client: client)
+              scrollToBottom(proxy: proxy, animated: false)
             }
-          } else {
+          } else if !cachedDayGroups.isEmpty && !initialPositioned {
+            scrollToBottom(proxy: proxy, animated: false)
+          }
+        }
+        .onChange(of: model.assets.count) { _ in
+          rebuildDayGroups()
+          if !initialPositioned && !cachedDayGroups.isEmpty {
+            scrollToBottom(proxy: proxy, animated: false)
+          }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+          if !device.authorized {
+            Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
+          }
+          if model.isLoading { ProgressView().padding(6) }
+          if let message = cloud.message {
             HStack(spacing: 8) {
-              Menu {
-                Picker("网格密度", selection: $columns) {
-                  Text("1 列 · 超大").tag(1)
-                  Text("2 列 · 大图").tag(2)
-                  Text("3 列 · 标准").tag(3)
-                  Text("4 列 · 紧凑").tag(4)
-                  Text("5 列 · 微缩").tag(5)
-                }
-              } label: {
-                Image(systemName: "square.grid.3x3")
+              Text(message).font(.caption).lineLimit(3)
+              Spacer(minLength: 4)
+              Button("重试核验") { Task { await cloud.retry(device.assets, client: client) } }
+                .font(.caption).fixedSize()
+            }
+            .padding(6)
+          }
+          if let message = model.error {
+            HStack { Text(message).font(.caption).lineLimit(2); Button("重试") { Task { await model.retry() } } }.padding(6)
+          }
+        }
+        .navigationTitle("照片")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+          ToolbarItem(placement: .navigationBarLeading) {
+            if isSelecting {
+              Button("取消") { clearSelection() }
+            } else {
+              Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
+            }
+          }
+          ToolbarItem(placement: .principal) {
+            if isSelecting {
+              Text("已选 \(selectedIDs.count) 项").font(.headline)
+            }
+          }
+          ToolbarItem(placement: .navigationBarTrailing) {
+            if isSelecting {
+              Button("全选") {
+                selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
               }
-              Button("选择") {
-                isSelecting = true
-              }
-              Menu {
-                Button(action: {
-                  Task {
-                    cloud.reset()
-                    await model.loadInitial()
-                    rebuildDayGroups()
-                    await cloud.check(device.assets, client: client)
+            } else {
+              HStack(spacing: 8) {
+                Menu {
+                  Picker("网格密度", selection: $columns) {
+                    Text("1 列 · 超大").tag(1)
+                    Text("2 列 · 大图").tag(2)
+                    Text("3 列 · 标准").tag(3)
+                    Text("4 列 · 紧凑").tag(4)
+                    Text("5 列 · 微缩").tag(5)
                   }
-                }) {
-                  Label("刷新", systemImage: "arrow.clockwise")
+                } label: {
+                  Image(systemName: "square.grid.3x3")
                 }
-                Button(action: onUseFlutter) {
-                  Label("使用完整应用", systemImage: "square.grid.2x2")
+                Button("选择") {
+                  isSelecting = true
                 }
-                Button(action: onLogout) {
-                  Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
-                }
-              } label: { Image(systemName: "ellipsis.circle") }
+                Menu {
+                  Button(action: {
+                    scrollToBottom(proxy: proxy, animated: true)
+                  }) {
+                    Label("回到最新", systemImage: "arrow.down.to.line")
+                  }
+                  Button(action: {
+                    Task {
+                      cloud.reset()
+                      await model.loadInitial()
+                      rebuildDayGroups()
+                      await cloud.check(device.assets, client: client)
+                      scrollToBottom(proxy: proxy, animated: false)
+                    }
+                  }) {
+                    Label("刷新", systemImage: "arrow.clockwise")
+                  }
+                  Button(action: onUseFlutter) {
+                    Label("使用完整应用", systemImage: "square.grid.2x2")
+                  }
+                  Button(action: onLogout) {
+                    Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
+                  }
+                } label: { Image(systemName: "ellipsis.circle") }
+              }
             }
           }
         }
+        .sheet(item: $selected) { NativeAssetViewer(client: client, asset: $0) }
+        .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
       }
-      .sheet(item: $selected) { NativeAssetViewer(client: client, asset: $0) }
-      .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
     }
     .navigationViewStyle(.stack)
+  }
+
+  private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+      if animated {
+        withAnimation(.easeInOut(duration: 0.25)) {
+          proxy.scrollTo(bottomAnchor, anchor: .bottom)
+        }
+      } else {
+        withAnimation(.none) {
+          proxy.scrollTo(bottomAnchor, anchor: .bottom)
+        }
+      }
+      initialPositioned = true
+    }
+  }
+
+  private func requestOlder(proxy: ScrollViewProxy) {
+    guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading, initialPositioned else { return }
+    let anchor = cachedDayGroups.first?.assets.first?.id
+    loadingOlderAnchor = anchor ?? "pending"
+    Task {
+      await model.loadOlder()
+      if let anchor {
+        await Task.yield()
+        withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) }
+      }
+      try? await Task.sleep(nanoseconds: 300_000_000)
+      loadingOlderAnchor = nil
+    }
   }
 
   private func rebuildDayGroups() {
@@ -902,14 +957,14 @@ struct NativePhotosView: View {
     }
     merged.sort { lhs, rhs in
       if lhs.date == rhs.date { return lhs.id < rhs.id }
-      return lhs.date > rhs.date
+      return lhs.date < rhs.date
     }
     var grouped: [Date: [NativeGridItem]] = [:]
     for item in merged {
       let date = Calendar.current.startOfDay(for: item.date)
       grouped[date, default: []].append(item)
     }
-    cachedDayGroups = grouped.keys.sorted(by: >).map { date in
+    cachedDayGroups = grouped.keys.sorted().map { date in
       NativeDayGroup(date: date, assets: grouped[date] ?? [])
     }
   }

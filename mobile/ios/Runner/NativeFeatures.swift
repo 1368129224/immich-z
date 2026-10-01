@@ -35,7 +35,7 @@ final class NativeDeviceLibrary: ObservableObject {
     Task { [weak self] in
       let library = await Task.detached(priority: .userInitiated) {
         let options = PHFetchOptions()
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         let results = PHAsset.fetchAssets(with: options)
         var entries: [NativeDeviceAsset] = []
         entries.reserveCapacity(results.count)
@@ -158,52 +158,72 @@ struct NativeDeviceGrid: View {
   let assets: [NativeDeviceAsset]
   @State private var columns: Int = 3
   @State private var selected: NativeDeviceAsset?
+  @State private var positioned = false
+  private let bottom = "device-bottom"
 
   var body: some View {
-    ScrollView {
-      LazyVStack(alignment: .leading, spacing: 4) {
-        let groups = Dictionary(grouping: assets) { Calendar.current.startOfDay(for: $0.date) }
-        ForEach(groups.keys.sorted(by: >), id: \.self) { day in
-          VStack(alignment: .leading, spacing: 2) {
-            Text(day, style: .date).font(.headline).padding(.horizontal)
-            LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
-              ForEach(groups[day] ?? []) { asset in
-                Button { selected = asset } label: {
-                  Color.clear
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay(
-                      GeometryReader { geo in
-                        NativeDeviceThumbnail(asset: asset)
-                          .frame(width: geo.size.width, height: geo.size.height)
-                          .clipped()
+    ScrollViewReader { proxy in
+      ScrollView {
+        LazyVStack(alignment: .leading, spacing: 4) {
+          let groups = Dictionary(grouping: assets) { Calendar.current.startOfDay(for: $0.date) }
+          ForEach(groups.keys.sorted(), id: \.self) { day in
+            VStack(alignment: .leading, spacing: 2) {
+              Text(day, style: .date).font(.headline).padding(.horizontal)
+              LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 2), count: columns), spacing: 2) {
+                ForEach(groups[day] ?? []) { asset in
+                  Button { selected = asset } label: {
+                    Color.clear
+                      .aspectRatio(1, contentMode: .fit)
+                      .overlay(
+                        GeometryReader { geo in
+                          NativeDeviceThumbnail(asset: asset)
+                            .frame(width: geo.size.width, height: geo.size.height)
+                            .clipped()
+                        }
+                      )
+                      .clipped()
+                      .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: asset.isVideo ? "video.fill" : "iphone")
+                          .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
+                          .foregroundColor(.white).shadow(color: .black, radius: 2)
+                          .padding(3)
                       }
-                    )
-                    .clipped()
-                    .overlay(alignment: .bottomTrailing) {
-                      Image(systemName: asset.isVideo ? "video.fill" : "iphone")
-                        .font(.system(size: columns > 4 ? 9 : 13, weight: .semibold))
-                        .foregroundColor(.white).shadow(color: .black, radius: 2)
-                        .padding(3)
-                    }
-                    .contentShape(Rectangle())
+                      .contentShape(Rectangle())
+                  }
+                  .buttonStyle(.plain)
+                  .accessibilityLabel("设备照片，\(asset.date.formatted())")
                 }
-                .buttonStyle(.plain)
-                .accessibilityLabel("设备照片，\(asset.date.formatted())")
               }
             }
+          }
+          Color.clear.frame(height: 1).id(bottom)
+        }
+      }
+      .gesture(
+        MagnificationGesture()
+          .onEnded { value in
+            withAnimation(.easeInOut(duration: 0.2)) {
+              if value > 1.25 { columns = max(1, columns - 1) }
+              else if value < 0.8 { columns = min(6, columns + 1) }
+            }
+          }
+      )
+      .onChange(of: assets.count) { _ in
+        guard !positioned, !assets.isEmpty else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+          withAnimation(.none) { proxy.scrollTo(bottom, anchor: .bottom) }
+          positioned = true
+        }
+      }
+      .onAppear {
+        if !assets.isEmpty && !positioned {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            withAnimation(.none) { proxy.scrollTo(bottom, anchor: .bottom) }
+            positioned = true
           }
         }
       }
     }
-    .gesture(
-      MagnificationGesture()
-        .onEnded { value in
-          withAnimation(.easeInOut(duration: 0.2)) {
-            if value > 1.25 { columns = max(1, columns - 1) }
-            else if value < 0.8 { columns = min(6, columns + 1) }
-          }
-        }
-    )
     .sheet(item: $selected) { NativeDeviceViewer(asset: $0) }
     .navigationTitle(title)
   }

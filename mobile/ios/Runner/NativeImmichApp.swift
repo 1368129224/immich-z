@@ -706,6 +706,15 @@ struct NativePhotosView: View {
           Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
         }
         if model.isLoading { ProgressView().padding(6) }
+        if let message = cloud.message {
+          HStack(spacing: 8) {
+            Text(message).font(.caption).lineLimit(3)
+            Spacer(minLength: 4)
+            Button("重试核验") { Task { await cloud.retry(device.assets, client: client) } }
+              .font(.caption).fixedSize()
+          }
+          .padding(6)
+        }
         if let message = model.error {
           HStack { Text(message).font(.caption).lineLimit(2); Button("重试") { Task { await model.retry() } } }.padding(6)
         }

@@ -113,6 +113,7 @@ private enum NativeAPIError: LocalizedError {
   case unauthorized
   case http(Int, String)
   case invalidResponse
+  case invalidJSON(String)
 
   var errorDescription: String? {
     switch self {
@@ -120,6 +121,7 @@ private enum NativeAPIError: LocalizedError {
     case .unauthorized: return "认证失败。请检查服务器地址和凭据。"
     case let .http(code, message): return "服务器请求失败（\(code)）：\(message)"
     case .invalidResponse: return "服务器返回了无法识别的数据。"
+    case let .invalidJSON(endpoint): return "服务器在 \(endpoint) 返回的数据不是有效 JSON。请检查服务器版本及反向代理的 /api 配置。"
     }
   }
 }
@@ -206,8 +208,13 @@ final class NativeImmichClient {
       let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["message"] as? String ?? ""
       throw NativeAPIError.http(http.statusCode, message)
     }
-    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw NativeAPIError.invalidResponse }
-    return object
+    do {
+      guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        throw NativeAPIError.invalidJSON(path)
+      }
+      return object
+    } catch let error as NativeAPIError { throw error }
+    catch { throw NativeAPIError.invalidJSON(path) }
   }
 
   func timelineBuckets() async throws -> [NativeBucket] {
@@ -223,7 +230,8 @@ final class NativeImmichClient {
     applyAuth(to: &request)
     let (data, response) = try await nativeData(for: request, using: session)
     try check(response: response, data: data)
-    guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw NativeAPIError.invalidResponse }
+    let payload = try parseJSON(data, endpoint: "/timeline/buckets")
+    guard let rows = payload as? [[String: Any]] else { throw NativeAPIError.invalidJSON("/timeline/buckets") }
     return rows.compactMap { row in
       guard let id = row["timeBucket"] as? String else { return nil }
       return NativeBucket(id: String(id.prefix(10)), count: row["count"] as? Int ?? 0)
@@ -245,8 +253,10 @@ final class NativeImmichClient {
     applyAuth(to: &request)
     let (data, response) = try await nativeData(for: request, using: session)
     try check(response: response, data: data)
-    guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-          let ids = object["id"] as? [Any] else { throw NativeAPIError.invalidResponse }
+    let payload = try parseJSON(data, endpoint: "/timeline/bucket")
+    guard let object = payload as? [String: Any], let ids = object["id"] as? [Any] else {
+      throw NativeAPIError.invalidJSON("/timeline/bucket")
+    }
     func strings(_ key: String) -> [Any] { object[key] as? [Any] ?? [] }
     let dates = strings("fileCreatedAt")
     let created = strings("createdAt")
@@ -288,6 +298,11 @@ final class NativeImmichClient {
     let (data, response) = try await nativeData(for: request, using: session)
     try check(response: response, data: data)
     return data
+  }
+
+  private func parseJSON(_ data: Data, endpoint: String) throws -> Any {
+    do { return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) }
+    catch { throw NativeAPIError.invalidJSON(endpoint) }
   }
 
   private func applyAuth(to request: inout URLRequest) {
@@ -499,6 +514,8 @@ private final class NativeTimelineModel: ObservableObject {
   private let client: NativeImmichClient
   private var buckets: [NativeBucket] = []
   private var nextBucket = 0
+  private var searchFallbackEnabled = false
+  private var searchCursor: String?
   private let pageSize = 4
 
   init(client: NativeImmichClient) { self.client = client }
@@ -509,12 +526,23 @@ private final class NativeTimelineModel: ObservableObject {
     error = nil
     defer { isLoading = false }
     do {
+      assets = []
+      searchFallbackEnabled = false
+      searchCursor = nil
       buckets = try await client.timelineBuckets()
       nextBucket = 0
-      assets = []
       hasOlder = !buckets.isEmpty
       try await loadNextPage()
-    } catch { self.error = error.localizedDescription }
+    } catch {
+      // Some compatible Immich servers or reverse proxies return a non-JSON
+      // timeline response. Keep Photos usable via the standard metadata search.
+      do {
+        searchFallbackEnabled = true
+        searchCursor = nil
+        assets = []
+        try await loadSearchFallbackPage()
+      } catch { self.error = error.localizedDescription }
+    }
   }
 
   func loadOlder() async {
@@ -523,7 +551,8 @@ private final class NativeTimelineModel: ObservableObject {
     defer { isLoading = false }
     do {
       error = nil
-      try await loadNextPage()
+      if searchFallbackEnabled { try await loadSearchFallbackPage() }
+      else { try await loadNextPage() }
     } catch { self.error = error.localizedDescription }
   }
 
@@ -533,6 +562,15 @@ private final class NativeTimelineModel: ObservableObject {
     } else {
       await loadOlder()
     }
+  }
+
+  private func loadSearchFallbackPage() async throws {
+    let page = try await client.searchPage(cursor: searchCursor, filter: ["visibility": ["eq": "timeline"]])
+    var seen = Set(assets.map(\.id))
+    assets = (assets + page.assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
+    searchCursor = page.next
+    hasOlder = page.next != nil
+    error = nil
   }
 
   private func loadNextPage() async throws {

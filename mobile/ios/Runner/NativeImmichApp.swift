@@ -731,7 +731,8 @@ struct NativePhotosView: View {
   @State private var selectedLocal: NativeDeviceAsset?
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
-  @State private var initialPositioned = false
+  @State private var hasInitialScrolled = false
+  @State private var didInitialPosition = false
   @State private var loadingOlderAnchor: String?
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
@@ -775,7 +776,7 @@ struct NativePhotosView: View {
                 .padding(.vertical, 16)
                 .id("older-loader")
                 .onAppear {
-                  if initialPositioned {
+                  if didInitialPosition {
                     requestOlder(proxy: proxy)
                   }
                 }
@@ -921,7 +922,7 @@ struct NativePhotosView: View {
         .onChange(of: device.assets.count) { _ in
           rebuildDayGroups()
           Task { await cloud.check(device.assets, client: client) }
-          if !initialPositioned && !cachedDayGroups.isEmpty {
+          if !hasInitialScrolled && !cachedDayGroups.isEmpty {
             scrollToBottom(proxy: proxy, animated: false)
           }
         }
@@ -936,14 +937,14 @@ struct NativePhotosView: View {
             }
           } else {
             Task { await cloud.check(device.assets, client: client) }
-            if !cachedDayGroups.isEmpty && !initialPositioned {
+            if !cachedDayGroups.isEmpty && !hasInitialScrolled {
               scrollToBottom(proxy: proxy, animated: false)
             }
           }
         }
         .onChange(of: model.assets.count) { _ in
           rebuildDayGroups()
-          if !initialPositioned && !cachedDayGroups.isEmpty {
+          if !hasInitialScrolled && !cachedDayGroups.isEmpty {
             scrollToBottom(proxy: proxy, animated: false)
           }
         }
@@ -957,7 +958,6 @@ struct NativePhotosView: View {
           if !device.authorized {
             Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
           }
-          if model.isLoading { ProgressView().padding(6) }
           if let message = cloud.message {
             HStack(spacing: 8) {
               Text(message).font(.caption).lineLimit(3)
@@ -978,7 +978,13 @@ struct NativePhotosView: View {
             if isSelecting {
               Button("取消") { clearSelection() }
             } else {
-              Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
+              HStack(spacing: 6) {
+                Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
+                if model.isLoading {
+                  ProgressView()
+                    .scaleEffect(0.7)
+                }
+              }
             }
           }
           ToolbarItem(placement: .principal) {
@@ -1048,6 +1054,7 @@ struct NativePhotosView: View {
   }
 
   private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+    hasInitialScrolled = true
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
       if animated {
         withAnimation(.easeInOut(duration: 0.25)) {
@@ -1058,12 +1065,15 @@ struct NativePhotosView: View {
           proxy.scrollTo(bottomAnchor, anchor: .bottom)
         }
       }
-      initialPositioned = true
+      // Allow pagination only after the initial bottom positioning is fully settled
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+        didInitialPosition = true
+      }
     }
   }
 
   private func requestOlder(proxy: ScrollViewProxy) {
-    guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading, initialPositioned else { return }
+    guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading, didInitialPosition else { return }
     let anchor = cachedDayGroups.first?.assets.first?.id
     loadingOlderAnchor = anchor ?? "pending"
     Task {

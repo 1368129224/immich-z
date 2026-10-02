@@ -731,6 +731,10 @@ struct NativePhotosView: View {
   @State private var selectedLocal: NativeDeviceAsset?
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
+  @State private var dragInitialSelectedIDs: Set<String> = []
+  @State private var dragSelectMode: Bool = true // true = selecting, false = deselecting
+  @State private var dragStartIndex: Int? = nil
+  @State private var itemBounds: [String: CGRect] = [:]
   @State private var hasInitialScrolled = false
   @State private var didInitialPosition = false
   @State private var loadingOlderAnchor: String?
@@ -830,6 +834,7 @@ struct NativePhotosView: View {
                             }
                             .frame(width: geo.size.width, height: geo.size.height)
                             .clipped()
+                            .preference(key: NativeItemFramePreferenceKey.self, value: [entry.id: geo.frame(in: .named("photosScrollSpace"))])
                           }
                         )
                         .clipped()
@@ -886,6 +891,20 @@ struct NativePhotosView: View {
             Color.clear.frame(height: 1).id(bottomAnchor)
           }
         }
+        .coordinateSpace(name: "photosScrollSpace")
+        .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
+          itemBounds = frames
+        }
+        .gesture(
+          DragGesture(minimumDistance: 10, coordinateSpace: .named("photosScrollSpace"))
+            .onChanged { gesture in
+              guard isSelecting else { return }
+              handleDragSelection(at: gesture.location)
+            }
+            .onEnded { _ in
+              dragStartIndex = nil
+            }
+        )
         .background(Color(uiColor: .systemBackground))
         .simultaneousGesture(
           MagnificationGesture()
@@ -1129,9 +1148,55 @@ struct NativePhotosView: View {
     }
   }
 
+  private var allOrderedAssetIDs: [String] {
+    cachedDayGroups.flatMap { $0.assets.map(\.id) }
+  }
+
   private func enterSelection(startingWith id: String) {
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     isSelecting = true
-    selectedIDs.insert(id)
+    let orderedIDs = allOrderedAssetIDs
+    if let idx = orderedIDs.firstIndex(of: id) {
+      dragStartIndex = idx
+      let alreadySelected = selectedIDs.contains(id)
+      dragSelectMode = !alreadySelected
+      dragInitialSelectedIDs = selectedIDs
+      if dragSelectMode {
+        selectedIDs.insert(id)
+      } else {
+        selectedIDs.remove(id)
+      }
+    } else {
+      selectedIDs.insert(id)
+    }
+  }
+
+  private func handleDragSelection(at location: CGPoint) {
+    guard let targetID = itemBounds.first(where: { $0.value.contains(location) })?.key else { return }
+    let orderedIDs = allOrderedAssetIDs
+    guard let currentIndex = orderedIDs.firstIndex(of: targetID) else { return }
+    
+    if dragStartIndex == nil {
+      dragStartIndex = currentIndex
+      dragInitialSelectedIDs = selectedIDs
+      dragSelectMode = !selectedIDs.contains(targetID)
+    }
+    
+    guard let startIndex = dragStartIndex else { return }
+    let lower = min(startIndex, currentIndex)
+    let upper = max(startIndex, currentIndex)
+    let rangeIDs = Set(orderedIDs[lower...upper])
+    
+    var updated = dragInitialSelectedIDs
+    if dragSelectMode {
+      updated.formUnion(rangeIDs)
+    } else {
+      updated.subtract(rangeIDs)
+    }
+    if updated != selectedIDs {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+      selectedIDs = updated
+    }
   }
 
   private func toggleSelection(_ id: String) {
@@ -1141,6 +1206,8 @@ struct NativePhotosView: View {
   private func clearSelection() {
     isSelecting = false
     selectedIDs.removeAll()
+    dragStartIndex = nil
+    dragInitialSelectedIDs.removeAll()
   }
 
   private func cloudSymbol(for entry: NativeGridItem) -> String {
@@ -1164,6 +1231,13 @@ struct NativePhotosView: View {
 private struct NativeDayGroup {
   let date: Date
   let assets: [NativeGridItem]
+}
+
+private struct NativeItemFramePreferenceKey: PreferenceKey {
+  static var defaultValue: [String: CGRect] = [:]
+  static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+    value.merge(nextValue(), uniquingKeysWith: { $1 })
+  }
 }
 
 private enum NativeThumbnailCache {

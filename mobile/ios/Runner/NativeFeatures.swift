@@ -88,8 +88,8 @@ struct NativeDeviceAlbum: Identifiable, Sendable {
 private enum NativeLocalThumbnailCache {
   static let images: NSCache<NSString, UIImage> = {
     let cache = NSCache<NSString, UIImage>()
-    cache.countLimit = 500
-    cache.totalCostLimit = 80 * 1024 * 1024
+    cache.countLimit = 1500
+    cache.totalCostLimit = 160 * 1024 * 1024
     return cache
   }()
   static let manager = PHCachingImageManager()
@@ -97,14 +97,17 @@ private enum NativeLocalThumbnailCache {
 
 struct NativeDeviceThumbnail: View {
   let asset: NativeDeviceAsset
+  var columns: Int = 3
   @State private var image: UIImage?
+
   var body: some View {
     Group {
       if let image { Image(uiImage: image).resizable().scaledToFill() }
       else { Rectangle().fill(Color(uiColor: .secondarySystemBackground)) }
     }
-    .task(id: "\(asset.id):\(asset.contentVersion)") {
-      let key = NSString(string: "\(asset.id):\(asset.contentVersion)")
+    .task(id: "\(asset.id):\(asset.contentVersion):\(targetDimension)") {
+      let dim = targetDimension
+      let key = NSString(string: "\(asset.id):\(asset.contentVersion):\(dim)")
       if let cached = NativeLocalThumbnailCache.images.object(forKey: key) {
         image = cached
         return
@@ -114,9 +117,10 @@ struct NativeDeviceThumbnail: View {
       options.isNetworkAccessAllowed = true
       options.deliveryMode = .opportunistic
       options.resizeMode = .fast
+      let targetSize = CGSize(width: dim, height: dim)
       NativeLocalThumbnailCache.manager.requestImage(
         for: source,
-        targetSize: CGSize(width: 450, height: 450),
+        targetSize: targetSize,
         contentMode: .aspectFill,
         options: options
       ) { result, info in
@@ -126,6 +130,18 @@ struct NativeDeviceThumbnail: View {
         NativeLocalThumbnailCache.images.setObject(result, forKey: key, cost: Int(result.size.width * result.size.height * 4))
         Task { @MainActor in image = result }
       }
+    }
+  }
+
+  private var targetDimension: Int {
+    if columns <= 2 {
+      return 500
+    } else if columns <= 4 {
+      return 320
+    } else if columns <= 7 {
+      return 180
+    } else {
+      return 110
     }
   }
 }
@@ -179,7 +195,7 @@ struct NativeDeviceGrid: View {
                       .aspectRatio(1, contentMode: .fit)
                       .overlay(
                         GeometryReader { geo in
-                          NativeDeviceThumbnail(asset: asset)
+                          NativeDeviceThumbnail(asset: asset, columns: columns)
                             .frame(width: geo.size.width, height: geo.size.height)
                             .clipped()
                         }
@@ -454,8 +470,8 @@ struct NativeResultGrid: View {
                     .overlay(
                       GeometryReader { geo in
                         Group {
-                          if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
-                          else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
+                          if let asset = entry.server { NativeThumbnail(client: client, asset: asset, columns: columns) }
+                          else if let asset = entry.local { NativeDeviceThumbnail(asset: asset, columns: columns) }
                         }
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()

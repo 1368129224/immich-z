@@ -824,8 +824,8 @@ struct NativePhotosView: View {
                         .overlay(
                           GeometryReader { geo in
                             Group {
-                              if let asset = entry.server { NativeThumbnail(client: client, asset: asset) }
-                              else if let asset = entry.local { NativeDeviceThumbnail(asset: asset) }
+                              if let asset = entry.server { NativeThumbnail(client: client, asset: asset, columns: columns) }
+                              else if let asset = entry.local { NativeDeviceThumbnail(asset: asset, columns: columns) }
                             }
                             .frame(width: geo.size.width, height: geo.size.height)
                             .clipped()
@@ -1159,16 +1159,35 @@ private struct NativeDayGroup {
 private enum NativeThumbnailCache {
   static let images: NSCache<NSString, UIImage> = {
     let cache = NSCache<NSString, UIImage>()
-    cache.countLimit = 500
-    cache.totalCostLimit = 150 * 1024 * 1024
+    cache.countLimit = 1500
+    cache.totalCostLimit = 200 * 1024 * 1024
     return cache
   }()
+
+  static func downsampledImage(from data: Data, maxPixelSize: Int) -> UIImage? {
+    let options: [CFString: Any] = [
+      kCGImageSourceShouldCache: false
+    ]
+    guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
+      return UIImage(data: data)
+    }
+    let thumbOptions: [CFString: Any] = [
+      kCGImageSourceCreateThumbnailFromImageAlways: true,
+      kCGImageSourceShouldCacheImmediately: true,
+      kCGImageSourceCreateThumbnailWithTransform: true,
+      kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+    ]
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbOptions as CFDictionary) else {
+      return UIImage(data: data)
+    }
+    return UIImage(cgImage: cgImage)
+  }
 }
 
 @MainActor
 private final class NativeThumbnailRequestLimiter {
   static let shared = NativeThumbnailRequestLimiter()
-  private let maximumActive = 6
+  private let maximumActive = 12
   private var active = 0
   private var waiters: [CheckedContinuation<Void, Never>] = []
 
@@ -1189,9 +1208,43 @@ private final class NativeThumbnailRequestLimiter {
   }
 }
 
+struct NativeThumbhashBackground: View {
+  let thumbhash: String?
+
+  var body: some View {
+    if let gradientColors, !gradientColors.isEmpty {
+      LinearGradient(
+        colors: gradientColors,
+        startPoint: .topLeading,
+        endPoint: .bottomTrailing
+      )
+    } else {
+      Rectangle().fill(Color(uiColor: .secondarySystemBackground))
+    }
+  }
+
+  private var gradientColors: [Color]? {
+    guard let hash = thumbhash, !hash.isEmpty,
+          let data = Data(base64Encoded: hash), data.count >= 5 else {
+      return nil
+    }
+    func dc(_ byte: UInt8) -> Double {
+      let v = Double((byte & 0x3F) * 2)
+      return min(1.0, max(0.0, (v * 255.0 / 126.0) / 255.0))
+    }
+    let r = dc(data[1])
+    let g = dc(data[2])
+    let b = dc(data[3])
+    let c1 = Color(red: r, green: g, blue: b)
+    let c2 = Color(red: max(0.0, r * 0.55), green: max(0.0, g * 0.55), blue: max(0.0, b * 0.55))
+    return [c1, c2]
+  }
+}
+
 struct NativeThumbnail: View {
   let client: NativeImmichClient
   let asset: NativeAsset
+  var columns: Int = 3
   @State private var image: UIImage?
 
   var body: some View {
@@ -1201,40 +1254,53 @@ struct NativeThumbnail: View {
           .resizable()
           .scaledToFill()
       } else {
-        Rectangle().fill(Color(uiColor: .secondarySystemBackground))
+        NativeThumbhashBackground(thumbhash: asset.thumbhash)
       }
     }
-    .task(id: "\(client.config.serverUrl):\(asset.id)") {
+    .task(id: "\(client.config.serverUrl):\(asset.id):\(isLowDensity ? "p" : "t")") {
       image = nil
       let credential = client.config.accessToken ?? client.config.apiKey ?? ""
       let accountDigest = SHA256.hash(data: Data("\(client.config.serverUrl):\(credential)".utf8))
         .map { String(format: "%02x", $0) }.joined()
-      let cacheKey = "\(accountDigest):\(asset.id)"
+      let sizeTag = isLowDensity ? "preview" : "thumbnail"
+      let cacheKey = "\(accountDigest):\(asset.id):\(sizeTag)"
       let key = NSString(string: cacheKey)
       if let cached = NativeThumbnailCache.images.object(forKey: key) {
         image = cached
         return
       }
-      if let cachedData = await NativeThumbnailDiskCache.shared.data(for: cacheKey),
-         let cachedImage = UIImage(data: cachedData) {
-        NativeThumbnailCache.images.setObject(
-          cachedImage,
-          forKey: key,
-          cost: Int(cachedImage.size.width * cachedImage.size.height * 4)
-        )
-        image = cachedImage
-        return
+      let maxDim = maxPixelDimension
+      if let cachedData = await NativeThumbnailDiskCache.shared.data(for: cacheKey) {
+        let decoded = await Task.detached(priority: .userInitiated) {
+          NativeThumbnailCache.downsampledImage(from: cachedData, maxPixelSize: maxDim)
+        }.value
+        if let decoded {
+          NativeThumbnailCache.images.setObject(
+            decoded,
+            forKey: key,
+            cost: Int(decoded.size.width * decoded.size.height * 4)
+          )
+          image = decoded
+          return
+        }
       }
-      // Request high-resolution preview first for crisp retina rendering
-      let previewURL = client.thumbnailURL(for: asset, size: "preview")
-      let thumbURL = client.thumbnailURL(for: asset, size: "thumbnail")
-      guard let url = previewURL ?? thumbURL else { return }
+
+      // If columns > 3, request lightweight 250px thumbnail directly (10x faster)
+      // Only request high-res preview when zooming into 1~3 large columns
+      let preferredURL = isLowDensity ? client.thumbnailURL(for: asset, size: "preview") : client.thumbnailURL(for: asset, size: "thumbnail")
+      let fallbackURL = isLowDensity ? client.thumbnailURL(for: asset, size: "thumbnail") : client.thumbnailURL(for: asset, size: "preview")
+      guard let url = preferredURL ?? fallbackURL else { return }
+
       await NativeThumbnailRequestLimiter.shared.acquire()
       defer { NativeThumbnailRequestLimiter.shared.release() }
       guard !Task.isCancelled else { return }
       do {
         let data = try await client.thumbnailData(for: url)
-        guard !Task.isCancelled, let decoded = UIImage(data: data) else { return }
+        guard !Task.isCancelled else { return }
+        let decoded = await Task.detached(priority: .userInitiated) {
+          NativeThumbnailCache.downsampledImage(from: data, maxPixelSize: maxDim)
+        }.value
+        guard !Task.isCancelled, let decoded else { return }
         await NativeThumbnailDiskCache.shared.store(data, for: cacheKey)
         NativeThumbnailCache.images.setObject(
           decoded,
@@ -1243,11 +1309,14 @@ struct NativeThumbnail: View {
         )
         image = decoded
       } catch {
-        // Fallback to thumbnail size if preview fails
-        if let fallbackURL = thumbURL, fallbackURL != url {
+        if let fallbackURL, fallbackURL != url {
           do {
             let data = try await client.thumbnailData(for: fallbackURL)
-            guard !Task.isCancelled, let decoded = UIImage(data: data) else { return }
+            guard !Task.isCancelled else { return }
+            let decoded = await Task.detached(priority: .userInitiated) {
+              NativeThumbnailCache.downsampledImage(from: data, maxPixelSize: maxDim)
+            }.value
+            guard !Task.isCancelled, let decoded else { return }
             await NativeThumbnailDiskCache.shared.store(data, for: cacheKey)
             NativeThumbnailCache.images.setObject(
               decoded,
@@ -1260,6 +1329,22 @@ struct NativeThumbnail: View {
           image = nil
         }
       }
+    }
+  }
+
+  private var isLowDensity: Bool {
+    columns <= 3
+  }
+
+  private var maxPixelDimension: Int {
+    if columns <= 2 {
+      return 600
+    } else if columns <= 4 {
+      return 360
+    } else if columns <= 7 {
+      return 220
+    } else {
+      return 130
     }
   }
 }

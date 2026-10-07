@@ -26,7 +26,46 @@ trap 'rm -rf -- "$staging"' EXIT
 echo "Downloading run $run_id ($artifact)..."
 if ! gh run download "$run_id" -R "$repo" -n "$artifact" -D "$staging" 2>/dev/null; then
   echo "Artifact download failed (possibly hit storage quota), falling back to release $ipa_name..."
-  gh release download latest-build -R "$repo" -p "$ipa_name" -D "$staging" --clobber
+  python3 - "$repo" "latest-build" "$ipa_name" "$staging/$ipa_name" <<'PY'
+import sys, json, os, time, subprocess, urllib.request
+
+repo, tag, asset_name, dest = sys.argv[1:5]
+token = subprocess.check_output("gh auth token", shell=True).decode().strip()
+release_info = subprocess.check_output(f"gh api repos/{repo}/releases/tags/{tag}", shell=True).decode()
+assets = json.loads(release_info).get('assets', [])
+asset = next((a for a in assets if a['name'] == asset_name), None)
+if not asset:
+    sys.exit(f"Asset {asset_name} not found in release {tag}")
+
+asset_url = asset['url']
+target_size = asset['size']
+current_size = os.path.getsize(dest) if os.path.exists(dest) else 0
+
+for attempt in range(1, 40):
+    if current_size >= target_size:
+        break
+    req = urllib.request.Request(asset_url)
+    req.add_header("Authorization", f"token {token}")
+    req.add_header("Accept", "application/octet-stream")
+    if current_size > 0:
+        req.add_header("Range", f"bytes={current_size}-")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            with open(dest, "ab" if current_size > 0 else "wb") as f:
+                while True:
+                    chunk = resp.read(128 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    current_size += len(chunk)
+    except Exception as e:
+        time.sleep(1)
+        if os.path.exists(dest):
+            current_size = os.path.getsize(dest)
+
+if not os.path.exists(dest) or os.path.getsize(dest) != target_size:
+    sys.exit(f"Failed to fully download {asset_name}: {current_size}/{target_size} bytes")
+PY
 fi
 ipa="$staging/$ipa_name"
 [[ -s "$ipa" ]] || { echo "Could not obtain $ipa_name from artifact or release" >&2; exit 1; }

@@ -38,7 +38,7 @@ jobs:
         working-directory: ./mobile
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -88,7 +88,7 @@ jobs:
           ls -lh ImmichZ-unsigned.ipa
 
       - name: Upload unsigned IPA
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         continue-on-error: true
         with:
           name: immich-z-ios-ipa-unsigned
@@ -111,7 +111,7 @@ jobs:
           gh release upload "$TAG" ImmichZ-unsigned.ipa --clobber
 
       - name: Upload raw .app bundle
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         continue-on-error: true
         with:
           name: immich-z-ios-app-bundle
@@ -134,7 +134,7 @@ jobs:
         working-directory: ./mobile
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -193,7 +193,7 @@ jobs:
       - name: Build signed IPA
         run: flutter build ipa --release --export-method=ad-hoc
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: immich-z-ios-ipa-signed
           path: mobile/build/ios/ipa/*.ipa

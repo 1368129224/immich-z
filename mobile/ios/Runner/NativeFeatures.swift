@@ -1133,6 +1133,7 @@ private struct NativeAlbumsView: View {
   @State private var serverAlbums: [NativeServerAlbum] = []
   @State private var error: String?
   @State private var loaded = false
+  @State private var isLoading = false
 
   @State private var isSelecting = false
   @State private var isDragSelecting = false
@@ -1290,6 +1291,14 @@ private struct NativeAlbumsView: View {
               isSelecting = false
               selectedAlbumIDs.removeAll()
             }
+          } else {
+            HStack(spacing: 6) {
+              Text("\(entries.count) 个相册").font(.caption).foregroundColor(.secondary)
+              if isLoading {
+                ProgressView()
+                  .scaleEffect(0.7)
+              }
+            }
           }
         }
         ToolbarItem(placement: .principal) {
@@ -1303,18 +1312,13 @@ private struct NativeAlbumsView: View {
               selectedAlbumIDs = Set(entries.map(\.id))
             }
           } else {
-            HStack(spacing: 12) {
-              Button("选择") {
-                isSelecting = true
+            Button {
+              Task {
+                await reload()
+                device.refresh()
               }
-              Button {
-                Task {
-                  await reload()
-                  device.refresh()
-                }
-              } label: {
-                Image(systemName: "arrow.clockwise")
-              }
+            } label: {
+              Image(systemName: "arrow.clockwise")
             }
           }
         }
@@ -1326,6 +1330,8 @@ private struct NativeAlbumsView: View {
   }
 
   private func reload() async {
+    isLoading = true
+    defer { isLoading = false }
     do { serverAlbums = try await client.serverAlbums(); error = nil }
     catch { self.error = error.localizedDescription }
   }

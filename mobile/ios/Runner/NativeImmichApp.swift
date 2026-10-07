@@ -734,7 +734,8 @@ struct NativePhotosView: View {
   @State private var isMagnifying = false
   @State private var dragInitialSelectedIDs: Set<String> = []
   @State private var dragSelectMode: Bool = true // true = selecting, false = deselecting
-  @State private var dragStartIndex: Int? = nil
+  @State private var dragStartLocation: CGPoint? = nil
+  @State private var dragStartAssetID: String? = nil
   @State private var itemBounds: [String: CGRect] = [:]
   @State private var hasInitialScrolled = false
   @State private var didInitialPosition = false
@@ -881,10 +882,29 @@ struct NativePhotosView: View {
                           selectedLocal = entry.local
                         }
                       }
-                      .onLongPressGesture(minimumDuration: 0.55, maximumDistance: 24) {
-                        guard !isMagnifying else { return }
-                        enterSelection(startingWith: entry.id)
-                      }
+                      .gesture(
+                        LongPressGesture(minimumDuration: 0.32)
+                          .sequenced(before: DragGesture(coordinateSpace: .named("photosScrollSpace")))
+                          .onChanged { value in
+                            guard !isMagnifying else { return }
+                            switch value {
+                            case .first:
+                              break
+                            case .second(true, let drag):
+                              if !isSelecting {
+                                enterSelection(startingWith: entry.id, at: drag?.location)
+                              }
+                              if let drag = drag {
+                                handle2DDragSelection(at: drag.location)
+                              }
+                            default:
+                              break
+                            }
+                          }
+                          .onEnded { _ in
+                            finishDragSelection()
+                          }
+                      )
                       .id(entry.id)
                   }
                 }
@@ -898,14 +918,14 @@ struct NativePhotosView: View {
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
           itemBounds = frames
         }
-        .gesture(
-          DragGesture(minimumDistance: 10, coordinateSpace: .named("photosScrollSpace"))
+        .simultaneousGesture(
+          DragGesture(minimumDistance: 8, coordinateSpace: .named("photosScrollSpace"))
             .onChanged { gesture in
               guard isSelecting else { return }
-              handleDragSelection(at: gesture.location)
+              handle2DDragSelection(at: gesture.location)
             }
             .onEnded { _ in
-              dragStartIndex = nil
+              finishDragSelection()
             }
         )
         .background(Color(uiColor: .systemBackground))
@@ -1187,51 +1207,76 @@ struct NativePhotosView: View {
     cachedDayGroups.flatMap { $0.assets.map(\.id) }
   }
 
-  private func enterSelection(startingWith id: String) {
+  private func enterSelection(startingWith id: String, at location: CGPoint? = nil) {
+    guard !isSelecting else { return }
     UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
     isSelecting = true
-    let orderedIDs = allOrderedAssetIDs
-    if let idx = orderedIDs.firstIndex(of: id) {
-      dragStartIndex = idx
-      let alreadySelected = selectedIDs.contains(id)
-      dragSelectMode = !alreadySelected
-      dragInitialSelectedIDs = selectedIDs
-      if dragSelectMode {
-        selectedIDs.insert(id)
-      } else {
-        selectedIDs.remove(id)
-      }
-    } else {
+    dragStartAssetID = id
+    let startLoc = location ?? itemBounds[id].map { CGPoint(x: $0.midX, y: $0.midY) }
+    dragStartLocation = startLoc
+    dragInitialSelectedIDs = selectedIDs
+    let alreadySelected = selectedIDs.contains(id)
+    dragSelectMode = !alreadySelected
+    if dragSelectMode {
       selectedIDs.insert(id)
+    } else {
+      selectedIDs.remove(id)
     }
   }
 
-  private func handleDragSelection(at location: CGPoint) {
-    guard let targetID = itemBounds.first(where: { $0.value.contains(location) })?.key else { return }
-    let orderedIDs = allOrderedAssetIDs
-    guard let currentIndex = orderedIDs.firstIndex(of: targetID) else { return }
-    
-    if dragStartIndex == nil {
-      dragStartIndex = currentIndex
+  private func handle2DDragSelection(at location: CGPoint) {
+    guard isSelecting else { return }
+    if dragStartLocation == nil {
+      dragStartLocation = location
       dragInitialSelectedIDs = selectedIDs
-      dragSelectMode = !selectedIDs.contains(targetID)
+      if let hitID = itemBounds.first(where: { $0.value.contains(location) })?.key {
+        dragStartAssetID = hitID
+        dragSelectMode = !selectedIDs.contains(hitID)
+      } else {
+        dragSelectMode = true
+      }
     }
     
-    guard let startIndex = dragStartIndex else { return }
-    let lower = min(startIndex, currentIndex)
-    let upper = max(startIndex, currentIndex)
-    let rangeIDs = Set(orderedIDs[lower...upper])
+    let startLoc = dragStartLocation ?? location
+    let minX = min(startLoc.x, location.x)
+    let minY = min(startLoc.y, location.y)
+    let maxX = max(startLoc.x, location.x)
+    let maxY = max(startLoc.y, location.y)
+    
+    let selectionRect = CGRect(
+      x: minX,
+      y: minY,
+      width: max(maxX - minX, 6),
+      height: max(maxY - minY, 6)
+    )
+    
+    var itemsInRect = Set<String>()
+    for (id, frame) in itemBounds {
+      if frame.intersects(selectionRect) {
+        itemsInRect.insert(id)
+      }
+    }
+    if let startID = dragStartAssetID {
+      itemsInRect.insert(startID)
+    }
     
     var updated = dragInitialSelectedIDs
     if dragSelectMode {
-      updated.formUnion(rangeIDs)
+      updated.formUnion(itemsInRect)
     } else {
-      updated.subtract(rangeIDs)
+      updated.subtract(itemsInRect)
     }
+    
     if updated != selectedIDs {
       UIImpactFeedbackGenerator(style: .light).impactOccurred()
       selectedIDs = updated
     }
+  }
+
+  private func finishDragSelection() {
+    dragStartLocation = nil
+    dragStartAssetID = nil
+    dragInitialSelectedIDs.removeAll()
   }
 
   private func toggleSelection(_ id: String) {
@@ -1242,8 +1287,7 @@ struct NativePhotosView: View {
   private func clearSelection() {
     isSelecting = false
     selectedIDs.removeAll()
-    dragStartIndex = nil
-    dragInitialSelectedIDs.removeAll()
+    finishDragSelection()
   }
 
   private func cloudSymbol(for entry: NativeGridItem) -> String {

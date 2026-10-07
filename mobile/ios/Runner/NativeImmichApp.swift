@@ -724,7 +724,7 @@ struct NativePhotosView: View {
   let onLogout: () -> Void
   @StateObject private var model: NativeTimelineModel
   @StateObject private var cloud = NativeCloudStatus()
-  @State private var columns: Int = 3
+  @State private var columns: Int = 4
   @State private var gestureBaseColumns: Int? = nil
   @State private var cachedDayGroups: [NativeDayGroup] = []
   @State private var selected: NativeAsset?
@@ -751,6 +751,10 @@ struct NativePhotosView: View {
     self.onUseFlutter = onUseFlutter
     self.onLogout = onLogout
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
+  }
+
+  private var totalDisplayCount: Int {
+    cachedDayGroups.reduce(0) { $0 + $1.assets.count }
   }
 
   private var firstGroupDatesInMonth: Set<Date> {
@@ -1047,7 +1051,7 @@ struct NativePhotosView: View {
               Button("取消") { clearSelection() }
             } else {
               HStack(spacing: 6) {
-                Text("\(model.assets.count) 项").font(.caption).foregroundColor(.secondary)
+                Text("\(totalDisplayCount) 项").font(.caption).foregroundColor(.secondary)
                 if model.isLoading {
                   ProgressView()
                     .scaleEffect(0.7)
@@ -1066,48 +1070,32 @@ struct NativePhotosView: View {
                 selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
               }
             } else {
-              HStack(spacing: 8) {
-                Menu {
-                  Picker("网格密度", selection: $columns) {
-                    Text("1 列 · 超大").tag(1)
-                    Text("2 列 · 大图").tag(2)
-                    Text("3 列 · 标准").tag(3)
-                    Text("4 列 · 紧凑").tag(4)
-                    Text("5 列 · 密集").tag(5)
-                    Text("7 列 · 微缩").tag(7)
-                    Text("10 列 · 概览").tag(10)
-                    Text("15 列 · 全景").tag(15)
-                  }
-                } label: {
-                  Image(systemName: "square.grid.3x3")
+              Menu {
+                Button(action: {
+                  scrollToBottom(proxy: proxy, animated: true)
+                }) {
+                  Label("回到最新", systemImage: "arrow.down.to.line")
                 }
-                Menu {
-                  Button(action: {
-                    scrollToBottom(proxy: proxy, animated: true)
-                  }) {
-                    Label("回到最新", systemImage: "arrow.down.to.line")
+                Button(action: {
+                  Task {
+                    await model.loadInitial()
+                    rebuildDayGroups()
+                    await cloud.check(device.assets, client: client)
+                    scrollToBottom(proxy: proxy, animated: false)
                   }
-                  Button(action: {
-                    Task {
-                      await model.loadInitial()
-                      rebuildDayGroups()
-                      await cloud.check(device.assets, client: client)
-                      scrollToBottom(proxy: proxy, animated: false)
-                    }
-                  }) {
-                    Label("刷新", systemImage: "arrow.clockwise")
-                  }
-                  Button(action: onUseFlutter) {
-                    Label("使用完整应用", systemImage: "square.grid.2x2")
-                  }
-                  Button(action: {
-                    cloud.clearCache()
-                    onLogout()
-                  }) {
-                    Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
-                  }
-                } label: { Image(systemName: "ellipsis.circle") }
-              }
+                }) {
+                  Label("刷新", systemImage: "arrow.clockwise")
+                }
+                Button(action: onUseFlutter) {
+                  Label("使用完整应用", systemImage: "square.grid.2x2")
+                }
+                Button(action: {
+                  cloud.clearCache()
+                  onLogout()
+                }) {
+                  Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
+                }
+              } label: { Image(systemName: "ellipsis.circle") }
             }
           }
         }

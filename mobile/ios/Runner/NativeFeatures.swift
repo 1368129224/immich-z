@@ -445,11 +445,68 @@ struct NativeResultGrid: View {
   let assets: [NativeAsset]
   var localAssets: [NativeDeviceAsset] = []
   let hasOlder: Bool
+  var isSelectingBinding: Binding<Bool>? = nil
+  var selectedIDsBinding: Binding<Set<String>>? = nil
   let loadMore: () -> Void
+
+  @State private var internalIsSelecting = false
+  @State private var internalSelectedIDs: Set<String> = []
+
+  @State private var isDragSelecting = false
+  @State private var isMagnifying = false
+  @State private var columns: Int = 4
+  @State private var gestureBaseColumns: Int? = nil
+
+  @State private var dragInitialSelectedIDs: Set<String> = []
+  @State private var dragSelectMode: Bool = true
+  @State private var dragStartLocation: CGPoint? = nil
+  @State private var dragStartAssetID: String? = nil
+  @State private var itemBounds: [String: CGRect] = [:]
+
   @State private var selected: NativeAsset?
   @State private var selectedLocal: NativeDeviceAsset?
-  @State private var columns: Int = 3
-  @State private var gestureBaseColumns: Int? = nil
+
+  private var isSelecting: Bool {
+    isSelectingBinding?.wrappedValue ?? internalIsSelecting
+  }
+
+  private var selectedIDs: Set<String> {
+    selectedIDsBinding?.wrappedValue ?? internalSelectedIDs
+  }
+
+  private func setIsSelecting(_ value: Bool) {
+    if let binding = isSelectingBinding {
+      binding.wrappedValue = value
+    } else {
+      internalIsSelecting = value
+    }
+  }
+
+  private func setSelectedIDs(_ value: Set<String>) {
+    if let binding = selectedIDsBinding {
+      binding.wrappedValue = value
+    } else {
+      internalSelectedIDs = value
+    }
+  }
+
+  init(
+    client: NativeImmichClient,
+    assets: [NativeAsset],
+    localAssets: [NativeDeviceAsset] = [],
+    hasOlder: Bool,
+    isSelecting: Binding<Bool>? = nil,
+    selectedIDs: Binding<Set<String>>? = nil,
+    loadMore: @escaping () -> Void
+  ) {
+    self.client = client
+    self.assets = assets
+    self.localAssets = localAssets
+    self.hasOlder = hasOlder
+    self.isSelectingBinding = isSelecting
+    self.selectedIDsBinding = selectedIDs
+    self.loadMore = loadMore
+  }
 
   private var merged: [NativeGridItem] {
     let matched = NativeSyncCacheStore.shared.matchedServerIDs
@@ -487,10 +544,7 @@ struct NativeResultGrid: View {
             let gridSpacing: CGFloat = columns > 7 ? 1 : 2
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
               ForEach(groups[day] ?? []) { entry in
-                Button {
-                  selected = entry.server
-                  selectedLocal = entry.local
-                } label: {
+                ZStack(alignment: .topTrailing) {
                   Color.clear
                     .aspectRatio(1, contentMode: .fit)
                     .overlay(
@@ -501,6 +555,7 @@ struct NativeResultGrid: View {
                         }
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
+                        .preference(key: NativeItemFramePreferenceKey.self, value: [entry.id: geo.frame(in: .named("resultGridScrollSpace"))])
                       }
                     )
                     .clipped()
@@ -520,9 +575,43 @@ struct NativeResultGrid: View {
                           .padding(columns > 4 ? 1.5 : 3)
                       }
                     }
-                    .contentShape(Rectangle())
+
+                  if isSelecting {
+                    ZStack {
+                      Circle()
+                        .fill(selectedIDs.contains(entry.id) ? Color.blue : Color.black.opacity(0.35))
+                        .frame(width: 22, height: 22)
+                      if selectedIDs.contains(entry.id) {
+                        Image(systemName: "checkmark")
+                          .font(.system(size: 11, weight: .bold))
+                          .foregroundColor(.white)
+                      } else {
+                        Circle()
+                          .stroke(Color.white, lineWidth: 1.5)
+                          .frame(width: 20, height: 20)
+                      }
+                    }
+                    .padding(columns > 4 ? 2 : 4)
+                  }
                 }
-                .buttonStyle(.plain)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                  guard !isMagnifying else { return }
+                  if isSelecting {
+                    toggleSelection(entry.id)
+                  } else {
+                    selected = entry.server
+                    selectedLocal = entry.local
+                  }
+                }
+                .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
+                  guard !isMagnifying else { return }
+                  if !isSelecting {
+                    enterSelection(startingWith: entry.id)
+                  } else {
+                    startDragSelectionInSelectMode(startingWith: entry.id)
+                  }
+                }
                 .id(entry.id)
               }
             }
@@ -534,9 +623,51 @@ struct NativeResultGrid: View {
         }
       }
     }
+    .coordinateSpace(name: "resultGridScrollSpace")
+    .nativeScrollDisabled(isDragSelecting)
+    .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
+      itemBounds = frames
+    }
+    .simultaneousGesture(
+      LongPressGesture(minimumDuration: 0.28, maximumDistance: 15)
+        .sequenced(before: DragGesture(coordinateSpace: .named("resultGridScrollSpace")))
+        .onChanged { value in
+          guard !isMagnifying else { return }
+          switch value {
+          case .first:
+            break
+          case .second(true, let drag):
+            if !isDragSelecting {
+              isDragSelecting = true
+              let loc = drag?.startLocation ?? drag?.location
+              if let loc = loc,
+                 let hitID = itemBounds.first(where: { $0.value.contains(loc) })?.key {
+                if !isSelecting {
+                  enterSelection(startingWith: hitID, at: loc)
+                } else {
+                  startDragSelectionInSelectMode(startingWith: hitID, at: loc)
+                }
+              }
+            }
+            if let drag = drag {
+              handle2DDragSelection(at: drag.location)
+            }
+          default:
+            break
+          }
+        }
+        .onEnded { _ in
+          isDragSelecting = false
+          finishDragSelection()
+        }
+    )
     .simultaneousGesture(
       MagnificationGesture()
         .onChanged { value in
+          guard !isSelecting else { return }
+          if !isMagnifying {
+            isMagnifying = true
+          }
           let base = gestureBaseColumns ?? columns
           if gestureBaseColumns == nil {
             gestureBaseColumns = base
@@ -566,10 +697,116 @@ struct NativeResultGrid: View {
         }
         .onEnded { _ in
           gestureBaseColumns = nil
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            isMagnifying = false
+          }
         }
     )
     .sheet(item: $selected) { NativeAssetViewer(client: client, asset: $0) }
     .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
+  }
+
+  private func enterSelection(startingWith id: String, at location: CGPoint? = nil) {
+    guard !isSelecting else { return }
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    setIsSelecting(true)
+    dragStartAssetID = id
+    let startLoc = location ?? itemBounds[id].map { CGPoint(x: $0.midX, y: $0.midY) }
+    dragStartLocation = startLoc
+    dragInitialSelectedIDs = selectedIDs
+    let alreadySelected = selectedIDs.contains(id)
+    dragSelectMode = !alreadySelected
+    var updated = selectedIDs
+    if dragSelectMode {
+      updated.insert(id)
+    } else {
+      updated.remove(id)
+    }
+    setSelectedIDs(updated)
+  }
+
+  private func startDragSelectionInSelectMode(startingWith id: String, at location: CGPoint? = nil) {
+    guard dragStartAssetID != id || dragStartLocation == nil else { return }
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    dragStartAssetID = id
+    let startLoc = location ?? itemBounds[id].map { CGPoint(x: $0.midX, y: $0.midY) }
+    dragStartLocation = startLoc
+    dragInitialSelectedIDs = selectedIDs
+    let alreadySelected = selectedIDs.contains(id)
+    dragSelectMode = !alreadySelected
+    var updated = selectedIDs
+    if dragSelectMode {
+      updated.insert(id)
+    } else {
+      updated.remove(id)
+    }
+    setSelectedIDs(updated)
+  }
+
+  private func handle2DDragSelection(at location: CGPoint) {
+    guard isSelecting else { return }
+    if dragStartLocation == nil {
+      dragStartLocation = location
+      dragInitialSelectedIDs = selectedIDs
+      if let hitID = itemBounds.first(where: { $0.value.contains(location) })?.key {
+        dragStartAssetID = hitID
+        dragSelectMode = !selectedIDs.contains(hitID)
+      } else {
+        dragSelectMode = true
+      }
+    }
+
+    let startLoc = dragStartLocation ?? location
+    let minX = min(startLoc.x, location.x)
+    let minY = min(startLoc.y, location.y)
+    let maxX = max(startLoc.x, location.x)
+    let maxY = max(startLoc.y, location.y)
+
+    let selectionRect = CGRect(
+      x: minX,
+      y: minY,
+      width: max(maxX - minX, 6),
+      height: max(maxY - minY, 6)
+    )
+
+    var itemsInRect = Set<String>()
+    for (id, frame) in itemBounds {
+      if frame.intersects(selectionRect) {
+        itemsInRect.insert(id)
+      }
+    }
+    if let startID = dragStartAssetID {
+      itemsInRect.insert(startID)
+    }
+
+    var updated = dragInitialSelectedIDs
+    if dragSelectMode {
+      updated.formUnion(itemsInRect)
+    } else {
+      updated.subtract(itemsInRect)
+    }
+
+    if updated != selectedIDs {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+      setSelectedIDs(updated)
+    }
+  }
+
+  private func finishDragSelection() {
+    dragStartLocation = nil
+    dragStartAssetID = nil
+    dragInitialSelectedIDs.removeAll()
+  }
+
+  private func toggleSelection(_ id: String) {
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    var updated = selectedIDs
+    if updated.contains(id) {
+      updated.remove(id)
+    } else {
+      updated.insert(id)
+    }
+    setSelectedIDs(updated)
   }
 }
 
@@ -773,12 +1010,16 @@ enum NativeAlbumOrigin {
   case local
 }
 
-private struct NativeAlbumEntry: Identifiable {
+private struct NativeAlbumEntry: Identifiable, Equatable {
   let id: String
   let title: String
   let server: NativeServerAlbum?
   let device: NativeDeviceAlbum?
   let origin: NativeAlbumOrigin
+
+  static func == (lhs: NativeAlbumEntry, rhs: NativeAlbumEntry) -> Bool {
+    lhs.id == rhs.id
+  }
 
   var countDescription: String {
     switch origin {
@@ -844,10 +1085,31 @@ private struct NativeAlbumCard: View {
   @ObservedObject var device: NativeDeviceLibrary
   let entry: NativeAlbumEntry
   let mergeAlbums: Bool
+  let isSelecting: Bool
+  let isSelected: Bool
 
   var body: some View {
     VStack(alignment: .leading, spacing: 6) {
-      NativeAlbumCoverView(client: client, device: device, entry: entry, mergeAlbums: mergeAlbums)
+      ZStack(alignment: .topTrailing) {
+        NativeAlbumCoverView(client: client, device: device, entry: entry, mergeAlbums: mergeAlbums)
+        if isSelecting {
+          ZStack {
+            Circle()
+              .fill(isSelected ? Color.blue : Color.black.opacity(0.35))
+              .frame(width: 24, height: 24)
+            if isSelected {
+              Image(systemName: "checkmark")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundColor(.white)
+            } else {
+              Circle()
+                .stroke(Color.white, lineWidth: 1.5)
+                .frame(width: 22, height: 22)
+            }
+          }
+          .padding(8)
+        }
+      }
       VStack(alignment: .leading, spacing: 2) {
         Text(entry.title)
           .font(.subheadline)
@@ -871,6 +1133,16 @@ private struct NativeAlbumsView: View {
   @State private var serverAlbums: [NativeServerAlbum] = []
   @State private var error: String?
   @State private var loaded = false
+
+  @State private var isSelecting = false
+  @State private var isDragSelecting = false
+  @State private var selectedAlbumIDs: Set<String> = []
+  @State private var itemBounds: [String: CGRect] = [:]
+  @State private var dragStartLocation: CGPoint? = nil
+  @State private var dragStartAlbumID: String? = nil
+  @State private var dragInitialSelectedIDs: Set<String> = []
+  @State private var dragSelectMode: Bool = true
+  @State private var activeEntry: NativeAlbumEntry? = nil
 
   private let gridColumns = [
     GridItem(.flexible(), spacing: 14),
@@ -907,6 +1179,19 @@ private struct NativeAlbumsView: View {
     NavigationView {
       ScrollView {
         VStack(alignment: .leading, spacing: 16) {
+          if let active = activeEntry {
+            NavigationLink(
+              destination: NativeAlbumDetail(client: client, device: device, entry: active, mergeAlbums: mergeAlbums),
+              isActive: Binding(
+                get: { activeEntry != nil },
+                set: { if !$0 { activeEntry = nil } }
+              )
+            ) {
+              EmptyView()
+            }
+            .hidden()
+          }
+
           if !device.authorized {
             Button("允许访问设备相册（可选）") { Task { await device.requestAccess() } }
               .font(.footnote)
@@ -922,10 +1207,36 @@ private struct NativeAlbumsView: View {
 
           LazyVGrid(columns: gridColumns, spacing: 16) {
             ForEach(entries) { entry in
-              NavigationLink(destination: NativeAlbumDetail(client: client, device: device, entry: entry, mergeAlbums: mergeAlbums)) {
-                NativeAlbumCard(client: client, device: device, entry: entry, mergeAlbums: mergeAlbums)
+              NativeAlbumCard(
+                client: client,
+                device: device,
+                entry: entry,
+                mergeAlbums: mergeAlbums,
+                isSelecting: isSelecting,
+                isSelected: selectedAlbumIDs.contains(entry.id)
+              )
+              .background(
+                GeometryReader { geo in
+                  Color.clear
+                    .preference(key: NativeItemFramePreferenceKey.self, value: [entry.id: geo.frame(in: .named("albumsScrollSpace"))])
+                }
+              )
+              .contentShape(Rectangle())
+              .onTapGesture {
+                if isSelecting {
+                  toggleAlbumSelection(entry.id)
+                } else {
+                  activeEntry = entry
+                }
               }
-              .buttonStyle(.plain)
+              .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
+                if !isSelecting {
+                  enterAlbumSelection(startingWith: entry.id)
+                } else {
+                  startDragSelectionInAlbumMode(startingWith: entry.id)
+                }
+              }
+              .id(entry.id)
             }
           }
           .padding(.horizontal, 16)
@@ -933,17 +1244,78 @@ private struct NativeAlbumsView: View {
           .padding(.bottom, 24)
         }
       }
+      .coordinateSpace(name: "albumsScrollSpace")
+      .nativeScrollDisabled(isDragSelecting)
+      .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
+        itemBounds = frames
+      }
+      .simultaneousGesture(
+        LongPressGesture(minimumDuration: 0.28, maximumDistance: 15)
+          .sequenced(before: DragGesture(coordinateSpace: .named("albumsScrollSpace")))
+          .onChanged { value in
+            switch value {
+            case .first:
+              break
+            case .second(true, let drag):
+              if !isDragSelecting {
+                isDragSelecting = true
+                let loc = drag?.startLocation ?? drag?.location
+                if let loc = loc,
+                   let hitID = itemBounds.first(where: { $0.value.contains(loc) })?.key {
+                  if !isSelecting {
+                    enterAlbumSelection(startingWith: hitID, at: loc)
+                  } else {
+                    startDragSelectionInAlbumMode(startingWith: hitID, at: loc)
+                  }
+                }
+              }
+              if let drag = drag {
+                handle2DDragSelection(at: drag.location)
+              }
+            default:
+              break
+            }
+          }
+          .onEnded { _ in
+            isDragSelecting = false
+            finishDragSelection()
+          }
+      )
       .navigationTitle("")
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
-        ToolbarItem(placement: .navigationBarTrailing) {
-          Button {
-            Task {
-              await reload()
-              device.refresh()
+        ToolbarItem(placement: .navigationBarLeading) {
+          if isSelecting {
+            Button("取消") {
+              isSelecting = false
+              selectedAlbumIDs.removeAll()
             }
-          } label: {
-            Image(systemName: "arrow.clockwise")
+          }
+        }
+        ToolbarItem(placement: .principal) {
+          if isSelecting {
+            Text("已选 \(selectedAlbumIDs.count) 个相册").font(.headline)
+          }
+        }
+        ToolbarItem(placement: .navigationBarTrailing) {
+          if isSelecting {
+            Button("全选") {
+              selectedAlbumIDs = Set(entries.map(\.id))
+            }
+          } else {
+            HStack(spacing: 12) {
+              Button("选择") {
+                isSelecting = true
+              }
+              Button {
+                Task {
+                  await reload()
+                  device.refresh()
+                }
+              } label: {
+                Image(systemName: "arrow.clockwise")
+              }
+            }
           }
         }
       }
@@ -957,6 +1329,103 @@ private struct NativeAlbumsView: View {
     do { serverAlbums = try await client.serverAlbums(); error = nil }
     catch { self.error = error.localizedDescription }
   }
+
+  private func enterAlbumSelection(startingWith id: String, at location: CGPoint? = nil) {
+    guard !isSelecting else { return }
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    isSelecting = true
+    dragStartAlbumID = id
+    let startLoc = location ?? itemBounds[id].map { CGPoint(x: $0.midX, y: $0.midY) }
+    dragStartLocation = startLoc
+    dragInitialSelectedIDs = selectedAlbumIDs
+    let alreadySelected = selectedAlbumIDs.contains(id)
+    dragSelectMode = !alreadySelected
+    if dragSelectMode {
+      selectedAlbumIDs.insert(id)
+    } else {
+      selectedAlbumIDs.remove(id)
+    }
+  }
+
+  private func startDragSelectionInAlbumMode(startingWith id: String, at location: CGPoint? = nil) {
+    guard dragStartAlbumID != id || dragStartLocation == nil else { return }
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    dragStartAlbumID = id
+    let startLoc = location ?? itemBounds[id].map { CGPoint(x: $0.midX, y: $0.midY) }
+    dragStartLocation = startLoc
+    dragInitialSelectedIDs = selectedAlbumIDs
+    let alreadySelected = selectedAlbumIDs.contains(id)
+    dragSelectMode = !alreadySelected
+    if dragSelectMode {
+      selectedAlbumIDs.insert(id)
+    } else {
+      selectedAlbumIDs.remove(id)
+    }
+  }
+
+  private func handle2DDragSelection(at location: CGPoint) {
+    guard isSelecting else { return }
+    if dragStartLocation == nil {
+      dragStartLocation = location
+      dragInitialSelectedIDs = selectedAlbumIDs
+      if let hitID = itemBounds.first(where: { $0.value.contains(location) })?.key {
+        dragStartAlbumID = hitID
+        dragSelectMode = !selectedAlbumIDs.contains(hitID)
+      } else {
+        dragSelectMode = true
+      }
+    }
+
+    let startLoc = dragStartLocation ?? location
+    let minX = min(startLoc.x, location.x)
+    let minY = min(startLoc.y, location.y)
+    let maxX = max(startLoc.x, location.x)
+    let maxY = max(startLoc.y, location.y)
+
+    let selectionRect = CGRect(
+      x: minX,
+      y: minY,
+      width: max(maxX - minX, 6),
+      height: max(maxY - minY, 6)
+    )
+
+    var itemsInRect = Set<String>()
+    for (id, frame) in itemBounds {
+      if frame.intersects(selectionRect) {
+        itemsInRect.insert(id)
+      }
+    }
+    if let startID = dragStartAlbumID {
+      itemsInRect.insert(startID)
+    }
+
+    var updated = dragInitialSelectedIDs
+    if dragSelectMode {
+      updated.formUnion(itemsInRect)
+    } else {
+      updated.subtract(itemsInRect)
+    }
+
+    if updated != selectedAlbumIDs {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+      selectedAlbumIDs = updated
+    }
+  }
+
+  private func finishDragSelection() {
+    dragStartLocation = nil
+    dragStartAlbumID = nil
+    dragInitialSelectedIDs.removeAll()
+  }
+
+  private func toggleAlbumSelection(_ id: String) {
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    if selectedAlbumIDs.contains(id) {
+      selectedAlbumIDs.remove(id)
+    } else {
+      selectedAlbumIDs.insert(id)
+    }
+  }
 }
 
 private struct NativeAlbumDetail: View {
@@ -965,6 +1434,9 @@ private struct NativeAlbumDetail: View {
   let entry: NativeAlbumEntry
   let mergeAlbums: Bool
   @StateObject private var model: NativeResultsModel
+
+  @State private var isSelecting = false
+  @State private var selectedIDs: Set<String> = []
 
   init(client: NativeImmichClient, device: NativeDeviceLibrary, entry: NativeAlbumEntry, mergeAlbums: Bool) {
     self.client = client
@@ -1004,14 +1476,59 @@ private struct NativeAlbumDetail: View {
         client: client,
         assets: serverAssetsToDisplay,
         localAssets: localAssetsToDisplay,
-        hasOlder: entry.server != nil && model.next != nil
+        hasOlder: entry.server != nil && model.next != nil,
+        isSelecting: $isSelecting,
+        selectedIDs: $selectedIDs
       ) {
         if let id = entry.server?.id { Task { await model.load(albumId: id) } }
       }
       if model.loading { ProgressView().padding(8) }
     }
-    .navigationTitle(entry.title)
+    .navigationTitle(isSelecting ? "" : entry.title)
     .navigationBarTitleDisplayMode(.inline)
+    .toolbar {
+      ToolbarItem(placement: .navigationBarLeading) {
+        if isSelecting {
+          Button("取消") {
+            isSelecting = false
+            selectedIDs.removeAll()
+          }
+        }
+      }
+      ToolbarItem(placement: .principal) {
+        if isSelecting {
+          Text("已选 \(selectedIDs.count) 项").font(.headline)
+        }
+      }
+      ToolbarItem(placement: .navigationBarTrailing) {
+        if isSelecting {
+          Button("全选") {
+            let matched = NativeSyncCacheStore.shared.matchedServerIDs
+            let serverById = Dictionary(serverAssetsToDisplay.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            var usedServerIDs = Set<String>()
+            var ids: [String] = []
+            for local in localAssetsToDisplay {
+              if let sID = matched[local.id], let sAsset = serverById[sID] {
+                ids.append("merged:\(sAsset.id):\(local.id)")
+                usedServerIDs.insert(sAsset.id)
+              } else {
+                ids.append("local:\(local.id)")
+              }
+            }
+            for server in serverAssetsToDisplay {
+              if !usedServerIDs.contains(server.id) {
+                ids.append("server:\(server.id)")
+              }
+            }
+            selectedIDs = Set(ids)
+          }
+        } else {
+          Button("选择") {
+            isSelecting = true
+          }
+        }
+      }
+    }
     .task {
       if let server = entry.server {
         await model.load(albumId: server.id, reset: true)

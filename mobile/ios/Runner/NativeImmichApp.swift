@@ -1034,9 +1034,6 @@ struct NativePhotosView: View {
                 } label: {
                   Image(systemName: "square.grid.3x3")
                 }
-                Button("选择") {
-                  isSelecting = true
-                }
                 Menu {
                   Button(action: {
                     scrollToBottom(proxy: proxy, animated: true)

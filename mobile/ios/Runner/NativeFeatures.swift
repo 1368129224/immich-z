@@ -70,6 +70,21 @@ final class NativeDeviceLibrary: ObservableObject {
     let ids = Set((0..<results.count).map { results.object(at: $0).localIdentifier })
     return assets.filter { ids.contains($0.id) }
   }
+
+  func firstAsset(in album: NativeDeviceAlbum) -> NativeDeviceAsset? {
+    guard let collection = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [album.id], options: nil).firstObject else { return nil }
+    let options = PHFetchOptions()
+    options.fetchLimit = 1
+    options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+    let results = PHAsset.fetchAssets(in: collection, options: options)
+    guard let first = results.firstObject else { return nil }
+    return assets.first { $0.id == first.localIdentifier } ?? NativeDeviceAsset(
+      id: first.localIdentifier,
+      date: first.creationDate ?? .distantPast,
+      isVideo: first.mediaType == .video,
+      contentVersion: Int((first.modificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+    )
+  }
 }
 
 struct NativeDeviceAsset: Identifiable, Sendable {
@@ -279,6 +294,7 @@ struct NativeServerAlbum: Identifiable {
   let id: String
   let name: String
   let count: Int
+  let thumbnailAssetId: String?
 }
 
 struct NativeSearchPage {
@@ -364,7 +380,8 @@ extension NativeImmichClient {
     let rows = try await nativeArray(path: "albums")
     return rows.compactMap { row in
       guard let id = row["id"] as? String, let name = row["albumName"] as? String else { return nil }
-      return NativeServerAlbum(id: id, name: name, count: row["assetCount"] as? Int ?? 0)
+      let thumbId = row["albumThumbnailAssetId"] as? String
+      return NativeServerAlbum(id: id, name: name, count: row["assetCount"] as? Int ?? 0, thumbnailAssetId: thumbId)
     }
   }
 }
@@ -750,56 +767,190 @@ private struct NativeSearchView: View {
   }
 }
 
+enum NativeAlbumOrigin {
+  case merged
+  case server
+  case local
+}
+
 private struct NativeAlbumEntry: Identifiable {
   let id: String
   let title: String
   let server: NativeServerAlbum?
   let device: NativeDeviceAlbum?
-  var detail: String { "服务器 \(server?.count ?? 0) · 本机 \(device?.count ?? 0)" }
+  let origin: NativeAlbumOrigin
+
+  var countDescription: String {
+    switch origin {
+    case .merged:
+      let s = server?.count ?? 0
+      let d = device?.count ?? 0
+      return "云端 \(s) · 本地 \(d)"
+    case .server:
+      return "\(server?.count ?? 0) 项"
+    case .local:
+      return "\(device?.count ?? 0) 项"
+    }
+  }
+}
+
+private struct NativeAlbumCoverView: View {
+  let client: NativeImmichClient
+  @ObservedObject var device: NativeDeviceLibrary
+  let entry: NativeAlbumEntry
+  let mergeAlbums: Bool
+
+  var body: some View {
+    Color.clear
+      .aspectRatio(1, contentMode: .fit)
+      .overlay(
+        Group {
+          if let thumbId = entry.server?.thumbnailAssetId {
+            NativeThumbnail(
+              client: client,
+              asset: NativeAsset(id: thumbId, date: .distantPast, isImage: true, isFavorite: false, thumbhash: nil),
+              columns: 2
+            )
+          } else if let devAlbum = entry.device, let firstLocal = device.firstAsset(in: devAlbum) {
+            NativeDeviceThumbnail(asset: firstLocal, columns: 2)
+          } else {
+            ZStack {
+              Color(uiColor: .secondarySystemBackground)
+              Image(systemName: "photo.on.rectangle")
+                .font(.system(size: 32))
+                .foregroundColor(.secondary)
+            }
+          }
+        }
+      )
+      .clipped()
+      .cornerRadius(10)
+      .overlay(alignment: .bottomTrailing) {
+        if !mergeAlbums {
+          Image(systemName: entry.origin == .server ? "cloud.fill" : "iphone")
+            .font(.system(size: 11, weight: .bold))
+            .foregroundColor(.white)
+            .padding(5)
+            .background(Color.black.opacity(0.6))
+            .clipShape(Circle())
+            .padding(6)
+        }
+      }
+  }
+}
+
+private struct NativeAlbumCard: View {
+  let client: NativeImmichClient
+  @ObservedObject var device: NativeDeviceLibrary
+  let entry: NativeAlbumEntry
+  let mergeAlbums: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 6) {
+      NativeAlbumCoverView(client: client, device: device, entry: entry, mergeAlbums: mergeAlbums)
+      VStack(alignment: .leading, spacing: 2) {
+        Text(entry.title)
+          .font(.subheadline)
+          .fontWeight(.medium)
+          .foregroundColor(.primary)
+          .lineLimit(1)
+        Text(entry.countDescription)
+          .font(.caption2)
+          .foregroundColor(.secondary)
+          .lineLimit(1)
+      }
+      .frame(maxWidth: .infinity, alignment: .leading)
+    }
+  }
 }
 
 private struct NativeAlbumsView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
+  @AppStorage("immichz_merge_albums") private var mergeAlbums = true
   @State private var serverAlbums: [NativeServerAlbum] = []
   @State private var error: String?
   @State private var loaded = false
 
+  private let gridColumns = [
+    GridItem(.flexible(), spacing: 14),
+    GridItem(.flexible(), spacing: 14)
+  ]
+
   private var entries: [NativeAlbumEntry] {
-    let serverGroups = Dictionary(grouping: serverAlbums) { $0.name.trimmingCharacters(in: .whitespaces).precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: .current) }
-    let localGroups = Dictionary(grouping: device.albums) { $0.name.trimmingCharacters(in: .whitespaces).precomposedStringWithCanonicalMapping.folding(options: .caseInsensitive, locale: .current) }
-    let combined = Set(serverGroups.keys).union(localGroups.keys)
-    return combined.sorted().flatMap { key -> [NativeAlbumEntry] in
-      let remote = serverGroups[key] ?? []
-      let local = localGroups[key] ?? []
-      if remote.count == 1 && local.count == 1 {
-        return [NativeAlbumEntry(id: "pair:\(remote[0].id):\(local[0].id)", title: remote[0].name, server: remote[0], device: local[0])]
+    if mergeAlbums {
+      let serverGroups = Dictionary(grouping: serverAlbums) { $0.name.trimmingCharacters(in: .whitespaces).folding(options: .caseInsensitive, locale: .current) }
+      let localGroups = Dictionary(grouping: device.albums) { $0.name.trimmingCharacters(in: .whitespaces).folding(options: .caseInsensitive, locale: .current) }
+      let combined = Set(serverGroups.keys).union(localGroups.keys)
+      return combined.sorted().flatMap { key -> [NativeAlbumEntry] in
+        let remote = serverGroups[key] ?? []
+        let local = localGroups[key] ?? []
+        if remote.count == 1 && local.count == 1 {
+          return [NativeAlbumEntry(id: "pair:\(remote[0].id):\(local[0].id)", title: remote[0].name, server: remote[0], device: local[0], origin: .merged)]
+        }
+        return remote.map { NativeAlbumEntry(id: "server:\($0.id)", title: $0.name, server: $0, device: nil, origin: .server) }
+          + local.map { NativeAlbumEntry(id: "local:\($0.id)", title: $0.name, server: nil, device: $0, origin: .local) }
       }
-      return remote.map { NativeAlbumEntry(id: "server:\($0.id)", title: $0.name, server: $0, device: nil) }
-        + local.map { NativeAlbumEntry(id: "local:\($0.id)", title: $0.name, server: nil, device: $0) }
+    } else {
+      var result: [NativeAlbumEntry] = []
+      for s in serverAlbums {
+        result.append(NativeAlbumEntry(id: "server:\(s.id)", title: s.name, server: s, device: nil, origin: .server))
+      }
+      for d in device.albums {
+        result.append(NativeAlbumEntry(id: "local:\(d.id)", title: d.name, server: nil, device: d, origin: .local))
+      }
+      return result
     }
   }
 
   var body: some View {
     NavigationView {
-      List {
-        if !device.authorized {
-          Button("允许访问设备相册（可选）") { Task { await device.requestAccess() } }
-        }
-        if let error { Text(error).foregroundColor(.red); Button("重试") { Task { await reload() } } }
-        ForEach(entries) { entry in
-          NavigationLink(destination: NativeAlbumDetail(client: client, device: device, entry: entry)) {
-            VStack(alignment: .leading) {
-              Text(entry.title)
-              Text(entry.detail).font(.caption).foregroundColor(.secondary)
+      ScrollView {
+        VStack(alignment: .leading, spacing: 16) {
+          if !device.authorized {
+            Button("允许访问设备相册（可选）") { Task { await device.requestAccess() } }
+              .font(.footnote)
+              .padding(.horizontal)
+          }
+          if let error {
+            HStack {
+              Text(error).font(.caption).foregroundColor(.red)
+              Button("重试") { Task { await reload() } }.font(.caption)
             }
+            .padding(.horizontal)
+          }
+
+          LazyVGrid(columns: gridColumns, spacing: 16) {
+            ForEach(entries) { entry in
+              NavigationLink(destination: NativeAlbumDetail(client: client, device: device, entry: entry, mergeAlbums: mergeAlbums)) {
+                NativeAlbumCard(client: client, device: device, entry: entry, mergeAlbums: mergeAlbums)
+              }
+              .buttonStyle(.plain)
+            }
+          }
+          .padding(.horizontal, 16)
+          .padding(.top, 8)
+          .padding(.bottom, 24)
+        }
+      }
+      .navigationTitle("")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Button {
+            Task {
+              await reload()
+              device.refresh()
+            }
+          } label: {
+            Image(systemName: "arrow.clockwise")
           }
         }
       }
-      .navigationTitle("相册")
       .refreshable { await reload(); device.refresh() }
       .task { if !loaded { loaded = true; await reload() } }
-    }.navigationViewStyle(.stack)
+    }
+    .navigationViewStyle(.stack)
   }
 
   private func reload() async {
@@ -812,30 +963,67 @@ private struct NativeAlbumDetail: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
   let entry: NativeAlbumEntry
+  let mergeAlbums: Bool
   @StateObject private var model: NativeResultsModel
-  init(client: NativeImmichClient, device: NativeDeviceLibrary, entry: NativeAlbumEntry) {
-    self.client = client; self.device = device; self.entry = entry
+
+  init(client: NativeImmichClient, device: NativeDeviceLibrary, entry: NativeAlbumEntry, mergeAlbums: Bool) {
+    self.client = client
+    self.device = device
+    self.entry = entry
+    self.mergeAlbums = mergeAlbums
     _model = StateObject(wrappedValue: NativeResultsModel(client))
   }
+
+  private var localAssetsToDisplay: [NativeDeviceAsset] {
+    if mergeAlbums {
+      return entry.device.map { device.assets(in: $0) } ?? []
+    } else {
+      return entry.origin == .local ? (entry.device.map { device.assets(in: $0) } ?? []) : []
+    }
+  }
+
+  private var serverAssetsToDisplay: [NativeAsset] {
+    if mergeAlbums {
+      return model.assets
+    } else {
+      return entry.origin == .server ? model.assets : []
+    }
+  }
+
   var body: some View {
     VStack(spacing: 0) {
-      if let error = model.error { Text(error).foregroundColor(.red); Button("重试") { Task { await model.load(albumId: entry.server?.id, reset: model.assets.isEmpty) } } }
-      Text("本机成员不会自动上传或分享").font(.footnote).foregroundColor(.secondary)
-      NativeResultGrid(client: client, assets: model.assets,
-        localAssets: entry.device.map { device.assets(in: $0) } ?? [],
-        hasOlder: model.next != nil) {
-          if let id = entry.server?.id { Task { await model.load(albumId: id) } }
+      if let error = model.error {
+        HStack {
+          Text(error).font(.caption).foregroundColor(.red)
+          Button("重试") { Task { await model.load(albumId: entry.server?.id, reset: model.assets.isEmpty) } }
+            .font(.caption)
         }
-      if model.loading { ProgressView() }
+        .padding(6)
+      }
+      NativeResultGrid(
+        client: client,
+        assets: serverAssetsToDisplay,
+        localAssets: localAssetsToDisplay,
+        hasOlder: entry.server != nil && model.next != nil
+      ) {
+        if let id = entry.server?.id { Task { await model.load(albumId: id) } }
+      }
+      if model.loading { ProgressView().padding(8) }
     }
     .navigationTitle(entry.title)
-    .task { if let server = entry.server { await model.load(albumId: server.id, reset: true) } }
+    .navigationBarTitleDisplayMode(.inline)
+    .task {
+      if let server = entry.server {
+        await model.load(albumId: server.id, reset: true)
+      }
+    }
   }
 }
 
 private struct NativeLibraryView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
+  @AppStorage("immichz_merge_albums") private var mergeAlbums = true
   @State private var features: [String: Any] = [:]
   private var buildCommit: String {
     guard let value = Bundle.main.object(forInfoDictionaryKey: "ImmichZGitCommit") as? String,
@@ -853,6 +1041,9 @@ private struct NativeLibraryView: View {
   var body: some View {
     NavigationView {
       List {
+        Section("相册偏好") {
+          Toggle("合并本地和远端相册", isOn: $mergeAlbums)
+        }
         Section("快捷入口") {
           NavigationLink("收藏") { NativeFilteredView(client: client, title: "收藏", filter: ["isFavorite": ["eq": true]]) }
           NavigationLink("归档") { NativeFilteredView(client: client, title: "归档", filter: ["visibility": ["eq": "archive"]]) }
@@ -907,7 +1098,7 @@ private struct NativeLibraryView: View {
           .listRowBackground(Color.clear)
         }
       }
-      .navigationTitle("资源库")
+      .navigationTitle("设置")
       .task {
         do { features = try await client.send(path: "server/features") }
         catch { features = [:] }
@@ -1079,7 +1270,7 @@ struct NativeTabShell: View {
         .tabItem { Label("相册", systemImage: "rectangle.stack") }
         .tag(2)
       NativeLibraryView(client: client, device: device)
-        .tabItem { Label("资源库", systemImage: "square.grid.2x2") }
+        .tabItem { Label("设置", systemImage: "gearshape") }
         .tag(3)
     }
     .background(

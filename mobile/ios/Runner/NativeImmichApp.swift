@@ -731,6 +731,7 @@ struct NativePhotosView: View {
   @State private var selectedLocal: NativeDeviceAsset?
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
+  @State private var isDragSelecting = false
   @State private var isMagnifying = false
   @State private var dragInitialSelectedIDs: Set<String> = []
   @State private var dragSelectMode: Bool = true // true = selecting, false = deselecting
@@ -882,9 +883,13 @@ struct NativePhotosView: View {
                           selectedLocal = entry.local
                         }
                       }
-                      .onLongPressGesture(minimumDuration: 0.32, maximumDistance: 15) {
+                      .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
                         guard !isMagnifying else { return }
-                        enterSelection(startingWith: entry.id)
+                        if !isSelecting {
+                          enterSelection(startingWith: entry.id)
+                        } else {
+                          startDragSelectionInSelectMode(startingWith: entry.id)
+                        }
                       }
                       .id(entry.id)
                   }
@@ -896,17 +901,40 @@ struct NativePhotosView: View {
           .opacity(initialScrollVisible ? 1 : 0)
         }
         .coordinateSpace(name: "photosScrollSpace")
-        .nativeScrollDisabled(isSelecting)
+        .nativeScrollDisabled(isDragSelecting)
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
           itemBounds = frames
         }
         .simultaneousGesture(
-          DragGesture(minimumDistance: 8, coordinateSpace: .named("photosScrollSpace"))
-            .onChanged { gesture in
-              guard isSelecting else { return }
-              handle2DDragSelection(at: gesture.location)
+          LongPressGesture(minimumDuration: 0.28, maximumDistance: 15)
+            .sequenced(before: DragGesture(coordinateSpace: .named("photosScrollSpace")))
+            .onChanged { value in
+              guard !isMagnifying else { return }
+              switch value {
+              case .first:
+                break
+              case .second(true, let drag):
+                if !isDragSelecting {
+                  isDragSelecting = true
+                  let loc = drag?.startLocation ?? drag?.location
+                  if let loc = loc,
+                     let hitID = itemBounds.first(where: { $0.value.contains(loc) })?.key {
+                    if !isSelecting {
+                      enterSelection(startingWith: hitID, at: loc)
+                    } else {
+                      startDragSelectionInSelectMode(startingWith: hitID, at: loc)
+                    }
+                  }
+                }
+                if let drag = drag {
+                  handle2DDragSelection(at: drag.location)
+                }
+              default:
+                break
+              }
             }
             .onEnded { _ in
+              isDragSelecting = false
               finishDragSelection()
             }
         )
@@ -1206,6 +1234,22 @@ struct NativePhotosView: View {
     }
   }
 
+  private func startDragSelectionInSelectMode(startingWith id: String, at location: CGPoint? = nil) {
+    guard dragStartAssetID != id || dragStartLocation == nil else { return }
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    dragStartAssetID = id
+    let startLoc = location ?? itemBounds[id].map { CGPoint(x: $0.midX, y: $0.midY) }
+    dragStartLocation = startLoc
+    dragInitialSelectedIDs = selectedIDs
+    let alreadySelected = selectedIDs.contains(id)
+    dragSelectMode = !alreadySelected
+    if dragSelectMode {
+      selectedIDs.insert(id)
+    } else {
+      selectedIDs.remove(id)
+    }
+  }
+
   private func handle2DDragSelection(at location: CGPoint) {
     guard isSelecting else { return }
     if dragStartLocation == nil {
@@ -1268,6 +1312,7 @@ struct NativePhotosView: View {
 
   private func clearSelection() {
     isSelecting = false
+    isDragSelecting = false
     selectedIDs.removeAll()
     finishDragSelection()
   }

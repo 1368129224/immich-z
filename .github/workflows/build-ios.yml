@@ -108,7 +108,7 @@ jobs:
               --title "$TITLE" \
               --notes "Continuously updated build artifacts."
           }
-          gh release upload "$TAG" mobile/ImmichZ-unsigned.ipa --clobber
+          gh release upload "$TAG" ImmichZ-unsigned.ipa --clobber
 
       - name: Upload raw .app bundle
         uses: actions/upload-artifact@v4

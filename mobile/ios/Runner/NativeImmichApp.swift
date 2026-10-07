@@ -731,6 +731,7 @@ struct NativePhotosView: View {
   @State private var selectedLocal: NativeDeviceAsset?
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
+  @State private var isMagnifying = false
   @State private var dragInitialSelectedIDs: Set<String> = []
   @State private var dragSelectMode: Bool = true // true = selecting, false = deselecting
   @State private var dragStartIndex: Int? = nil
@@ -817,74 +818,74 @@ struct NativePhotosView: View {
                 let gridSpacing: CGFloat = columns > 7 ? 1 : 2
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
                   ForEach(group.assets) { entry in
-                    Button {
-                      if isSelecting {
-                        toggleSelection(entry.id)
-                      } else {
-                        selected = entry.server
-                        selectedLocal = entry.local
+                    Color.clear
+                      .aspectRatio(1, contentMode: .fit)
+                      .overlay(
+                        GeometryReader { geo in
+                          Group {
+                            if let asset = entry.server { NativeThumbnail(client: client, asset: asset, columns: columns) }
+                            else if let asset = entry.local { NativeDeviceThumbnail(asset: asset, columns: columns) }
+                          }
+                          .frame(width: geo.size.width, height: geo.size.height)
+                          .clipped()
+                          .preference(key: NativeItemFramePreferenceKey.self, value: [entry.id: geo.frame(in: .named("photosScrollSpace"))])
+                        }
+                      )
+                      .clipped()
+                      .overlay(alignment: .topLeading) {
+                        if columns <= 6 && entry.id == group.assets.first?.id {
+                          Text(formatDateBadge(for: group))
+                            .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 2)
+                            .background(.black.opacity(0.65))
+                            .cornerRadius(3)
+                            .allowsHitTesting(false)
+                        }
                       }
-                    } label: {
-                      Color.clear
-                        .aspectRatio(1, contentMode: .fit)
-                        .overlay(
-                          GeometryReader { geo in
-                            Group {
-                              if let asset = entry.server { NativeThumbnail(client: client, asset: asset, columns: columns) }
-                              else if let asset = entry.local { NativeDeviceThumbnail(asset: asset, columns: columns) }
-                            }
-                            .frame(width: geo.size.width, height: geo.size.height)
-                            .clipped()
-                            .preference(key: NativeItemFramePreferenceKey.self, value: [entry.id: geo.frame(in: .named("photosScrollSpace"))])
-                          }
-                        )
-                        .clipped()
-                        .overlay(alignment: .topLeading) {
-                          if columns <= 6 && entry.id == group.assets.first?.id {
-                            Text(formatDateBadge(for: group))
-                              .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
-                              .foregroundColor(.white)
-                              .lineLimit(1)
-                              .minimumScaleFactor(0.7)
-                              .padding(.horizontal, 4)
-                              .padding(.vertical, 2)
-                              .background(.black.opacity(0.65))
-                              .cornerRadius(3)
-                              .allowsHitTesting(false)
-                          }
+                      .overlay(alignment: .bottomLeading) {
+                        if entry.isVideo && columns <= 7 {
+                          Image(systemName: "play.fill")
+                            .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
+                            .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            .padding(columns > 4 ? 1.5 : 3)
                         }
-                        .overlay(alignment: .bottomLeading) {
-                          if entry.isVideo && columns <= 7 {
-                            Image(systemName: "play.fill")
-                              .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
-                              .foregroundColor(.white).shadow(color: .black, radius: 2)
-                              .padding(columns > 4 ? 1.5 : 3)
-                          }
+                      }
+                      .overlay(alignment: .bottomTrailing) {
+                        if columns <= 7 {
+                          Image(systemName: cloudSymbol(for: entry))
+                            .font(.system(size: columns > 4 ? 7 : 13, weight: .semibold))
+                            .foregroundColor(.white).shadow(color: .black, radius: 2)
+                            .padding(columns > 4 ? 1.5 : 3)
                         }
-                        .overlay(alignment: .bottomTrailing) {
-                          if columns <= 7 {
-                            Image(systemName: cloudSymbol(for: entry))
-                              .font(.system(size: columns > 4 ? 7 : 13, weight: .semibold))
-                              .foregroundColor(.white).shadow(color: .black, radius: 2)
-                              .padding(columns > 4 ? 1.5 : 3)
-                          }
+                      }
+                      .overlay(alignment: .topTrailing) {
+                        if selectedIDs.contains(entry.id) {
+                          Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: columns > 7 ? 12 : (columns > 4 ? 16 : 20), weight: .semibold))
+                            .foregroundStyle(.white, .blue)
+                            .padding(columns > 7 ? 1 : 4)
                         }
-                        .overlay(alignment: .topTrailing) {
-                          if selectedIDs.contains(entry.id) {
-                            Image(systemName: "checkmark.circle.fill")
-                              .font(.system(size: columns > 7 ? 12 : (columns > 4 ? 16 : 20), weight: .semibold))
-                              .foregroundStyle(.white, .blue)
-                              .padding(columns > 7 ? 1 : 4)
-                          }
+                      }
+                      .contentShape(Rectangle())
+                      .accessibilityLabel("\(entry.date.formatted()), \(cloudDescription(for: entry))")
+                      .onTapGesture {
+                        guard !isMagnifying else { return }
+                        if isSelecting {
+                          toggleSelection(entry.id)
+                        } else {
+                          selected = entry.server
+                          selectedLocal = entry.local
                         }
-                        .contentShape(Rectangle())
-                        .accessibilityLabel("\(entry.date.formatted()), \(cloudDescription(for: entry))")
-                    }
-                    .buttonStyle(.plain)
-                    .onLongPressGesture(minimumDuration: 0.45) {
-                      enterSelection(startingWith: entry.id)
-                    }
-                    .id(entry.id)
+                      }
+                      .onLongPressGesture(minimumDuration: 0.55, maximumDistance: 24) {
+                        guard !isMagnifying else { return }
+                        enterSelection(startingWith: entry.id)
+                      }
+                      .id(entry.id)
                   }
                 }
               }
@@ -911,19 +912,32 @@ struct NativePhotosView: View {
         .simultaneousGesture(
           MagnificationGesture()
             .onChanged { value in
+              guard !isSelecting else { return }
+              if !isMagnifying {
+                isMagnifying = true
+              }
               let base = gestureBaseColumns ?? columns
               if gestureBaseColumns == nil {
                 gestureBaseColumns = base
               }
-              let delta: Double
-              if value >= 1.0 {
-                delta = -(value - 1.0) * 4.0
+              let deadzone: Double = 0.12
+              var effectiveValue = value
+              if value > 1.0 {
+                if value < 1.0 + deadzone { return }
+                effectiveValue = 1.0 + (value - 1.0 - deadzone)
               } else {
-                delta = (1.0 / max(0.08, value) - 1.0) * 4.0
+                if value > 1.0 - deadzone { return }
+                effectiveValue = 1.0 - (1.0 - deadzone - value)
+              }
+              let delta: Double
+              if effectiveValue >= 1.0 {
+                delta = -(effectiveValue - 1.0) * 4.0
+              } else {
+                delta = (1.0 / max(0.08, effectiveValue) - 1.0) * 4.0
               }
               let target = min(15, max(1, Int(round(Double(base) + delta))))
               if target != columns {
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                   columns = target
                 }
@@ -931,6 +945,9 @@ struct NativePhotosView: View {
             }
             .onEnded { _ in
               gestureBaseColumns = nil
+              DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                isMagnifying = false
+              }
             }
         )
         .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
@@ -1171,7 +1188,7 @@ struct NativePhotosView: View {
   }
 
   private func enterSelection(startingWith id: String) {
-    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
     isSelecting = true
     let orderedIDs = allOrderedAssetIDs
     if let idx = orderedIDs.firstIndex(of: id) {
@@ -1218,6 +1235,7 @@ struct NativePhotosView: View {
   }
 
   private func toggleSelection(_ id: String) {
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
     if selectedIDs.contains(id) { selectedIDs.remove(id) } else { selectedIDs.insert(id) }
   }
 

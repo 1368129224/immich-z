@@ -227,15 +227,24 @@ struct NativeDeviceGrid: View {
             if gestureBaseColumns == nil {
               gestureBaseColumns = base
             }
-            let delta: Double
-            if value >= 1.0 {
-              delta = -(value - 1.0) * 4.0
+            let deadzone: Double = 0.12
+            var effectiveValue = value
+            if value > 1.0 {
+              if value < 1.0 + deadzone { return }
+              effectiveValue = 1.0 + (value - 1.0 - deadzone)
             } else {
-              delta = (1.0 / max(0.08, value) - 1.0) * 4.0
+              if value > 1.0 - deadzone { return }
+              effectiveValue = 1.0 - (1.0 - deadzone - value)
+            }
+            let delta: Double
+            if effectiveValue >= 1.0 {
+              delta = -(effectiveValue - 1.0) * 4.0
+            } else {
+              delta = (1.0 / max(0.08, effectiveValue) - 1.0) * 4.0
             }
             let target = min(15, max(1, Int(round(Double(base) + delta))))
             if target != columns {
-              UIImpactFeedbackGenerator(style: .light).impactOccurred()
+              UIImpactFeedbackGenerator(style: .medium).impactOccurred()
               withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
                 columns = target
               }
@@ -515,15 +524,24 @@ struct NativeResultGrid: View {
           if gestureBaseColumns == nil {
             gestureBaseColumns = base
           }
-          let delta: Double
-          if value >= 1.0 {
-            delta = -(value - 1.0) * 4.0
+          let deadzone: Double = 0.12
+          var effectiveValue = value
+          if value > 1.0 {
+            if value < 1.0 + deadzone { return }
+            effectiveValue = 1.0 + (value - 1.0 - deadzone)
           } else {
-            delta = (1.0 / max(0.08, value) - 1.0) * 4.0
+            if value > 1.0 - deadzone { return }
+            effectiveValue = 1.0 - (1.0 - deadzone - value)
+          }
+          let delta: Double
+          if effectiveValue >= 1.0 {
+            delta = -(effectiveValue - 1.0) * 4.0
+          } else {
+            delta = (1.0 / max(0.08, effectiveValue) - 1.0) * 4.0
           }
           let target = min(15, max(1, Int(round(Double(base) + delta))))
           if target != columns {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
               columns = target
             }

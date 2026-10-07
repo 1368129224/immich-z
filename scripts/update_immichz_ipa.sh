@@ -24,9 +24,12 @@ staging="$(mktemp -d "$ipa_dir/.download.XXXXXXXX")"
 trap 'rm -rf -- "$staging"' EXIT
 
 echo "Downloading run $run_id ($artifact)..."
-gh run download "$run_id" -R "$repo" -n "$artifact" -D "$staging"
+if ! gh run download "$run_id" -R "$repo" -n "$artifact" -D "$staging" 2>/dev/null; then
+  echo "Artifact download failed (possibly hit storage quota), falling back to release $ipa_name..."
+  gh release download latest-build -R "$repo" -p "$ipa_name" -D "$staging" --clobber
+fi
 ipa="$staging/$ipa_name"
-[[ -s "$ipa" ]] || { echo "Artifact did not contain $ipa_name" >&2; exit 1; }
+[[ -s "$ipa" ]] || { echo "Could not obtain $ipa_name from artifact or release" >&2; exit 1; }
 
 # An Actions artifact is an outer ZIP; gh extracts it. Never rename that ZIP to .ipa.
 python3 - "$ipa" <<'PY'

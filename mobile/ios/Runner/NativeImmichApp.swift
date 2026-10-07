@@ -882,29 +882,10 @@ struct NativePhotosView: View {
                           selectedLocal = entry.local
                         }
                       }
-                      .gesture(
-                        LongPressGesture(minimumDuration: 0.32)
-                          .sequenced(before: DragGesture(coordinateSpace: .named("photosScrollSpace")))
-                          .onChanged { value in
-                            guard !isMagnifying else { return }
-                            switch value {
-                            case .first:
-                              break
-                            case .second(true, let drag):
-                              if !isSelecting {
-                                enterSelection(startingWith: entry.id, at: drag?.location)
-                              }
-                              if let drag = drag {
-                                handle2DDragSelection(at: drag.location)
-                              }
-                            default:
-                              break
-                            }
-                          }
-                          .onEnded { _ in
-                            finishDragSelection()
-                          }
-                      )
+                      .onLongPressGesture(minimumDuration: 0.32, maximumDistance: 15) {
+                        guard !isMagnifying else { return }
+                        enterSelection(startingWith: entry.id)
+                      }
                       .id(entry.id)
                   }
                 }
@@ -915,6 +896,7 @@ struct NativePhotosView: View {
           .opacity(initialScrollVisible ? 1 : 0)
         }
         .coordinateSpace(name: "photosScrollSpace")
+        .scrollDisabled(isSelecting)
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
           itemBounds = frames
         }

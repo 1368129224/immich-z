@@ -737,6 +737,7 @@ struct NativePhotosView: View {
   @State private var itemBounds: [String: CGRect] = [:]
   @State private var hasInitialScrolled = false
   @State private var didInitialPosition = false
+  @State private var initialScrollVisible = false
   @State private var loadingOlderAnchor: String?
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
@@ -890,6 +891,7 @@ struct NativePhotosView: View {
             }
             Color.clear.frame(height: 1).id(bottomAnchor)
           }
+          .opacity(initialScrollVisible ? 1 : 0)
         }
         .coordinateSpace(name: "photosScrollSpace")
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
@@ -1073,20 +1075,39 @@ struct NativePhotosView: View {
   }
 
   private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
+    let isFirst = !hasInitialScrolled
     hasInitialScrolled = true
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-      if animated {
-        withAnimation(.easeInOut(duration: 0.25)) {
-          proxy.scrollTo(bottomAnchor, anchor: .bottom)
-        }
-      } else {
+    if isFirst {
+      // First scroll: position immediately without delay, then reveal
+      withAnimation(.none) {
+        proxy.scrollTo(bottomAnchor, anchor: .bottom)
+      }
+      // Reveal content after the scroll position is committed
+      DispatchQueue.main.async {
         withAnimation(.none) {
           proxy.scrollTo(bottomAnchor, anchor: .bottom)
         }
+        initialScrollVisible = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+          didInitialPosition = true
+        }
       }
-      // Allow pagination only after the initial bottom positioning is fully settled
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-        didInitialPosition = true
+    } else {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        if animated {
+          withAnimation(.easeInOut(duration: 0.25)) {
+            proxy.scrollTo(bottomAnchor, anchor: .bottom)
+          }
+        } else {
+          withAnimation(.none) {
+            proxy.scrollTo(bottomAnchor, anchor: .bottom)
+          }
+        }
+        if !self.didInitialPosition {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            self.didInitialPosition = true
+          }
+        }
       }
     }
   }

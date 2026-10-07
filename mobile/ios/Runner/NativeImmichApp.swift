@@ -896,7 +896,7 @@ struct NativePhotosView: View {
           .opacity(initialScrollVisible ? 1 : 0)
         }
         .coordinateSpace(name: "photosScrollSpace")
-        .scrollDisabled(isSelecting)
+        .nativeScrollDisabled(isSelecting)
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
           itemBounds = frames
         }
@@ -1531,4 +1531,15 @@ struct NativeAssetViewer: View {
 
 extension Notification.Name {
   static let immichScrollPhotosToBottom = Notification.Name("ImmichScrollPhotosToBottom")
+}
+
+extension View {
+  @ViewBuilder
+  func nativeScrollDisabled(_ disabled: Bool) -> some View {
+    if #available(iOS 16.0, *) {
+      self.scrollDisabled(disabled)
+    } else {
+      self
+    }
+  }
 }

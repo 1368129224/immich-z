@@ -757,6 +757,45 @@ struct NativePhotosView: View {
     cachedDayGroups.reduce(0) { $0 + $1.assets.count }
   }
 
+  private var connectionAndSyncBadge: some View {
+    HStack(spacing: 3) {
+      // 1. 服务器连接状态指示
+      if model.error != nil {
+        Image(systemName: "bolt.horizontal.circle.fill")
+          .font(.system(size: 11))
+          .foregroundColor(.red)
+      } else if model.isLoading {
+        Image(systemName: "antenna.radiowaves.left.and.right")
+          .font(.system(size: 10))
+          .foregroundColor(.blue)
+      } else {
+        Image(systemName: "checkmark.circle.fill")
+          .font(.system(size: 10))
+          .foregroundColor(.green)
+      }
+
+      // 2. 同步状态指示
+      // 目前同步功能未做：有本地照片待同步或正在校验核验
+      if cloud.isRunning {
+        Image(systemName: "arrow.triangle.2.circlepath")
+          .font(.system(size: 10))
+          .foregroundColor(.blue)
+      } else if unsyncedLocalCount > 0 {
+        Image(systemName: "icloud.slash")
+          .font(.system(size: 10))
+          .foregroundColor(.orange)
+      } else {
+        Image(systemName: "checkmark.icloud.fill")
+          .font(.system(size: 10))
+          .foregroundColor(.secondary)
+      }
+    }
+  }
+
+  private var unsyncedLocalCount: Int {
+    device.assets.filter { cloud.matchedServerIDs[$0.id] == nil }.count
+  }
+
   private var firstGroupDatesInMonth: Set<Date> {
     var seenYearMonths = Set<Int>()
     var result = Set<Date>()
@@ -1050,7 +1089,8 @@ struct NativePhotosView: View {
             if isSelecting {
               Button("取消") { clearSelection() }
             } else {
-              HStack(spacing: 6) {
+              HStack(spacing: 5) {
+                connectionAndSyncBadge
                 Text("\(totalDisplayCount) 项").font(.caption).foregroundColor(.secondary)
                 if model.isLoading {
                   ProgressView()

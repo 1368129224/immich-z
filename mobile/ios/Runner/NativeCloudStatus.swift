@@ -135,6 +135,7 @@ final class NativeCloudStatus: ObservableObject {
   @Published private(set) var checkedIDs: Set<String>
   @Published private(set) var message: String?
   @Published private(set) var failedCount = 0
+  @Published private(set) var isRunning = false
   private var checksums: [String: String]
   private var running = false
   private var generation = 0
@@ -153,6 +154,7 @@ final class NativeCloudStatus: ObservableObject {
     failedCount = 0
     message = nil
     running = false
+    isRunning = false
   }
 
   func clearCache() {
@@ -178,10 +180,12 @@ final class NativeCloudStatus: ObservableObject {
     guard !toCheck.isEmpty else { return }
 
     running = true
+    isRunning = true
     let current = generation
     defer {
       if current == generation {
         running = false
+        isRunning = false
         failedCount = failedIDs.count
       }
     }

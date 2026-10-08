@@ -1635,7 +1635,7 @@ private struct NativeLibraryView: View {
 }
 
 private struct NativeFallbackNote: View {
-  var body: some View { Text("此功能尚未迁移到 Swift。请返回照片页菜单，选择“使用完整应用”。").padding() }
+  var body: some View { Text("此功能暂未提供。").padding() }
 }
 
 struct NativeFilteredView: View {

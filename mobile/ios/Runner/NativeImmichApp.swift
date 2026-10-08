@@ -617,11 +617,6 @@ private struct NativeLoginView: View {
         }
       }
       .navigationTitle("Immich")
-      .toolbar {
-        ToolbarItem(placement: .navigationBarTrailing) {
-          Button("使用完整应用", action: onUseFlutter)
-        }
-      }
     }
     .navigationViewStyle(.stack)
   }
@@ -760,7 +755,9 @@ struct NativePhotosView: View {
   @State private var hasInitialScrolled = false
   @State private var didInitialPosition = false
   @State private var initialScrollVisible = false
-  @State private var loadingOlderAnchor: String?
+  @State private var showServerSettings = false
+  @State private var showSyncSettings = false
+  @State private var isRefreshing = false
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
 
@@ -1106,13 +1103,25 @@ struct NativePhotosView: View {
             if isSelecting {
               Button("取消") { clearSelection() }
             } else {
-              HStack(spacing: 5) {
-                connectionAndSyncBadge
-                Text("\(totalDisplayCount) 项").font(.caption).foregroundColor(.secondary)
-                if model.isLoading {
-                  ProgressView()
-                    .scaleEffect(0.7)
+              HStack(spacing: 8) {
+                Button {
+                  triggerRefresh(proxy: proxy)
+                } label: {
+                  if isRefreshing || model.isLoading {
+                    ProgressView()
+                      .scaleEffect(0.7)
+                      .frame(width: 16, height: 16)
+                  } else {
+                    Image(systemName: "arrow.clockwise")
+                      .font(.system(size: 14, weight: .medium))
+                      .foregroundColor(.secondary)
+                  }
                 }
+                .buttonStyle(.plain)
+
+                Text("\(totalDisplayCount) 项")
+                  .font(.caption)
+                  .foregroundColor(.secondary)
               }
             }
           }
@@ -1127,34 +1136,55 @@ struct NativePhotosView: View {
                 selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
               }
             } else {
-              Menu {
-                Button(action: {
-                  scrollToBottom(proxy: proxy, animated: true)
-                }) {
-                  Label("回到最新", systemImage: "arrow.down.to.line")
-                }
-                Button(action: {
-                  Task {
-                    await model.loadInitial()
-                    rebuildDayGroups()
-                    await cloud.check(device.assets, client: client)
-                    scrollToBottom(proxy: proxy, animated: false)
+              HStack(spacing: 14) {
+                // 服务器状态与设置按钮
+                Button {
+                  showServerSettings = true
+                } label: {
+                  if model.error != nil {
+                    Image(systemName: "bolt.slash")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary.opacity(0.6))
+                  } else if model.isLoading {
+                    Image(systemName: "antenna.radiowaves.left.and.right")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary)
+                  } else {
+                    Image(systemName: "server.rack")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary)
                   }
-                }) {
-                  Label("刷新", systemImage: "arrow.clockwise")
                 }
-                Button(action: onUseFlutter) {
-                  Label("使用完整应用", systemImage: "square.grid.2x2")
+                .buttonStyle(.plain)
+
+                // 同步状态与设置按钮
+                Button {
+                  showSyncSettings = true
+                } label: {
+                  if cloud.isRunning {
+                    Image(systemName: "arrow.triangle.2.circlepath")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary)
+                  } else if unsyncedLocalCount > 0 {
+                    Image(systemName: "arrow.up.icloud")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary.opacity(0.6))
+                  } else {
+                    Image(systemName: "checkmark.icloud")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary)
+                  }
                 }
-                Button(action: {
-                  cloud.clearCache()
-                  onLogout()
-                }) {
-                  Label("退出登录", systemImage: "rectangle.portrait.and.arrow.right")
-                }
-              } label: { Image(systemName: "ellipsis.circle") }
+                .buttonStyle(.plain)
+              }
             }
           }
+        }
+        .sheet(isPresented: $showServerSettings) {
+          NativeServerSettingsSheet(client: client, onLogout: onLogout)
+        }
+        .sheet(isPresented: $showSyncSettings) {
+          NativeSyncSettingsSheet(client: client, device: device, cloud: cloud)
         }
         .fullScreenCover(item: $activeViewerItem) { item in
           NativeUnifiedGalleryViewer(
@@ -1167,6 +1197,20 @@ struct NativePhotosView: View {
       }
     }
     .navigationViewStyle(.stack)
+  }
+
+  private func triggerRefresh(proxy: ScrollViewProxy) {
+    guard !isRefreshing else { return }
+    isRefreshing = true
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    Task {
+      await model.loadInitial()
+      rebuildDayGroups()
+      await cloud.check(device.assets, client: client)
+      await MainActor.run {
+        isRefreshing = false
+      }
+    }
   }
 
   private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
@@ -2098,6 +2142,135 @@ private struct InfoRow: View {
         .font(.subheadline)
         .foregroundColor(.primary)
         .multilineTextAlignment(.trailing)
+    }
+  }
+}
+
+// MARK: - Server and Sync Settings Sheets
+
+struct NativeServerSettingsSheet: View {
+  let client: NativeImmichClient
+  let onLogout: () -> Void
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    NavigationView {
+      Form {
+        Section(header: Text("服务器配置")) {
+          HStack {
+            Text("服务器地址")
+            Spacer()
+            Text(client.config.serverUrl)
+              .foregroundColor(.secondary)
+              .lineLimit(1)
+              .truncationMode(.middle)
+          }
+          if let deviceId = client.config.deviceId {
+            HStack {
+              Text("设备标识")
+              Spacer()
+              Text(deviceId)
+                .foregroundColor(.secondary)
+            }
+          }
+          HStack {
+            Text("认证方式")
+            Spacer()
+            Text(client.config.apiKey != nil ? "API Key" : "账号凭据")
+              .foregroundColor(.secondary)
+          }
+        }
+
+        Section(header: Text("账号操作")) {
+          Button(role: .destructive) {
+            dismiss()
+            onLogout()
+          } label: {
+            HStack {
+              Spacer()
+              Text("退出当前账号")
+              Spacer()
+            }
+          }
+        }
+      }
+      .navigationTitle("服务器设置")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Button("完成") { dismiss() }
+        }
+      }
+    }
+  }
+}
+
+struct NativeSyncSettingsSheet: View {
+  let client: NativeImmichClient
+  @ObservedObject var device: NativeDeviceLibrary
+  @ObservedObject var cloud: NativeCloudStatus
+  @Environment(\.dismiss) private var dismiss
+
+  private var unsyncedCount: Int {
+    device.assets.filter { cloud.matchedServerIDs[$0.id] == nil }.count
+  }
+
+  var body: some View {
+    NavigationView {
+      Form {
+        Section(header: Text("相册与同步状态")) {
+          HStack {
+            Text("设备已授权照片")
+            Spacer()
+            Text("\(device.assets.count) 项").foregroundColor(.secondary)
+          }
+          HStack {
+            Text("已匹配云端照片")
+            Spacer()
+            Text("\(cloud.matchedServerIDs.count) 项").foregroundColor(.secondary)
+          }
+          HStack {
+            Text("待同步 / 未上传照片")
+            Spacer()
+            Text("\(unsyncedCount) 项")
+              .foregroundColor(unsyncedCount > 0 ? .orange : .secondary)
+          }
+        }
+
+        Section(header: Text("核验与操作"), footer: Text("原生上传同步功能正在演进中。目前可通过重新核验比对设备相册与云端照片哈希。")) {
+          Button {
+            Task {
+              await cloud.retry(device.assets, client: client)
+            }
+          } label: {
+            HStack {
+              if cloud.isRunning {
+                ProgressView().scaleEffect(0.8)
+                Text("正在核验中…")
+              } else {
+                Text("重新核验本地照片")
+              }
+            }
+          }
+          .disabled(cloud.isRunning)
+
+          Button(role: .destructive) {
+            cloud.clearCache()
+            Task {
+              await cloud.check(device.assets, client: client)
+            }
+          } label: {
+            Text("清除匹配缓存并重新比对")
+          }
+        }
+      }
+      .navigationTitle("同步设置")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Button("完成") { dismiss() }
+        }
+      }
     }
   }
 }

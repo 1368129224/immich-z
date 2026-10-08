@@ -755,6 +755,7 @@ struct NativePhotosView: View {
   @State private var hasInitialScrolled = false
   @State private var didInitialPosition = false
   @State private var initialScrollVisible = false
+  @State private var loadingOlderAnchor: String?
   @State private var showServerSettings = false
   @State private var showSyncSettings = false
   @State private var isRefreshing = false

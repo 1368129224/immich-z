@@ -864,7 +864,7 @@ struct NativePhotosView: View {
 
   @ViewBuilder
   private var cloudSyncStatusIcon: some View {
-    if model.error != nil || cloud.error != nil {
+    if model.error != nil || cloud.failedCount > 0 {
       Image(systemName: "xmark.icloud")
         .font(.system(size: 16, weight: .medium))
         .foregroundColor(.secondary)

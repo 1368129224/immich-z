@@ -1158,16 +1158,23 @@ struct NativePhotosView: View {
                 }
                 .buttonStyle(.plain)
 
-                // 同步状态与设置按钮
+                // 同步状态与设置按钮（常驻显示）：
+                // 1. 离线/未连接服务器/未同步 -> 空心云朵内部打叉 (xmark.icloud)
+                // 2. 正在同步/核验中 -> 空心云朵内部上下箭头 (arrow.up.and.down.icloud)
+                // 3. 同步完成 -> 空心云朵内部打勾 (checkmark.icloud)
                 Button {
                   showSyncSettings = true
                 } label: {
-                  if cloud.isRunning {
-                    Image(systemName: "arrow.triangle.2.circlepath")
+                  if model.error != nil {
+                    Image(systemName: "xmark.icloud")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary)
+                  } else if cloud.isRunning {
+                    Image(systemName: "arrow.up.and.down.icloud")
                       .font(.system(size: 16, weight: .medium))
                       .foregroundColor(.secondary)
                   } else if unsyncedLocalCount > 0 {
-                    Image(systemName: "arrow.up.icloud")
+                    Image(systemName: "arrow.up.and.down.icloud")
                       .font(.system(size: 16, weight: .medium))
                       .foregroundColor(.secondary.opacity(0.6))
                   } else {
@@ -1652,6 +1659,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var showInfoSheet = false
   @State private var isFavorite = false
   @State private var isProcessingFavorite = false
+  @State private var dragOffset: CGSize = .zero
   @State private var shareItem: Any? = nil
 
   init(client: NativeImmichClient, device: NativeDeviceLibrary, items: [NativeGridItem], initialItem: NativeGridItem) {
@@ -1693,6 +1701,28 @@ struct NativeUnifiedGalleryViewer: View {
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
         .ignoresSafeArea()
+        .offset(y: max(0, dragOffset.height))
+        .scaleEffect(dragOffset.height > 0 ? max(0.8, 1.0 - (dragOffset.height / 1000.0)) : 1.0)
+        .opacity(dragOffset.height > 0 ? max(0.4, 1.0 - Double(dragOffset.height / 500.0)) : 1.0)
+        .simultaneousGesture(
+          DragGesture()
+            .onChanged { value in
+              // 仅在主要为下划（向下位移大于横向位移，且下移大于 10pt）时触发下滑关闭手势
+              if value.translation.height > 10 && abs(value.translation.height) > abs(value.translation.width) {
+                dragOffset = value.translation
+              }
+            }
+            .onEnded { value in
+              if dragOffset.height > 120 {
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                dismiss()
+              } else {
+                withAnimation(.interactiveSpring()) {
+                  dragOffset = .zero
+                }
+              }
+            }
+        )
       }
 
       // Top & Bottom Overlay Chrome
@@ -2154,9 +2184,32 @@ struct NativeServerSettingsSheet: View {
   let onLogout: () -> Void
   @Environment(\.dismiss) private var dismiss
 
+  @State private var currentUserEmail: String = "正在获取…"
+  @State private var currentUserName: String = ""
+  @State private var isTestingConnection = false
+  @State private var testResult: String? = nil
+  @State private var testSuccess: Bool? = nil
+
   var body: some View {
     NavigationView {
       Form {
+        Section(header: Text("当前登录账号")) {
+          HStack {
+            Text("账号邮箱")
+            Spacer()
+            Text(currentUserEmail)
+              .foregroundColor(.secondary)
+          }
+          if !currentUserName.isEmpty {
+            HStack {
+              Text("用户昵称")
+              Spacer()
+              Text(currentUserName)
+                .foregroundColor(.secondary)
+            }
+          }
+        }
+
         Section(header: Text("服务器配置")) {
           HStack {
             Text("服务器地址")
@@ -2182,6 +2235,22 @@ struct NativeServerSettingsSheet: View {
           }
         }
 
+        Section(header: Text("连接性测试"), footer: testResult.map { Text($0).foregroundColor(testSuccess == true ? .green : .red) }) {
+          Button {
+            testServerConnection()
+          } label: {
+            HStack {
+              if isTestingConnection {
+                ProgressView().scaleEffect(0.8)
+                Text("正在测试连接…")
+              } else {
+                Text("测试服务器连接性")
+              }
+            }
+          }
+          .disabled(isTestingConnection)
+        }
+
         Section(header: Text("账号操作")) {
           Button(role: .destructive) {
             dismiss()
@@ -2200,6 +2269,52 @@ struct NativeServerSettingsSheet: View {
       .toolbar {
         ToolbarItem(placement: .navigationBarTrailing) {
           Button("完成") { dismiss() }
+        }
+      }
+      .task {
+        await loadUserInfo()
+      }
+    }
+  }
+
+  private func loadUserInfo() async {
+    do {
+      let info = try await client.send(path: "users/me")
+      let email = info["email"] as? String ?? "已登录"
+      let name = info["name"] as? String ?? ""
+      await MainActor.run {
+        currentUserEmail = email
+        currentUserName = name
+      }
+    } catch {
+      await MainActor.run {
+        currentUserEmail = client.config.apiKey != nil ? "API Key 授权" : "无法获取用户信息"
+      }
+    }
+  }
+
+  private func testServerConnection() {
+    isTestingConnection = true
+    testResult = nil
+    testSuccess = nil
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    Task {
+      let start = Date()
+      do {
+        _ = try await client.send(path: "server/ping")
+        let latency = Int(Date().timeIntervalSince(start) * 1000)
+        await MainActor.run {
+          isTestingConnection = false
+          testSuccess = true
+          testResult = "连接正常：服务器响应成功，延迟约为 \(latency)ms"
+          UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        }
+      } catch {
+        await MainActor.run {
+          isTestingConnection = false
+          testSuccess = false
+          testResult = "连接失败：\(error.localizedDescription)"
+          UINotificationFeedbackGenerator().notificationOccurred(.error)
         }
       }
     }

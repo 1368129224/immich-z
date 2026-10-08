@@ -798,11 +798,11 @@ struct NativePhotosView: View {
 
       // 2. 同步状态指示
       if cloud.isRunning {
-        Image(systemName: "arrow.triangle.2.circlepath")
+        Image(systemName: "arrow.clockwise.icloud")
           .font(.system(size: 11, weight: .medium))
           .foregroundColor(.secondary)
       } else if unsyncedLocalCount > 0 {
-        Image(systemName: "arrow.up.icloud")
+        Image(systemName: "icloud.and.arrow.up")
           .font(.system(size: 11, weight: .medium))
           .foregroundColor(.secondary.opacity(0.6))
       } else {
@@ -1163,22 +1163,23 @@ struct NativePhotosView: View {
                 .buttonStyle(.plain)
 
                 // 同步状态与设置按钮（常驻显示）：
-                // 1. 离线/未连接服务器/未同步 -> 空心云朵内部打叉 (xmark.icloud)
-                // 2. 正在同步/核验中 -> 空心云朵内部上下箭头 (arrow.up.and.down.icloud)
-                // 3. 同步完成 -> 空心云朵内部打勾 (checkmark.icloud)
+                // 1. 错误/异常 -> 空心云朵内部打叉 (xmark.icloud)
+                // 2. 正在同步/核验中 -> 空心云朵旋转刷新 (arrow.clockwise.icloud)
+                // 3. 有未核验/未匹配本地照片 -> 空心云朵向上箭头 (icloud.and.arrow.up)
+                // 4. 同步核验完成 -> 空心云朵内部打勾 (checkmark.icloud)
                 Button {
                   showSyncSettings = true
                 } label: {
-                  if model.error != nil {
+                  if model.error != nil || cloud.error != nil {
                     Image(systemName: "xmark.icloud")
                       .font(.system(size: 16, weight: .medium))
                       .foregroundColor(.secondary)
                   } else if cloud.isRunning {
-                    Image(systemName: "arrow.up.and.down.icloud")
+                    Image(systemName: "arrow.clockwise.icloud")
                       .font(.system(size: 16, weight: .medium))
                       .foregroundColor(.secondary)
                   } else if unsyncedLocalCount > 0 {
-                    Image(systemName: "arrow.up.and.down.icloud")
+                    Image(systemName: "icloud.and.arrow.up")
                       .font(.system(size: 16, weight: .medium))
                       .foregroundColor(.secondary.opacity(0.6))
                   } else {

@@ -340,6 +340,26 @@ final class NativeImmichClient {
     }
   }
 
+  func deleteAsset(id: String) async throws {
+    let payload: [String: Any] = [
+      "ids": [id],
+      "force": false
+    ]
+    _ = try await send(path: "assets", method: "DELETE", body: payload)
+  }
+
+  func updateFavorite(id: String, isFavorite: Bool) async throws {
+    let payload: [String: Any] = [
+      "ids": [id],
+      "isFavorite": isFavorite
+    ]
+    _ = try await send(path: "assets", method: "PUT", body: payload)
+  }
+
+  func assetInfo(id: String) async throws -> [String: Any] {
+    try await send(path: "assets/\(id)", method: "GET")
+  }
+
   func originalURL(for asset: NativeAsset) -> URL? {
     let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
     return URL(string: base + "/assets/\(asset.id)/original")
@@ -727,8 +747,7 @@ struct NativePhotosView: View {
   @State private var columns: Int = 4
   @State private var gestureBaseColumns: Int? = nil
   @State private var cachedDayGroups: [NativeDayGroup] = []
-  @State private var selected: NativeAsset?
-  @State private var selectedLocal: NativeDeviceAsset?
+  @State private var activeViewerItem: NativeGridItem?
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
   @State private var isDragSelecting = false
@@ -922,8 +941,7 @@ struct NativePhotosView: View {
                         if isSelecting {
                           toggleSelection(entry.id)
                         } else {
-                          selected = entry.server
-                          selectedLocal = entry.local
+                          activeViewerItem = entry
                         }
                       }
                       .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
@@ -1139,8 +1157,14 @@ struct NativePhotosView: View {
             }
           }
         }
-        .sheet(item: $selected) { NativeAssetViewer(client: client, asset: $0) }
-        .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
+        .fullScreenCover(item: $activeViewerItem) { item in
+          NativeUnifiedGalleryViewer(
+            client: client,
+            device: device,
+            items: cachedDayGroups.flatMap(\.assets),
+            initialItem: item
+          )
+        }
       }
     }
     .navigationViewStyle(.stack)
@@ -1568,37 +1592,514 @@ struct NativeThumbnail: View {
   }
 }
 
-struct NativeAssetViewer: View {
+// MARK: - Native Unified Gallery Viewer (Full-featured Asset Viewer)
+
+import AVKit
+
+struct NativeUnifiedGalleryViewer: View {
   let client: NativeImmichClient
-  let asset: NativeAsset
+  let device: NativeDeviceLibrary
+  let items: [NativeGridItem]
+  let initialItem: NativeGridItem
+
   @Environment(\.dismiss) private var dismiss
+  @State private var currentIndex: Int = 0
+  @State private var showChrome = true
+  @State private var showInfoSheet = false
+  @State private var isFavorite = false
+  @State private var isProcessingFavorite = false
+  @State private var shareItem: Any? = nil
+
+  init(client: NativeImmichClient, device: NativeDeviceLibrary, items: [NativeGridItem], initialItem: NativeGridItem) {
+    self.client = client
+    self.device = device
+    self.items = items
+    self.initialItem = initialItem
+    let index = items.firstIndex(where: { $0.id == initialItem.id }) ?? 0
+    _currentIndex = State(initialValue: index)
+    _isFavorite = State(initialValue: initialItem.server?.isFavorite ?? false)
+  }
+
+  private var currentItem: NativeGridItem? {
+    guard items.indices.contains(currentIndex) else { return nil }
+    return items[currentIndex]
+  }
+
+  var body: some View {
+    ZStack {
+      Color.black.ignoresSafeArea()
+
+      if items.isEmpty {
+        Text("无可预览照片").foregroundColor(.white)
+      } else {
+        TabView(selection: $currentIndex) {
+          ForEach(items.indices, id: \.self) { idx in
+            NativeSingleAssetPage(
+              client: client,
+              device: device,
+              item: items[idx],
+              onTap: {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                  showChrome.toggle()
+                }
+              }
+            )
+            .tag(idx)
+          }
+        }
+        .tabViewStyle(.page(indexDisplayMode: .never))
+        .ignoresSafeArea()
+      }
+
+      // Top & Bottom Overlay Chrome
+      if showChrome {
+        VStack {
+          // Top Bar
+          HStack {
+            Button {
+              dismiss()
+            } label: {
+              Image(systemName: "chevron.left")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(10)
+                .background(Color.black.opacity(0.4))
+                .clipShape(Circle())
+            }
+
+            Spacer()
+
+            if let item = currentItem {
+              VStack(spacing: 2) {
+                Text(NativeImmichClient.formatChineseDate(item.date))
+                  .font(.subheadline.weight(.semibold))
+                  .foregroundColor(.white)
+                Text("\(currentIndex + 1) / \(items.count)")
+                  .font(.caption2)
+                  .foregroundColor(.white.opacity(0.75))
+              }
+            }
+
+            Spacer()
+
+            Button {
+              showInfoSheet = true
+            } label: {
+              Image(systemName: "info.circle")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(.white)
+                .padding(10)
+                .background(Color.black.opacity(0.4))
+                .clipShape(Circle())
+            }
+          }
+          .padding(.horizontal, 16)
+          .padding(.top, 48)
+
+          Spacer()
+
+          // Bottom Bar
+          HStack(spacing: 36) {
+            // Share
+            Button {
+              triggerShare()
+            } label: {
+              VStack(spacing: 4) {
+                Image(systemName: "square.and.arrow.up")
+                  .font(.system(size: 20))
+                Text("分享").font(.caption2)
+              }
+              .foregroundColor(.white)
+            }
+
+            // Favorite
+            Button {
+              toggleFavorite()
+            } label: {
+              VStack(spacing: 4) {
+                Image(systemName: isFavorite ? "heart.fill" : "heart")
+                  .font(.system(size: 20))
+                  .foregroundColor(isFavorite ? .red : .white)
+                Text(isFavorite ? "已收藏" : "收藏").font(.caption2)
+                  .foregroundColor(.white)
+              }
+            }
+            .disabled(isProcessingFavorite || currentItem?.server == nil)
+            .opacity(currentItem?.server != nil ? 1 : 0.4)
+
+            // Info Details
+            Button {
+              showInfoSheet = true
+            } label: {
+              VStack(spacing: 4) {
+                Image(systemName: "info.circle")
+                  .font(.system(size: 20))
+                Text("详情").font(.caption2)
+              }
+              .foregroundColor(.white)
+            }
+          }
+          .padding(.vertical, 12)
+          .padding(.horizontal, 24)
+          .background(Color.black.opacity(0.6))
+          .cornerRadius(24)
+          .padding(.bottom, 24)
+        }
+        .transition(.opacity)
+      }
+    }
+    .onChange(of: currentIndex) { newIdx in
+      if items.indices.contains(newIdx) {
+        isFavorite = items[newIdx].server?.isFavorite ?? false
+      }
+    }
+    .sheet(isPresented: $showInfoSheet) {
+      if let item = currentItem {
+        NativeAssetInfoSheet(client: client, device: device, item: item)
+      }
+    }
+    .sheet(item: Binding<NativeSharePayload?>(
+      get: { shareItem.map { NativeSharePayload(content: $0) } },
+      set: { if $0 == nil { shareItem = nil } }
+    )) { payload in
+      NativeActivityView(activityItems: [payload.content])
+    }
+  }
+
+  private func toggleFavorite() {
+    guard let item = currentItem, let server = item.server, !isProcessingFavorite else { return }
+    let newFav = !isFavorite
+    isProcessingFavorite = true
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    Task {
+      do {
+        try await client.updateFavorite(id: server.id, isFavorite: newFav)
+        await MainActor.run {
+          isFavorite = newFav
+          isProcessingFavorite = false
+        }
+      } catch {
+        await MainActor.run {
+          isProcessingFavorite = false
+        }
+      }
+    }
+  }
+
+  private func triggerShare() {
+    guard let item = currentItem else { return }
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    if let local = item.local {
+      guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return }
+      let options = PHImageRequestOptions()
+      options.isNetworkAccessAllowed = true
+      options.deliveryMode = .highQualityFormat
+      PHImageManager.default().requestImage(for: source, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: options) { img, _ in
+        if let img {
+          DispatchQueue.main.async { shareItem = img }
+        }
+      }
+    } else if let server = item.server {
+      Task {
+        if let url = client.originalURL(for: server),
+           let data = try? await client.imageData(for: url),
+           let img = UIImage(data: data) {
+          await MainActor.run { shareItem = img }
+        }
+      }
+    }
+  }
+}
+
+private struct NativeSharePayload: Identifiable {
+  let id = UUID()
+  let content: Any
+}
+
+private struct NativeActivityView: UIViewControllerRepresentable {
+  let activityItems: [Any]
+
+  func makeUIViewController(context: Context) -> UIActivityViewController {
+    UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+  }
+
+  func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+private struct NativeSingleAssetPage: View {
+  let client: NativeImmichClient
+  let device: NativeDeviceLibrary
+  let item: NativeGridItem
+  let onTap: () -> Void
+
   @State private var image: UIImage?
+  @State private var isLoading = true
+  @State private var player: AVPlayer?
+
+  var body: some View {
+    GeometryReader { proxy in
+      ZStack {
+        Color.black.ignoresSafeArea()
+
+        if item.isVideo {
+          if let player {
+            VideoPlayer(player: player)
+              .frame(width: proxy.size.width, height: proxy.size.height)
+              .ignoresSafeArea()
+              .onAppear {
+                player.play()
+              }
+              .onDisappear {
+                player.pause()
+              }
+          } else {
+            VStack(spacing: 12) {
+              ProgressView().tint(.white)
+              Text("正在加载视频…").font(.caption).foregroundColor(.white.opacity(0.8))
+            }
+          }
+        } else {
+          if let image {
+            NativeZoomableImageView(image: image, size: proxy.size, onTap: onTap)
+          } else {
+            VStack {
+              if isLoading {
+                ProgressView().tint(.white)
+              } else {
+                Image(systemName: "photo")
+                  .font(.system(size: 48))
+                  .foregroundColor(.white.opacity(0.4))
+                Text("无法加载原图").font(.caption).foregroundColor(.white.opacity(0.6))
+              }
+            }
+          }
+        }
+      }
+      .contentShape(Rectangle())
+      .onTapGesture {
+        onTap()
+      }
+    }
+    .task {
+      await loadAssetContent()
+    }
+    .onDisappear {
+      player?.pause()
+      player = nil
+    }
+  }
+
+  private func loadAssetContent() async {
+    isLoading = true
+    defer { isLoading = false }
+
+    if item.isVideo {
+      if let local = item.local {
+        guard let phAsset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return }
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        PHImageManager.default().requestPlayerItem(forVideo: phAsset, options: options) { playerItem, _ in
+          if let playerItem {
+            DispatchQueue.main.async {
+              player = AVPlayer(playerItem: playerItem)
+            }
+          }
+        }
+      } else if let server = item.server {
+        let base = client.config.apiEndpoint ?? (NativeImmichClient.normalize(client.config.serverUrl) + "/api")
+        if let videoURL = URL(string: base + "/assets/\(server.id)/video/playback") {
+          var req = URLRequest(url: videoURL)
+          if let token = client.config.accessToken {
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+          }
+          if let key = client.config.apiKey {
+            req.setValue(key, forHTTPHeaderField: "x-api-key")
+          }
+          let asset = AVURLAsset(url: videoURL, options: ["AVURLAssetHTTPHeaderFieldsKey": req.allHTTPHeaderFields ?? [:]])
+          let item = AVPlayerItem(asset: asset)
+          await MainActor.run {
+            player = AVPlayer(playerItem: item)
+          }
+        }
+      }
+      return
+    }
+
+    // Load Image
+    if let local = item.local {
+      guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return }
+      let options = PHImageRequestOptions()
+      options.isNetworkAccessAllowed = true
+      options.deliveryMode = .highQualityFormat
+      PHImageManager.default().requestImage(for: source, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: options) { result, _ in
+        if let result {
+          DispatchQueue.main.async { image = result }
+        }
+      }
+    } else if let server = item.server {
+      if let url = client.originalURL(for: server) {
+        do {
+          let data = try await client.imageData(for: url)
+          if let decoded = UIImage(data: data) {
+            await MainActor.run { image = decoded }
+          }
+        } catch {
+          if let previewURL = client.thumbnailURL(for: server, size: "preview"),
+             let data = try? await client.thumbnailData(for: previewURL),
+             let decoded = UIImage(data: data) {
+            await MainActor.run { image = decoded }
+          }
+        }
+      }
+    }
+  }
+}
+
+// Pinch to zoom and double tap zoomable container
+private struct NativeZoomableImageView: UIViewRepresentable {
+  let image: UIImage
+  let size: CGSize
+  let onTap: () -> Void
+
+  func makeUIView(context: Context) -> UIScrollView {
+    let scrollView = UIScrollView()
+    scrollView.delegate = context.coordinator
+    scrollView.maximumZoomScale = 5.0
+    scrollView.minimumZoomScale = 1.0
+    scrollView.showsVerticalScrollIndicator = false
+    scrollView.showsHorizontalScrollIndicator = false
+    scrollView.backgroundColor = .clear
+
+    let imageView = UIImageView(image: image)
+    imageView.contentMode = .scaleAspectFit
+    imageView.tag = 100
+    scrollView.addSubview(imageView)
+
+    let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
+    tapGesture.numberOfTapsRequired = 1
+    scrollView.addGestureRecognizer(tapGesture)
+
+    let doubleTapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
+    doubleTapGesture.numberOfTapsRequired = 2
+    scrollView.addGestureRecognizer(doubleTapGesture)
+    tapGesture.require(toFail: doubleTapGesture)
+
+    return scrollView
+  }
+
+  func updateUIView(_ uiView: UIScrollView, context: Context) {
+    if let imageView = uiView.viewWithTag(100) as? UIImageView {
+      imageView.image = image
+      imageView.frame = CGRect(origin: .zero, size: size)
+      uiView.contentSize = size
+    }
+  }
+
+  func makeCoordinator() -> Coordinator {
+    Coordinator(onTap: onTap)
+  }
+
+  class Coordinator: NSObject, UIScrollViewDelegate {
+    let onTap: () -> Void
+
+    init(onTap: @escaping () -> Void) {
+      self.onTap = onTap
+    }
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+      scrollView.viewWithTag(100)
+    }
+
+    @objc func handleTap() {
+      onTap()
+    }
+
+    @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+      guard let scrollView = gesture.view as? UIScrollView else { return }
+      if scrollView.zoomScale > 1.0 {
+        scrollView.setZoomScale(1.0, animated: true)
+      } else {
+        let point = gesture.location(in: scrollView)
+        let rect = CGRect(x: point.x - 40, y: point.y - 40, width: 80, height: 80)
+        scrollView.zoom(to: rect, animated: true)
+      }
+    }
+  }
+}
+
+// Info & EXIF Sheet
+private struct NativeAssetInfoSheet: View {
+  let client: NativeImmichClient
+  let device: NativeDeviceLibrary
+  let item: NativeGridItem
+
+  @State private var remoteInfo: [String: Any]?
+  @State private var loadingInfo = false
+  @Environment(\.dismiss) private var dismiss
 
   var body: some View {
     NavigationView {
-      ZStack {
-        Color.black.ignoresSafeArea()
-        if !asset.isImage {
-          Text("视频播放尚未迁移；请从“使用完整应用”打开视频。")
-            .foregroundColor(.white).multilineTextAlignment(.center).padding()
-        } else if let image { Image(uiImage: image).resizable().scaledToFit() }
-        else { ProgressView().tint(.white) }
+      List {
+        Section("基本信息") {
+          InfoRow(label: "日期", value: NativeImmichClient.formatChineseDate(item.date))
+          InfoRow(label: "类型", value: item.isVideo ? "视频" : "照片")
+          InfoRow(label: "状态", value: item.server != nil ? (item.local != nil ? "已同步 (云端+本地)" : "仅云端") : "仅本地 (未上传)")
+          if let server = item.server {
+            InfoRow(label: "服务器 ID", value: server.id)
+          }
+          if let local = item.local {
+            InfoRow(label: "本地标识", value: local.id)
+          }
+        }
+
+        if let info = remoteInfo {
+          if let exif = info["exifInfo"] as? [String: Any] {
+            Section("拍摄与硬件参数") {
+              if let make = exif["make"] as? String { InfoRow(label: "设备品牌", value: make) }
+              if let model = exif["model"] as? String { InfoRow(label: "设备型号", value: model) }
+              if let lens = exif["lensModel"] as? String { InfoRow(label: "镜头", value: lens) }
+              if let fNumber = exif["fNumber"] { InfoRow(label: "光圈", value: "f/\(fNumber)") }
+              if let focal = exif["focalLength"] { InfoRow(label: "焦距", value: "\(focal)mm") }
+              if let iso = exif["iso"] { InfoRow(label: "ISO", value: "\(iso)") }
+              if let exp = exif["exposureTime"] { InfoRow(label: "曝光时间", value: "\(exp)s") }
+            }
+          }
+        }
       }
+      .navigationTitle("详细信息")
       .navigationBarTitleDisplayMode(.inline)
       .toolbar {
-        ToolbarItem(placement: .navigationBarLeading) {
-          Button("关闭") { dismiss() }.foregroundColor(.white)
-        }
-        ToolbarItem(placement: .principal) {
-          Text(NativeImmichClient.formatChineseDate(asset.date)).foregroundColor(.white)
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Button("完成") { dismiss() }
         }
       }
       .task {
-        guard asset.isImage, let url = client.originalURL(for: asset) else { return }
-        if let data = try? await client.imageData(for: url) { image = UIImage(data: data) }
+        if let server = item.server {
+          loadingInfo = true
+          remoteInfo = try? await client.assetInfo(id: server.id)
+          loadingInfo = false
+        }
       }
     }
-    .navigationViewStyle(.stack)
+  }
+}
+
+private struct InfoRow: View {
+  let label: String
+  let value: String
+
+  var body: some View {
+    HStack(alignment: .top) {
+      Text(label)
+        .font(.subheadline)
+        .foregroundColor(.secondary)
+        .frame(width: 90, alignment: .leading)
+      Spacer()
+      Text(value)
+        .font(.subheadline)
+        .foregroundColor(.primary)
+        .multilineTextAlignment(.trailing)
+    }
   }
 }
 

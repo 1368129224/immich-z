@@ -463,8 +463,7 @@ struct NativeResultGrid: View {
   @State private var dragStartAssetID: String? = nil
   @State private var itemBounds: [String: CGRect] = [:]
 
-  @State private var selected: NativeAsset?
-  @State private var selectedLocal: NativeDeviceAsset?
+  @State private var activeViewerItem: NativeGridItem?
 
   private var isSelecting: Bool {
     isSelectingBinding?.wrappedValue ?? internalIsSelecting
@@ -600,8 +599,7 @@ struct NativeResultGrid: View {
                   if isSelecting {
                     toggleSelection(entry.id)
                   } else {
-                    selected = entry.server
-                    selectedLocal = entry.local
+                    activeViewerItem = entry
                   }
                 }
                 .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
@@ -702,8 +700,14 @@ struct NativeResultGrid: View {
           }
         }
     )
-    .sheet(item: $selected) { NativeAssetViewer(client: client, asset: $0) }
-    .sheet(item: $selectedLocal) { NativeDeviceViewer(asset: $0) }
+    .fullScreenCover(item: $activeViewerItem) { item in
+      NativeUnifiedGalleryViewer(
+        client: client,
+        device: NativeDeviceLibrary(),
+        items: merged,
+        initialItem: item
+      )
+    }
   }
 
   private func enterSelection(startingWith id: String, at location: CGPoint? = nil) {

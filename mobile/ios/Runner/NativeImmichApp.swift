@@ -2,6 +2,7 @@ import Combine
 import CryptoKit
 import Foundation
 import Photos
+import PhotosUI
 import Security
 import SwiftUI
 import UIKit
@@ -326,6 +327,7 @@ final class NativeImmichClient {
     let images = strings("isImage")
     let favorites = strings("isFavorite")
     let hashes = strings("thumbhash")
+    let livePhotoIDs = strings("livePhotoVideoId")
     return ids.enumerated().compactMap { index, rawID in
       guard let id = rawID as? String else { return nil }
       let dateString = (dates[safe: index] as? String) ?? (created[safe: index] as? String) ?? bucket.id
@@ -335,7 +337,8 @@ final class NativeImmichClient {
         date: date,
         isImage: images[safe: index] as? Bool ?? true,
         isFavorite: favorites[safe: index] as? Bool ?? false,
-        thumbhash: hashes[safe: index] as? String
+        thumbhash: hashes[safe: index] as? String,
+        livePhotoVideoId: livePhotoIDs[safe: index] as? String
       )
     }
   }
@@ -486,6 +489,7 @@ struct NativeAsset: Identifiable {
   let isImage: Bool
   let isFavorite: Bool
   let thumbhash: String?
+  var livePhotoVideoId: String? = nil
 }
 
 // MARK: - SwiftUI app and login
@@ -753,6 +757,7 @@ struct NativePhotosView: View {
   @State private var dragStartAssetID: String? = nil
   @State private var itemBounds: [String: CGRect] = [:]
   @State private var hasInitialScrolled = false
+  @State private var initialRemoteLoaded = false
   @State private var didInitialPosition = false
   @State private var initialScrollVisible = false
   @State private var loadingOlderAnchor: String?
@@ -1043,42 +1048,40 @@ struct NativePhotosView: View {
           await model.loadInitial()
           rebuildDayGroups()
           Task { await cloud.check(device.assets, client: client) }
-          scrollToBottom(proxy: proxy, animated: false)
+          positionInitiallyIfReady(proxy: proxy)
         }
         .onChange(of: device.assets.count) { _ in
           rebuildDayGroups()
           Task { await cloud.check(device.assets, client: client) }
-          if !hasInitialScrolled && !cachedDayGroups.isEmpty {
-            scrollToBottom(proxy: proxy, animated: false)
-          }
+          positionInitiallyIfReady(proxy: proxy)
         }
         .onAppear {
           rebuildDayGroups()
           if model.assets.isEmpty && !model.isLoading {
             Task {
               await model.loadInitial()
+              initialRemoteLoaded = true
               rebuildDayGroups()
+              positionInitiallyIfReady(proxy: proxy)
               await cloud.check(device.assets, client: client)
-              scrollToBottom(proxy: proxy, animated: false)
             }
           } else {
+            initialRemoteLoaded = true
             Task { await cloud.check(device.assets, client: client) }
-            if !cachedDayGroups.isEmpty && !hasInitialScrolled {
-              scrollToBottom(proxy: proxy, animated: false)
-            }
+            positionInitiallyIfReady(proxy: proxy)
           }
         }
         .onChange(of: model.assets.count) { _ in
           rebuildDayGroups()
-          if !hasInitialScrolled && !cachedDayGroups.isEmpty {
-            scrollToBottom(proxy: proxy, animated: false)
-          }
+          positionInitiallyIfReady(proxy: proxy)
         }
+        .onChange(of: model.isLoading) { _ in positionInitiallyIfReady(proxy: proxy) }
+        .onChange(of: device.isLoading) { _ in positionInitiallyIfReady(proxy: proxy) }
         .onReceive(NotificationCenter.default.publisher(for: .immichScrollPhotosToBottom)) { _ in
           let now = Date()
           guard now.timeIntervalSince(lastScrollToBottomTime) > 0.25 else { return }
           lastScrollToBottomTime = now
-          scrollToBottom(proxy: proxy, animated: true)
+          if hasInitialScrolled { scrollToBottom(proxy: proxy, animated: true) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
           if !device.authorized {
@@ -1137,7 +1140,7 @@ struct NativePhotosView: View {
                 selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
               }
             } else {
-              HStack(spacing: 14) {
+              HStack(spacing: 2) {
                 // 服务器状态与设置按钮
                 Button {
                   showServerSettings = true
@@ -1156,6 +1159,7 @@ struct NativePhotosView: View {
                       .foregroundColor(.secondary)
                   }
                 }
+                .frame(width: 36, height: 40)
                 .buttonStyle(.plain)
 
                 // 同步状态与设置按钮（常驻显示）：
@@ -1183,8 +1187,10 @@ struct NativePhotosView: View {
                       .foregroundColor(.secondary)
                   }
                 }
+                .frame(width: 36, height: 40)
                 .buttonStyle(.plain)
               }
+              .fixedSize(horizontal: true, vertical: false)
             }
           }
         }
@@ -1221,22 +1227,27 @@ struct NativePhotosView: View {
     }
   }
 
+  private func positionInitiallyIfReady(proxy: ScrollViewProxy) {
+    guard !hasInitialScrolled, initialRemoteLoaded, !model.isLoading, !device.isLoading else { return }
+    // Do not commit the initial position while the remote/local timelines are
+    // still arriving: a subsequent layout pass would move the bottom anchor.
+    scrollToBottom(proxy: proxy, animated: false)
+  }
+
   private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-    let isFirst = !hasInitialScrolled
-    hasInitialScrolled = true
-    if isFirst {
-      // First scroll: position immediately without delay, then reveal
-      withAnimation(.none) {
-        proxy.scrollTo(bottomAnchor, anchor: .bottom)
-      }
-      // Reveal content after the scroll position is committed
-      DispatchQueue.main.async {
-        withAnimation(.none) {
-          proxy.scrollTo(bottomAnchor, anchor: .bottom)
-        }
-        initialScrollVisible = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-          didInitialPosition = true
+    if !hasInitialScrolled {
+      guard initialRemoteLoaded, !model.isLoading, !device.isLoading else { return }
+      hasInitialScrolled = true
+      // Lazy grids need a layout pass after the final data update before the
+      // bottom anchor has its final position. Keep content hidden until then.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+        withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+          withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+          initialScrollVisible = true
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            didInitialPosition = true
+          }
         }
       }
     } else {
@@ -1246,14 +1257,7 @@ struct NativePhotosView: View {
             proxy.scrollTo(bottomAnchor, anchor: .bottom)
           }
         } else {
-          withAnimation(.none) {
-            proxy.scrollTo(bottomAnchor, anchor: .bottom)
-          }
-        }
-        if !self.didInitialPosition {
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.didInitialPosition = true
-          }
+          withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
         }
       }
     }
@@ -1745,6 +1749,11 @@ struct NativeUnifiedGalleryViewer: View {
 
             if let item = currentItem {
               VStack(spacing: 2) {
+                if item.local?.isLivePhoto == true || item.server?.livePhotoVideoId != nil {
+                  Label("实况 · 长按播放", systemImage: "livephoto")
+                    .font(.caption2)
+                    .foregroundColor(.white.opacity(0.8))
+                }
                 Text(NativeImmichClient.formatChineseDate(item.date))
                   .font(.subheadline.weight(.semibold))
                   .foregroundColor(.white)
@@ -1909,6 +1918,13 @@ private struct NativeSingleAssetPage: View {
   @State private var image: UIImage?
   @State private var isLoading = true
   @State private var player: AVPlayer?
+  @State private var livePhoto: PHLivePhoto?
+  @State private var livePlayer: AVPlayer?
+  @State private var isLivePlaying = false
+
+  private var isLive: Bool {
+    item.local?.isLivePhoto == true || item.server?.livePhotoVideoId != nil
+  }
 
   var body: some View {
     GeometryReader { proxy in
@@ -1933,7 +1949,14 @@ private struct NativeSingleAssetPage: View {
             }
           }
         } else {
-          if let image {
+          if isLivePlaying, let livePlayer, livePhoto == nil {
+            VideoPlayer(player: livePlayer)
+              .frame(width: proxy.size.width, height: proxy.size.height)
+              .allowsHitTesting(false)
+          } else if let livePhoto {
+            NativeLivePhotoView(livePhoto: livePhoto, isPlaying: isLivePlaying)
+              .frame(width: proxy.size.width, height: proxy.size.height)
+          } else if let image {
             NativeZoomableImageView(image: image, size: proxy.size, onTap: onTap)
           } else {
             VStack {
@@ -1953,6 +1976,11 @@ private struct NativeSingleAssetPage: View {
       .onTapGesture {
         onTap()
       }
+      .onLongPressGesture(minimumDuration: 0.35, maximumDistance: 15, pressing: { pressing in
+        if !pressing { stopLivePlayback() }
+      }, perform: {
+        startLivePlayback()
+      })
     }
     .task {
       await loadAssetContent()
@@ -1960,7 +1988,21 @@ private struct NativeSingleAssetPage: View {
     .onDisappear {
       player?.pause()
       player = nil
+      stopLivePlayback()
+      livePlayer = nil
     }
+  }
+
+  private func startLivePlayback() {
+    guard isLive, !item.isVideo, livePhoto != nil || livePlayer != nil else { return }
+    isLivePlaying = true
+    livePlayer?.seek(to: .zero)
+    livePlayer?.play()
+  }
+
+  private func stopLivePlayback() {
+    isLivePlaying = false
+    livePlayer?.pause()
   }
 
   private func loadAssetContent() async {
@@ -2010,7 +2052,29 @@ private struct NativeSingleAssetPage: View {
           DispatchQueue.main.async { image = result }
         }
       }
+      if local.isLivePhoto {
+        let liveOptions = PHLivePhotoRequestOptions()
+        liveOptions.isNetworkAccessAllowed = true
+        PHImageManager.default().requestLivePhoto(for: source, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: liveOptions) { result, info in
+          guard info?[PHImageResultIsDegradedKey] as? Bool != true else { return }
+          DispatchQueue.main.async { livePhoto = result }
+        }
+      }
     } else if let server = item.server {
+      if let videoID = server.livePhotoVideoId {
+        let base = client.config.apiEndpoint ?? (NativeImmichClient.normalize(client.config.serverUrl) + "/api")
+        if let url = URL(string: base + "/assets/\(videoID)/video/playback") {
+          var request = URLRequest(url: url)
+          if let token = client.config.accessToken {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+          }
+          if let key = client.config.apiKey {
+            request.setValue(key, forHTTPHeaderField: "x-api-key")
+          }
+          let videoAsset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": request.allHTTPHeaderFields ?? [:]])
+          livePlayer = AVPlayer(playerItem: AVPlayerItem(asset: videoAsset))
+        }
+      }
       if let url = client.originalURL(for: server) {
         do {
           let data = try await client.imageData(for: url)
@@ -2026,6 +2090,35 @@ private struct NativeSingleAssetPage: View {
         }
       }
     }
+  }
+}
+
+// PhotoKit owns the local Live Photo playback (including its paired motion/audio).
+private struct NativeLivePhotoView: UIViewRepresentable {
+  let livePhoto: PHLivePhoto
+  let isPlaying: Bool
+
+  func makeUIView(context: Context) -> PHLivePhotoView {
+    let view = PHLivePhotoView()
+    view.contentMode = .scaleAspectFit
+    view.isMuted = false
+    return view
+  }
+
+  func updateUIView(_ view: PHLivePhotoView, context: Context) {
+    if view.livePhoto !== livePhoto { view.livePhoto = livePhoto }
+    if isPlaying && !context.coordinator.wasPlaying {
+      view.startPlayback(with: .full)
+    } else if !isPlaying && context.coordinator.wasPlaying {
+      view.stopPlayback()
+    }
+    context.coordinator.wasPlaying = isPlaying
+  }
+
+  func makeCoordinator() -> Coordinator { Coordinator() }
+
+  class Coordinator {
+    var wasPlaying = false
   }
 }
 

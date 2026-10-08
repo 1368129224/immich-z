@@ -201,7 +201,7 @@ private struct NativeFolderAssets: View {
         assets = rows.compactMap { row in
           guard let id = row["id"] as? String else { return nil }
           let text = row["fileCreatedAt"] as? String ?? ""
-          return NativeAsset(id: id, date: ISO8601DateFormatter().date(from: text) ?? .distantPast, isImage: row["type"] as? String != "VIDEO", isFavorite: row["isFavorite"] as? Bool ?? false, thumbhash: row["thumbhash"] as? String)
+          return NativeAsset(id: id, date: ISO8601DateFormatter().date(from: text) ?? .distantPast, isImage: row["type"] as? String != "VIDEO", isFavorite: row["isFavorite"] as? Bool ?? false, thumbhash: row["thumbhash"] as? String, livePhotoVideoId: row["livePhotoVideoId"] as? String)
         }
         error = nil
       } catch { self.error = error.localizedDescription }

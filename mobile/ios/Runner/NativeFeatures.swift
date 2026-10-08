@@ -45,6 +45,7 @@ final class NativeDeviceLibrary: ObservableObject {
             id: item.localIdentifier,
             date: item.creationDate ?? .distantPast,
             isVideo: item.mediaType == .video,
+            isLivePhoto: item.mediaSubtypes.contains(.photoLive),
             contentVersion: Int((item.modificationDate?.timeIntervalSince1970 ?? 0) * 1000)
           ))
         }
@@ -82,6 +83,7 @@ final class NativeDeviceLibrary: ObservableObject {
       id: first.localIdentifier,
       date: first.creationDate ?? .distantPast,
       isVideo: first.mediaType == .video,
+      isLivePhoto: first.mediaSubtypes.contains(.photoLive),
       contentVersion: Int((first.modificationDate?.timeIntervalSince1970 ?? 0) * 1000)
     )
   }
@@ -91,6 +93,7 @@ struct NativeDeviceAsset: Identifiable, Sendable {
   let id: String
   let date: Date
   let isVideo: Bool
+  var isLivePhoto: Bool = false
   let contentVersion: Int
 }
 
@@ -373,7 +376,7 @@ extension NativeImmichClient {
     let formatter = ISO8601DateFormatter()
     formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     let date = formatter.date(from: dateText) ?? ISO8601DateFormatter().date(from: dateText) ?? .distantPast
-    return NativeAsset(id: id, date: date, isImage: (item["type"] as? String) != "VIDEO", isFavorite: item["isFavorite"] as? Bool ?? false, thumbhash: item["thumbhash"] as? String)
+    return NativeAsset(id: id, date: date, isImage: (item["type"] as? String) != "VIDEO", isFavorite: item["isFavorite"] as? Bool ?? false, thumbhash: item["thumbhash"] as? String, livePhotoVideoId: item["livePhotoVideoId"] as? String)
   }
 
   func serverAlbums() async throws -> [NativeServerAlbum] {

@@ -817,6 +817,72 @@ struct NativePhotosView: View {
     device.assets.filter { cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
+  @ViewBuilder
+  private var trailingToolbarContent: some View {
+    if isSelecting {
+      Button("全选") {
+        selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
+      }
+    } else {
+      HStack(spacing: 2) {
+        Button {
+          showServerSettings = true
+        } label: {
+          serverStatusIcon
+        }
+        .frame(width: 36, height: 40)
+        .buttonStyle(.plain)
+
+        Button {
+          showSyncSettings = true
+        } label: {
+          cloudSyncStatusIcon
+        }
+        .frame(width: 36, height: 40)
+        .buttonStyle(.plain)
+      }
+      .fixedSize(horizontal: true, vertical: false)
+    }
+  }
+
+  @ViewBuilder
+  private var serverStatusIcon: some View {
+    if model.error != nil {
+      Image(systemName: "bolt.slash")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary.opacity(0.6))
+    } else if model.isLoading {
+      Image(systemName: "antenna.radiowaves.left.and.right")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary)
+    } else {
+      Image(systemName: "server.rack")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary)
+    }
+  }
+
+  @ViewBuilder
+  private var cloudSyncStatusIcon: some View {
+    if model.error != nil || cloud.error != nil {
+      Image(systemName: "xmark.icloud")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary)
+    } else if cloud.isRunning {
+      Image(systemName: "arrow.clockwise.icloud")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary)
+    } else if unsyncedLocalCount > 0 {
+      Image(systemName: "icloud.and.arrow.up")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary.opacity(0.6))
+    } else {
+      Image(systemName: "checkmark.icloud")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary)
+    }
+  }
+
   private var firstGroupDatesInMonth: Set<Date> {
     var seenYearMonths = Set<Int>()
     var result = Set<Date>()
@@ -1135,64 +1201,7 @@ struct NativePhotosView: View {
             }
           }
           ToolbarItem(placement: .navigationBarTrailing) {
-            if isSelecting {
-              Button("全选") {
-                selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
-              }
-            } else {
-              HStack(spacing: 2) {
-                // 服务器状态与设置按钮
-                Button {
-                  showServerSettings = true
-                } label: {
-                  if model.error != nil {
-                    Image(systemName: "bolt.slash")
-                      .font(.system(size: 16, weight: .medium))
-                      .foregroundColor(.secondary.opacity(0.6))
-                  } else if model.isLoading {
-                    Image(systemName: "antenna.radiowaves.left.and.right")
-                      .font(.system(size: 16, weight: .medium))
-                      .foregroundColor(.secondary)
-                  } else {
-                    Image(systemName: "server.rack")
-                      .font(.system(size: 16, weight: .medium))
-                      .foregroundColor(.secondary)
-                  }
-                }
-                .frame(width: 36, height: 40)
-                .buttonStyle(.plain)
-
-                // 同步状态与设置按钮（常驻显示）：
-                // 1. 错误/异常 -> 空心云朵内部打叉 (xmark.icloud)
-                // 2. 正在同步/核验中 -> 空心云朵旋转刷新 (arrow.clockwise.icloud)
-                // 3. 有未核验/未匹配本地照片 -> 空心云朵向上箭头 (icloud.and.arrow.up)
-                // 4. 同步核验完成 -> 空心云朵内部打勾 (checkmark.icloud)
-                Button {
-                  showSyncSettings = true
-                } label: {
-                  if model.error != nil || cloud.error != nil {
-                    Image(systemName: "xmark.icloud")
-                      .font(.system(size: 16, weight: .medium))
-                      .foregroundColor(.secondary)
-                  } else if cloud.isRunning {
-                    Image(systemName: "arrow.clockwise.icloud")
-                      .font(.system(size: 16, weight: .medium))
-                      .foregroundColor(.secondary)
-                  } else if unsyncedLocalCount > 0 {
-                    Image(systemName: "icloud.and.arrow.up")
-                      .font(.system(size: 16, weight: .medium))
-                      .foregroundColor(.secondary.opacity(0.6))
-                  } else {
-                    Image(systemName: "checkmark.icloud")
-                      .font(.system(size: 16, weight: .medium))
-                      .foregroundColor(.secondary)
-                  }
-                }
-                .frame(width: 36, height: 40)
-                .buttonStyle(.plain)
-              }
-              .fixedSize(horizontal: true, vertical: false)
-            }
+            trailingToolbarContent
           }
         }
         .sheet(isPresented: $showServerSettings) {

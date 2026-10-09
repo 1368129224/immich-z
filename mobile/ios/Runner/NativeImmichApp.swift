@@ -111,15 +111,37 @@ private enum NativeSessionStore {
   }
 }
 
-private actor NativeThumbnailDiskCache {
+actor NativeThumbnailDiskCache {
   static let shared = NativeThumbnailDiskCache()
-  private let directory: URL
+  let directory: URL
   private var writesSincePrune = 0
 
   private init() {
     directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
       .appendingPathComponent("ImmichZThumbnails_v2", isDirectory: true)
     try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+  }
+
+  func diskUsage() -> (count: Int, bytes: Int64) {
+    let files = (try? FileManager.default.contentsOfDirectory(
+      at: directory,
+      includingPropertiesForKeys: [.fileSizeKey],
+      options: [.skipsHiddenFiles]
+    )) ?? []
+    var totalBytes: Int64 = 0
+    for file in files {
+      if let size = (try? file.resourceValues(forKeys: [.fileSizeKey]))?.fileSize {
+        totalBytes += Int64(size)
+      }
+    }
+    return (files.count, totalBytes)
+  }
+
+  func clearAll() {
+    let files = (try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil, options: [])) ?? []
+    for file in files {
+      try? FileManager.default.removeItem(at: file)
+    }
   }
 
   func data(for key: String) -> Data? {
@@ -1464,7 +1486,7 @@ struct NativeItemFramePreferenceKey: PreferenceKey {
   }
 }
 
-private enum NativeThumbnailCache {
+enum NativeThumbnailCache {
   static let images: NSCache<NSString, UIImage> = {
     let cache = NSCache<NSString, UIImage>()
     cache.countLimit = 1500

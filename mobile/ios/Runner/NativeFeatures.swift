@@ -1555,6 +1555,10 @@ private struct NativeLibraryView: View {
   @ObservedObject var device: NativeDeviceLibrary
   @AppStorage("immichz_merge_albums") private var mergeAlbums = true
   @State private var features: [String: Any] = [:]
+  @State private var showDebugSheet = false
+  @State private var versionTapCount = 0
+  @State private var lastVersionTapTime: Date = .distantPast
+
   private var buildCommit: String {
     guard let value = Bundle.main.object(forInfoDictionaryKey: "ImmichZGitCommit") as? String,
           !value.isEmpty,
@@ -1566,6 +1570,24 @@ private struct NativeLibraryView: View {
     let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
     let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
     return buildNumber.isEmpty ? shortVersion : "\(shortVersion)+\(buildNumber)"
+  }
+
+  private func handleVersionTap() {
+    let now = Date()
+    if now.timeIntervalSince(lastVersionTapTime) > 1.2 {
+      versionTapCount = 1
+    } else {
+      versionTapCount += 1
+    }
+    lastVersionTapTime = now
+
+    if versionTapCount >= 3 {
+      versionTapCount = 0
+      UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+      showDebugSheet = true
+    } else {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    }
   }
 
   var body: some View {
@@ -1623,17 +1645,301 @@ private struct NativeLibraryView: View {
             Text("build \(buildCommit)  \(appVersion)")
               .font(.footnote.monospaced())
               .foregroundColor(.secondary)
+              .contentShape(Rectangle())
+              .onTapGesture {
+                handleVersionTap()
+              }
             Spacer()
           }
           .listRowBackground(Color.clear)
         }
       }
       .navigationTitle("设置")
+      .sheet(isPresented: $showDebugSheet) {
+        NativePerformanceDebugView(client: client, device: device)
+      }
       .task {
         do { features = try await client.send(path: "server/features") }
         catch { features = [:] }
       }
     }.navigationViewStyle(.stack)
+  }
+}
+
+// MARK: - Performance Debug View
+
+struct NativePerformanceDebugView: View {
+  let client: NativeImmichClient
+  @ObservedObject var device: NativeDeviceLibrary
+  @Environment(\.dismiss) private var dismiss
+
+  @State private var isRunningBenchmarks = false
+  @State private var pingLatency: Int? = nil
+  @State private var pingStatus: String = "未测"
+  @State private var timelineLoadTimeMs: Int? = nil
+  @State private var serverAssetCount: Int? = nil
+  @State private var serverVideoCount: Int? = nil
+  @State private var serverStorageUsage: String? = nil
+  @State private var serverVersion: String? = nil
+  @State private var diskCacheFiles: Int = 0
+  @State private var diskCacheBytes: Int64 = 0
+  @State private var matchedCount: Int = 0
+  @State private var memoryFootprintMB: Double = 0
+  @State private var isClearingCache = false
+  @State private var alertMessage: String? = nil
+  @State private var showAlert = false
+
+  var body: some View {
+    NavigationView {
+      List {
+        Section(header: Text("网络与服务器延迟")) {
+          HStack {
+            Text("服务器地址")
+            Spacer()
+            Text(client.config.serverUrl)
+              .font(.caption.monospaced())
+              .foregroundColor(.secondary)
+              .lineLimit(1)
+          }
+          HStack {
+            Text("连接延迟 (Ping)")
+            Spacer()
+            if let latency = pingLatency {
+              Text("\(latency) ms")
+                .foregroundColor(latency < 150 ? .green : (latency < 400 ? .orange : .red))
+                .font(.body.monospacedDigit())
+            } else {
+              Text(pingStatus).foregroundColor(.secondary)
+            }
+          }
+          HStack {
+            Text("时间线接口耗时 (/timeline/buckets)")
+            Spacer()
+            if let t = timelineLoadTimeMs {
+              Text("\(t) ms")
+                .foregroundColor(t < 300 ? .green : .orange)
+                .font(.body.monospacedDigit())
+            } else {
+              Text("未测量").foregroundColor(.secondary)
+            }
+          }
+          if let ver = serverVersion {
+            HStack {
+              Text("服务器版本")
+              Spacer()
+              Text(ver).font(.caption.monospaced()).foregroundColor(.secondary)
+            }
+          }
+        }
+
+        Section(header: Text("照片库统计")) {
+          HStack {
+            Text("本地授权照片数")
+            Spacer()
+            Text("\(device.assets.filter { !$0.isVideo }.count) 张照片 / \(device.assets.filter { $0.isVideo }.count) 个视频")
+              .font(.subheadline)
+              .foregroundColor(.secondary)
+          }
+          HStack {
+            Text("本地资产总数")
+            Spacer()
+            Text("\(device.assets.count) 项").bold()
+          }
+          HStack {
+            Text("服务器照片数")
+            Spacer()
+            if let count = serverAssetCount {
+              Text("\(count) 张").bold()
+            } else {
+              Text("加载中…").foregroundColor(.secondary)
+            }
+          }
+          if let videos = serverVideoCount {
+            HStack {
+              Text("服务器视频数")
+              Spacer()
+              Text("\(videos) 个").bold()
+            }
+          }
+          if let usage = serverStorageUsage {
+            HStack {
+              Text("服务器存储占用")
+              Spacer()
+              Text(usage).foregroundColor(.secondary)
+            }
+          }
+          HStack {
+            Text("本地/云端哈希匹配数")
+            Spacer()
+            Text("\(matchedCount) 项").foregroundColor(.secondary)
+          }
+        }
+
+        Section(header: Text("缓存与内存")) {
+          HStack {
+            Text("缩略图磁盘缓存文件数")
+            Spacer()
+            Text("\(diskCacheFiles) 个").foregroundColor(.secondary)
+          }
+          HStack {
+            Text("缩略图磁盘缓存体积")
+            Spacer()
+            Text(formatBytes(diskCacheBytes)).bold()
+          }
+          HStack {
+            Text("App 内存占用 (Resident Memory)")
+            Spacer()
+            Text(String(format: "%.1f MB", memoryFootprintMB))
+              .font(.body.monospacedDigit())
+              .foregroundColor(memoryFootprintMB > 300 ? .orange : .secondary)
+          }
+          Button(role: .destructive) {
+            clearCaches()
+          } label: {
+            HStack {
+              if isClearingCache {
+                ProgressView().scaleEffect(0.8)
+                Text("正在清除…")
+              } else {
+                Text("清除所有本地缩略图与同步缓存")
+              }
+            }
+          }
+          .disabled(isClearingCache)
+        }
+
+        Section(header: Text("调试操作")) {
+          Button {
+            Task { await runDiagnostics() }
+          } label: {
+            HStack {
+              Image(systemName: "arrow.triangle.2.circlepath")
+              Text(isRunningBenchmarks ? "正在测试中…" : "重新运行性能诊断测试")
+            }
+          }
+          .disabled(isRunningBenchmarks)
+        }
+      }
+      .navigationTitle("性能调试 (Debug)")
+      .navigationBarTitleDisplayMode(.inline)
+      .toolbar {
+        ToolbarItem(placement: .navigationBarTrailing) {
+          Button("完成") { dismiss() }
+        }
+      }
+      .alert(isPresented: $showAlert) {
+        Alert(title: Text("提示"), message: Text(alertMessage ?? ""), dismissButton: .default(Text("好")))
+      }
+      .task {
+        await runDiagnostics()
+      }
+    }
+  }
+
+  private func runDiagnostics() async {
+    guard !isRunningBenchmarks else { return }
+    isRunningBenchmarks = true
+    defer { isRunningBenchmarks = false }
+
+    updateMemoryAndDiskCache()
+    matchedCount = NativeSyncCacheStore.shared.matchedServerIDs.count
+
+    // 1. Measure Ping latency
+    let pingStart = Date()
+    do {
+      _ = try await client.send(path: "server/ping")
+      pingLatency = Int(Date().timeIntervalSince(pingStart) * 1000)
+      pingStatus = "正常"
+    } catch {
+      pingLatency = nil
+      pingStatus = "连接失败: \(error.localizedDescription)"
+    }
+
+    // 2. Measure /timeline/buckets latency
+    let timelineStart = Date()
+    do {
+      let buckets = try await client.timelineBuckets()
+      timelineLoadTimeMs = Int(Date().timeIntervalSince(timelineStart) * 1000)
+      let totalBucketAssets = buckets.reduce(0) { $0 + $1.count }
+      if serverAssetCount == nil {
+        serverAssetCount = totalBucketAssets
+      }
+    } catch {
+      timelineLoadTimeMs = nil
+    }
+
+    // 3. Query server statistics
+    do {
+      let stats = try await client.send(path: "server/statistics")
+      if let photos = stats["photos"] as? Int {
+        serverAssetCount = photos
+      }
+      if let videos = stats["videos"] as? Int {
+        serverVideoCount = videos
+      }
+      if let usageBytes = stats["usage"] as? Int64 {
+        serverStorageUsage = formatBytes(usageBytes)
+      } else if let usageBytes = stats["usage"] as? Int {
+        serverStorageUsage = formatBytes(Int64(usageBytes))
+      }
+    } catch {}
+
+    // 4. Query server version
+    do {
+      let verObj = try await client.send(path: "server/version")
+      if let major = verObj["major"], let minor = verObj["minor"], let patch = verObj["patch"] {
+        serverVersion = "\(major).\(minor).\(patch)"
+      }
+    } catch {}
+
+    updateMemoryAndDiskCache()
+  }
+
+  private func updateMemoryAndDiskCache() {
+    Task {
+      let (count, bytes) = await NativeThumbnailDiskCache.shared.diskUsage()
+      await MainActor.run {
+        diskCacheFiles = count
+        diskCacheBytes = bytes
+      }
+    }
+
+    var info = mach_task_basic_info()
+    var count = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size) / 4
+    let kerr = withUnsafeMutablePointer(to: &info) {
+      $0.withMemoryRebound(to: integer_t.self, capacity: 1) {
+        task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &count)
+      }
+    }
+    if kerr == KERN_SUCCESS {
+      memoryFootprintMB = Double(info.resident_size) / (1024.0 * 1024.0)
+    }
+  }
+
+  private func clearCaches() {
+    isClearingCache = true
+    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    Task {
+      await NativeThumbnailDiskCache.shared.clearAll()
+      NativeThumbnailCache.images.removeAllObjects()
+      NativeLocalThumbnailCache.images.removeAllObjects()
+      NativeSyncCacheStore.shared.clear()
+      await MainActor.run {
+        isClearingCache = false
+        updateMemoryAndDiskCache()
+        matchedCount = 0
+        alertMessage = "缩略图与同步缓存已全部清理完毕"
+        showAlert = true
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+      }
+    }
+  }
+
+  private func formatBytes(_ bytes: Int64) -> String {
+    let formatter = ByteCountFormatter()
+    formatter.allowedUnits = [.useAll]
+    formatter.countStyle = .file
+    return formatter.string(fromByteCount: bytes)
   }
 }
 

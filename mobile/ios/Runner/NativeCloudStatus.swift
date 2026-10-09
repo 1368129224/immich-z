@@ -175,6 +175,11 @@ final class NativeCloudStatus: ObservableObject {
   }
 
   func check(_ assets: [NativeDeviceAsset], client: NativeImmichClient, allowNetwork: Bool = false) async {
+    let syncEnabled = UserDefaults.standard.object(forKey: "backup_enabled") as? Bool ?? true
+    guard syncEnabled else {
+      message = "同步已暂停"
+      return
+    }
     guard !running else { return }
     let toCheck = assets.filter { matchedServerIDs[$0.id] == nil && (allowNetwork || !failedIDs.contains($0.id)) }
     guard !toCheck.isEmpty else { return }

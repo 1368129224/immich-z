@@ -1254,11 +1254,21 @@ struct NativePhotosView: View {
             trailingToolbarContent
           }
         }
-        .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片？", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
-          Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos() } }
+        .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
+          if selectedHasBothCopies {
+            Button("全部删除（本地与云端）", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+            Button("仅删除本地照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
+            Button("仅删除云端照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
+          } else {
+            Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+          }
           Button("取消", role: .cancel) {}
         } message: {
-          Text("合并照片会同时从 Immich 服务器和本机照片图库删除。")
+          if selectedHasBothCopies {
+            Text("选中的照片中包含本地和云端都存在的照片，请选择删除范围。")
+          } else {
+            Text("确认删除选中的照片？此操作不可撤销。")
+          }
         }
         .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
           Button("确定", role: .cancel) { deletionError = nil }
@@ -1282,15 +1292,22 @@ struct NativePhotosView: View {
     .navigationViewStyle(.stack)
   }
 
-  private func deleteSelectedPhotos() async {
+  private var selectedHasBothCopies: Bool {
+    let items = cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
+    return items.contains { $0.server != nil && $0.local != nil }
+  }
+
+  private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
     guard !isDeleting else { return }
     let items = cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
     guard !items.isEmpty else { return }
     isDeleting = true
     defer { isDeleting = false }
     do {
-      try await nativeDeleteGridItems(items, client: client, device: device)
-      model.removeAssets(ids: Set(items.compactMap { $0.server?.id }))
+      try await nativeDeleteGridItems(items, scope: scope, client: client, device: device)
+      if scope == .all || scope == .remoteOnly {
+        model.removeAssets(ids: Set(items.compactMap { $0.server?.id }))
+      }
       selectedIDs.removeAll()
       isSelecting = false
       device.refresh()
@@ -2510,6 +2527,10 @@ struct NativeSyncSettingsSheet: View {
   @ObservedObject var cloud: NativeCloudStatus
   @Environment(\.dismiss) private var dismiss
 
+  @AppStorage("backup_enabled") private var syncEnabled = true
+  @AppStorage("backup_require_wifi") private var requireWifi = true
+  @AppStorage("backup_cellular_videos") private var syncCellularVideos = false
+
   private var unsyncedCount: Int {
     device.assets.filter { cloud.matchedServerIDs[$0.id] == nil }.count
   }
@@ -2517,6 +2538,14 @@ struct NativeSyncSettingsSheet: View {
   var body: some View {
     NavigationView {
       Form {
+        Section(header: Text("同步控制与网络策略")) {
+          Toggle("开启照片同步", isOn: $syncEnabled)
+          Toggle("仅在 Wi-Fi 下同步", isOn: $requireWifi)
+            .disabled(!syncEnabled)
+          Toggle("允许移动蜂窝网络下同步视频", isOn: $syncCellularVideos)
+            .disabled(!syncEnabled || requireWifi)
+        }
+
         Section(header: Text("相册与同步状态")) {
           HStack {
             Text("设备已授权照片")
@@ -2536,7 +2565,7 @@ struct NativeSyncSettingsSheet: View {
           }
         }
 
-        Section(header: Text("核验与操作"), footer: Text("原生上传同步功能正在演进中。目前可通过重新核验比对设备相册与云端照片哈希。")) {
+        Section(header: Text("核验与操作"), footer: Text("原生上传同步功能正在演进中。开启同步后，系统将自动核验并在符合 Wi-Fi / 蜂窝网络设置的条件下执行照片与视频同步。")) {
           Button {
             Task {
               await cloud.retry(device.assets, client: client)
@@ -2551,7 +2580,7 @@ struct NativeSyncSettingsSheet: View {
               }
             }
           }
-          .disabled(cloud.isRunning)
+          .disabled(cloud.isRunning || !syncEnabled)
 
           Button(role: .destructive) {
             cloud.clearCache()
@@ -2561,6 +2590,7 @@ struct NativeSyncSettingsSheet: View {
           } label: {
             Text("清除匹配缓存并重新比对")
           }
+          .disabled(!syncEnabled)
         }
       }
       .navigationTitle("同步设置")

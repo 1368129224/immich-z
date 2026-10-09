@@ -881,13 +881,40 @@ enum NativeAssetState {
   case merged  // synced on both server and device -> checkmark.icloud
 }
 
+enum NativeDeleteTargetScope {
+  case all
+  case localOnly
+  case remoteOnly
+}
+
 @MainActor
-func nativeDeleteGridItems(_ items: [NativeGridItem], client: NativeImmichClient, device: NativeDeviceLibrary) async throws {
-  let serverIDs = Array(Set(items.compactMap { $0.server?.id }))
-  let localIDs = Array(Set(items.compactMap { $0.local?.id }))
-  if !serverIDs.isEmpty { try await client.deleteAssets(ids: serverIDs) }
-  if !localIDs.isEmpty {
-    guard await device.deleteAssets(ids: localIDs) else { throw NativeFeatureError.badResponse }
+func nativeDeleteGridItems(
+  _ items: [NativeGridItem],
+  scope: NativeDeleteTargetScope = .all,
+  client: NativeImmichClient,
+  device: NativeDeviceLibrary
+) async throws {
+  var serverIDs: [String] = []
+  var localIDs: [String] = []
+
+  for item in items {
+    switch scope {
+    case .all:
+      if let sid = item.server?.id { serverIDs.append(sid) }
+      if let lid = item.local?.id { localIDs.append(lid) }
+    case .localOnly:
+      if let lid = item.local?.id { localIDs.append(lid) }
+    case .remoteOnly:
+      if let sid = item.server?.id { serverIDs.append(sid) }
+    }
+  }
+
+  let uniqueServerIDs = Array(Set(serverIDs))
+  let uniqueLocalIDs = Array(Set(localIDs))
+
+  if !uniqueServerIDs.isEmpty { try await client.deleteAssets(ids: uniqueServerIDs) }
+  if !uniqueLocalIDs.isEmpty {
+    guard await device.deleteAssets(ids: uniqueLocalIDs) else { throw NativeFeatureError.badResponse }
   }
 }
 
@@ -1433,8 +1460,8 @@ private struct NativeAlbumsView: View {
       } message: {
         Text("会从 Immich 及本机照片图库删除这些照片，即使照片也属于其他相册。此操作无法在应用内撤销。")
       }
-      .alert("操作失败", isPresented: $showMutationError) {
-        Button("确定", role: .cancel) {}
+      .alert("删除失败", isPresented: $showMutationError) {
+        Button("确定", role: .cancel) { error = nil }
       } message: { Text(error ?? "未知错误") }
       .refreshable { await reload(); device.refresh() }
       .task { if !loaded { loaded = true; await reload() } }
@@ -1443,6 +1470,8 @@ private struct NativeAlbumsView: View {
   }
 
   private func reload() async {
+    isDragSelecting = false
+    finishDragSelection()
     isLoading = true
     defer { isLoading = false }
     do { serverAlbums = try await client.serverAlbums(); error = nil }
@@ -1470,10 +1499,17 @@ private struct NativeAlbumsView: View {
 
   private func deleteSelectedAlbums(includingAssets: Bool) async {
     guard !isMutating else { return }
+    isDragSelecting = false
+    finishDragSelection()
     let selected = entries.filter { selectedAlbumIDs.contains($0.id) }
     guard !selected.isEmpty else { return }
     isMutating = true
-    defer { isMutating = false; device.refresh() }
+    defer {
+      isMutating = false
+      isDragSelecting = false
+      finishDragSelection()
+      device.refresh()
+    }
     var failures: [String] = []
     var removedRemoteIDs = Set<String>()
     for entry in selected {
@@ -1720,11 +1756,21 @@ private struct NativeAlbumDetail: View {
         }
       }
     }
-    .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片？", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
-      Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos() } }
+    .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
+      if selectedHasBothCopies {
+        Button("全部删除（本地与云端）", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+        Button("仅删除本地照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
+        Button("仅删除云端照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
+      } else {
+        Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+      }
       Button("取消", role: .cancel) {}
     } message: {
-      Text("合并照片会同时从 Immich 服务器和本机照片图库删除。")
+      if selectedHasBothCopies {
+        Text("选中的照片中包含本地和云端都存在的照片，请选择删除范围。")
+      } else {
+        Text("确认删除选中的照片？此操作不可撤销。")
+      }
     }
     .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
       Button("确定", role: .cancel) { deletionError = nil }
@@ -1736,8 +1782,7 @@ private struct NativeAlbumDetail: View {
     }
   }
 
-  private func deleteSelectedPhotos() async {
-    guard !isDeleting else { return }
+  private var selectedTargets: [NativeGridItem] {
     let matched = NativeSyncCacheStore.shared.matchedServerIDs
     let serverByID = Dictionary(serverAssetsToDisplay.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     let items = localAssetsToDisplay.map { local -> NativeGridItem in
@@ -1745,12 +1790,21 @@ private struct NativeAlbumDetail: View {
     } + serverAssetsToDisplay.filter { server in
       !localAssetsToDisplay.contains { matched[$0.id] == server.id }
     }.map { NativeGridItem(server: $0, local: nil) }
-    let targets = items.filter { selectedIDs.contains($0.id) }
+    return items.filter { selectedIDs.contains($0.id) }
+  }
+
+  private var selectedHasBothCopies: Bool {
+    selectedTargets.contains { $0.server != nil && $0.local != nil }
+  }
+
+  private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
+    guard !isDeleting else { return }
+    let targets = selectedTargets
     guard !targets.isEmpty else { return }
     isDeleting = true
     defer { isDeleting = false }
     do {
-      try await nativeDeleteGridItems(targets, client: client, device: device)
+      try await nativeDeleteGridItems(targets, scope: scope, client: client, device: device)
       selectedIDs.removeAll()
       isSelecting = false
       device.refresh()

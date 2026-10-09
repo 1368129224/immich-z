@@ -294,6 +294,7 @@ final class NativeImmichClient {
       let message = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["message"] as? String ?? ""
       throw NativeAPIError.http(http.statusCode, message)
     }
+    if data.isEmpty { return [:] } // DELETE endpoints may return HTTP 204 No Content.
     do {
       guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
         throw NativeAPIError.invalidJSON(path)
@@ -366,11 +367,27 @@ final class NativeImmichClient {
   }
 
   func deleteAsset(id: String) async throws {
+    try await deleteAssets(ids: [id])
+  }
+
+  func deleteAssets(ids: [String]) async throws {
+    guard !ids.isEmpty else { return }
     let payload: [String: Any] = [
-      "ids": [id],
-      "force": false
+      "ids": ids,
+      "force": true
     ]
     _ = try await send(path: "assets", method: "DELETE", body: payload)
+  }
+
+  func createAlbum(name: String) async throws -> [String: Any] {
+    let payload: [String: Any] = [
+      "albumName": name
+    ]
+    return try await send(path: "albums", method: "POST", body: payload)
+  }
+
+  func deleteAlbum(id: String) async throws {
+    _ = try await send(path: "albums/\(id)", method: "DELETE")
   }
 
   func updateFavorite(id: String, isFavorite: Bool) async throws {
@@ -756,6 +773,10 @@ private final class NativeTimelineModel: ObservableObject {
     var seen = Set<String>()
     assets = (assets + result).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
   }
+
+  func removeAssets(ids: Set<String>) {
+    assets.removeAll { ids.contains($0.id) }
+  }
 }
 
 struct NativePhotosView: View {
@@ -785,6 +806,9 @@ struct NativePhotosView: View {
   @State private var loadingOlderAnchor: String?
   @State private var showServerSettings = false
   @State private var showSyncSettings = false
+  @State private var showDeleteConfirmation = false
+  @State private var deletionError: String?
+  @State private var isDeleting = false
   @State private var isRefreshing = false
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
@@ -842,6 +866,10 @@ struct NativePhotosView: View {
   @ViewBuilder
   private var trailingToolbarContent: some View {
     if isSelecting {
+      Button(role: .destructive) { showDeleteConfirmation = true } label: {
+        Image(systemName: "trash")
+      }
+      .disabled(selectedIDs.isEmpty || isDeleting)
       Button("全选") {
         selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
       }
@@ -1226,6 +1254,15 @@ struct NativePhotosView: View {
             trailingToolbarContent
           }
         }
+        .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片？", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
+          Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos() } }
+          Button("取消", role: .cancel) {}
+        } message: {
+          Text("合并照片会同时从 Immich 服务器和本机照片图库删除。")
+        }
+        .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
+          Button("确定", role: .cancel) { deletionError = nil }
+        } message: { Text(deletionError ?? "未知错误") }
         .sheet(isPresented: $showServerSettings) {
           NativeServerSettingsSheet(client: client, onLogout: onLogout)
         }
@@ -1243,6 +1280,27 @@ struct NativePhotosView: View {
       }
     }
     .navigationViewStyle(.stack)
+  }
+
+  private func deleteSelectedPhotos() async {
+    guard !isDeleting else { return }
+    let items = cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
+    guard !items.isEmpty else { return }
+    isDeleting = true
+    defer { isDeleting = false }
+    do {
+      try await nativeDeleteGridItems(items, client: client, device: device)
+      model.removeAssets(ids: Set(items.compactMap { $0.server?.id }))
+      selectedIDs.removeAll()
+      isSelecting = false
+      device.refresh()
+      rebuildDayGroups()
+    } catch {
+      deletionError = "可能已有部分照片删除成功，请刷新确认。\(error.localizedDescription)"
+      device.refresh()
+      await model.loadInitial()
+      rebuildDayGroups()
+    }
   }
 
   private func triggerRefresh(proxy: ScrollViewProxy) {

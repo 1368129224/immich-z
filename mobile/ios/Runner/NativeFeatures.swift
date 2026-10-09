@@ -87,6 +87,64 @@ final class NativeDeviceLibrary: ObservableObject {
       contentVersion: Int((first.modificationDate?.timeIntervalSince1970 ?? 0) * 1000)
     )
   }
+
+  func createAlbum(named name: String) async -> Bool {
+    guard authorized else { return false }
+    return await withCheckedContinuation { continuation in
+      PHPhotoLibrary.shared().performChanges({
+        PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: name)
+      }) { [weak self] success, _ in
+        if success {
+          DispatchQueue.main.async {
+            self?.refresh()
+          }
+        }
+        continuation.resume(returning: success)
+      }
+    }
+  }
+
+  func deleteAlbums(ids: [String]) async -> Bool {
+    guard authorized, !ids.isEmpty else { return false }
+    return await withCheckedContinuation { continuation in
+      let collections = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: ids, options: nil)
+      guard collections.count > 0 else {
+        continuation.resume(returning: true)
+        return
+      }
+      PHPhotoLibrary.shared().performChanges({
+        PHAssetCollectionChangeRequest.deleteAssetCollections(collections)
+      }) { [weak self] success, _ in
+        if success {
+          DispatchQueue.main.async {
+            self?.refresh()
+          }
+        }
+        continuation.resume(returning: success)
+      }
+    }
+  }
+
+  func deleteAssets(ids: [String]) async -> Bool {
+    guard authorized, !ids.isEmpty else { return false }
+    return await withCheckedContinuation { continuation in
+      let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+      guard fetch.count > 0 else {
+        continuation.resume(returning: true)
+        return
+      }
+      PHPhotoLibrary.shared().performChanges({
+        PHAssetChangeRequest.deleteAssets(fetch)
+      }) { [weak self] success, _ in
+        if success {
+          DispatchQueue.main.async {
+            self?.refresh()
+          }
+        }
+        continuation.resume(returning: success)
+      }
+    }
+  }
 }
 
 struct NativeDeviceAsset: Identifiable, Sendable {
@@ -823,6 +881,16 @@ enum NativeAssetState {
   case merged  // synced on both server and device -> checkmark.icloud
 }
 
+@MainActor
+func nativeDeleteGridItems(_ items: [NativeGridItem], client: NativeImmichClient, device: NativeDeviceLibrary) async throws {
+  let serverIDs = Array(Set(items.compactMap { $0.server?.id }))
+  let localIDs = Array(Set(items.compactMap { $0.local?.id }))
+  if !serverIDs.isEmpty { try await client.deleteAssets(ids: serverIDs) }
+  if !localIDs.isEmpty {
+    guard await device.deleteAssets(ids: localIDs) else { throw NativeFeatureError.badResponse }
+  }
+}
+
 struct NativeGridItem: Identifiable {
   let server: NativeAsset?
   let local: NativeDeviceAsset?
@@ -1151,6 +1219,13 @@ private struct NativeAlbumsView: View {
   @State private var dragInitialSelectedIDs: Set<String> = []
   @State private var dragSelectMode: Bool = true
   @State private var activeEntry: NativeAlbumEntry? = nil
+  @State private var showCreateAlbum = false
+  @State private var newAlbumName = ""
+  @State private var showCreateDestination = false
+  @State private var showDeleteOptions = false
+  @State private var showDeleteAssetsWarning = false
+  @State private var showMutationError = false
+  @State private var isMutating = false
 
   private let gridColumns = [
     GridItem(.flexible(), spacing: 14),
@@ -1313,23 +1388,54 @@ private struct NativeAlbumsView: View {
             Text("已选 \(selectedAlbumIDs.count) 个相册").font(.headline)
           }
         }
-        ToolbarItem(placement: .navigationBarTrailing) {
+        ToolbarItemGroup(placement: .navigationBarTrailing) {
           if isSelecting {
-            Button("全选") {
-              selectedAlbumIDs = Set(entries.map(\.id))
+            Button(role: .destructive) { showDeleteOptions = true } label: {
+              Image(systemName: "trash")
             }
+            .disabled(selectedAlbumIDs.isEmpty || isMutating)
+            Button("全选") { selectedAlbumIDs = Set(entries.map(\.id)) }
           } else {
+            Button { showCreateAlbum = true } label: { Image(systemName: "plus") }
             Button {
               Task {
                 await reload()
                 device.refresh()
               }
-            } label: {
-              Image(systemName: "arrow.clockwise")
-            }
+            } label: { Image(systemName: "arrow.clockwise") }
           }
         }
       }
+      .alert("新建相册", isPresented: $showCreateAlbum) {
+        TextField("相册名称", text: $newAlbumName)
+        Button("取消", role: .cancel) { newAlbumName = "" }
+        Button("下一步") { showCreateDestination = true }
+      } message: {
+        Text("输入新相册名称。")
+      }
+      .confirmationDialog("创建相册的位置", isPresented: $showCreateDestination, titleVisibility: .visible) {
+        Button("Immich 服务器") { Task { await createAlbum(local: false) } }
+        if device.authorized {
+          Button("本机照片图库") { Task { await createAlbum(local: true) } }
+        }
+        Button("取消", role: .cancel) {}
+      }
+      .confirmationDialog("删除选中的相册", isPresented: $showDeleteOptions, titleVisibility: .visible) {
+        Button("仅删除相册", role: .destructive) { Task { await deleteSelectedAlbums(includingAssets: false) } }
+        Button("删除相册及其中的照片", role: .destructive) { showDeleteAssetsWarning = true }
+        Button("取消", role: .cancel) {}
+      } message: {
+        Text("合并相册会删除两端相册。")
+      }
+      .alert("永久删除相册中的照片？", isPresented: $showDeleteAssetsWarning) {
+        Button("取消", role: .cancel) {}
+        Button("删除照片与相册", role: .destructive) { Task { await deleteSelectedAlbums(includingAssets: true) } }
+      } message: {
+        Text("会从 Immich 及本机照片图库删除这些照片，即使照片也属于其他相册。此操作无法在应用内撤销。")
+      }
+      .alert("操作失败", isPresented: $showMutationError) {
+        Button("确定", role: .cancel) {}
+      } message: { Text(error ?? "未知错误") }
       .refreshable { await reload(); device.refresh() }
       .task { if !loaded { loaded = true; await reload() } }
     }
@@ -1341,6 +1447,73 @@ private struct NativeAlbumsView: View {
     defer { isLoading = false }
     do { serverAlbums = try await client.serverAlbums(); error = nil }
     catch { self.error = error.localizedDescription }
+  }
+
+  private func createAlbum(local: Bool) async {
+    let name = newAlbumName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !name.isEmpty, !isMutating else { return }
+    isMutating = true
+    defer { isMutating = false }
+    do {
+      if local {
+        guard await device.createAlbum(named: name) else { throw NativeFeatureError.badResponse }
+      } else {
+        _ = try await client.createAlbum(name: name)
+      }
+      newAlbumName = ""
+      await reload()
+    } catch {
+      self.error = "新建相册失败：\(error.localizedDescription)"
+      showMutationError = true
+    }
+  }
+
+  private func deleteSelectedAlbums(includingAssets: Bool) async {
+    guard !isMutating else { return }
+    let selected = entries.filter { selectedAlbumIDs.contains($0.id) }
+    guard !selected.isEmpty else { return }
+    isMutating = true
+    defer { isMutating = false; device.refresh() }
+    var failures: [String] = []
+    var removedRemoteIDs = Set<String>()
+    for entry in selected {
+      do {
+        if includingAssets {
+          var remoteIDs = Set<String>()
+          if let server = entry.server {
+            var cursor: String? = nil
+            repeat {
+              let page = try await client.searchPage(albumId: server.id, cursor: cursor)
+              remoteIDs.formUnion(page.assets.map(\.id))
+              cursor = page.next
+            } while cursor != nil
+          }
+          let remainingRemoteIDs = remoteIDs.subtracting(removedRemoteIDs)
+          if !remainingRemoteIDs.isEmpty {
+            try await client.deleteAssets(ids: Array(remainingRemoteIDs))
+            removedRemoteIDs.formUnion(remainingRemoteIDs)
+          }
+          if let local = entry.device {
+            let localIDs = device.assets(in: local).map(\.id)
+            if !localIDs.isEmpty {
+              guard await device.deleteAssets(ids: localIDs) else { throw NativeFeatureError.badResponse }
+            }
+          }
+        }
+        if let server = entry.server { try await client.deleteAlbum(id: server.id) }
+        if let local = entry.device {
+          guard await device.deleteAlbums(ids: [local.id]) else { throw NativeFeatureError.badResponse }
+        }
+        selectedAlbumIDs.remove(entry.id)
+      } catch { failures.append("\(entry.title)：\(error.localizedDescription)") }
+    }
+    await reload()
+    if failures.isEmpty {
+      isSelecting = false
+    } else {
+      error = "部分删除失败：" + failures.joined(separator: "；")
+      showMutationError = true
+    }
   }
 
   private func enterAlbumSelection(startingWith id: String, at location: CGPoint? = nil) {
@@ -1450,6 +1623,9 @@ private struct NativeAlbumDetail: View {
 
   @State private var isSelecting = false
   @State private var selectedIDs: Set<String> = []
+  @State private var showDeleteConfirmation = false
+  @State private var deletionError: String?
+  @State private var isDeleting = false
 
   init(client: NativeImmichClient, device: NativeDeviceLibrary, entry: NativeAlbumEntry, mergeAlbums: Bool) {
     self.client = client
@@ -1513,8 +1689,10 @@ private struct NativeAlbumDetail: View {
           Text("已选 \(selectedIDs.count) 项").font(.headline)
         }
       }
-      ToolbarItem(placement: .navigationBarTrailing) {
+      ToolbarItemGroup(placement: .navigationBarTrailing) {
         if isSelecting {
+          Button(role: .destructive) { showDeleteConfirmation = true } label: { Image(systemName: "trash") }
+            .disabled(selectedIDs.isEmpty || isDeleting)
           Button("全选") {
             let matched = NativeSyncCacheStore.shared.matchedServerIDs
             let serverById = Dictionary(serverAssetsToDisplay.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -1542,10 +1720,45 @@ private struct NativeAlbumDetail: View {
         }
       }
     }
+    .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片？", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
+      Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos() } }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("合并照片会同时从 Immich 服务器和本机照片图库删除。")
+    }
+    .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
+      Button("确定", role: .cancel) { deletionError = nil }
+    } message: { Text(deletionError ?? "未知错误") }
     .task {
       if let server = entry.server {
         await model.load(albumId: server.id, reset: true)
       }
+    }
+  }
+
+  private func deleteSelectedPhotos() async {
+    guard !isDeleting else { return }
+    let matched = NativeSyncCacheStore.shared.matchedServerIDs
+    let serverByID = Dictionary(serverAssetsToDisplay.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let items = localAssetsToDisplay.map { local -> NativeGridItem in
+      NativeGridItem(server: matched[local.id].flatMap { serverByID[$0] }, local: local)
+    } + serverAssetsToDisplay.filter { server in
+      !localAssetsToDisplay.contains { matched[$0.id] == server.id }
+    }.map { NativeGridItem(server: $0, local: nil) }
+    let targets = items.filter { selectedIDs.contains($0.id) }
+    guard !targets.isEmpty else { return }
+    isDeleting = true
+    defer { isDeleting = false }
+    do {
+      try await nativeDeleteGridItems(targets, client: client, device: device)
+      selectedIDs.removeAll()
+      isSelecting = false
+      device.refresh()
+      if let id = entry.server?.id { await model.load(albumId: id, reset: true) }
+    } catch {
+      deletionError = "可能已有部分照片删除成功，请刷新确认。\(error.localizedDescription)"
+      device.refresh()
+      if let id = entry.server?.id { await model.load(albumId: id, reset: true) }
     }
   }
 }

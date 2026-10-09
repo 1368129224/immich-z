@@ -1124,15 +1124,15 @@ private struct NativeAlbumEntry: Identifiable, Equatable {
   }
 
   var countDescription: String {
+    let s = server?.count ?? 0
+    let d = device?.count ?? 0
     switch origin {
     case .merged:
-      let s = server?.count ?? 0
-      let d = device?.count ?? 0
-      return "云端 \(s) · 本地 \(d)"
+      return "\(s) 项 · 本机 \(d)"
     case .server:
-      return "\(server?.count ?? 0) 项"
+      return "\(s) 项 · 云端"
     case .local:
-      return "\(device?.count ?? 0) 项"
+      return "\(d) 项 · 本机"
     }
   }
 }

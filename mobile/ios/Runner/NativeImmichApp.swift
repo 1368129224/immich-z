@@ -1285,7 +1285,15 @@ struct NativePhotosView: View {
             device: device,
             items: cachedDayGroups.flatMap(\.assets),
             initialItem: item
-          )
+          ) { deletedItem, scope in
+            if scope == .all || scope == .remoteOnly {
+              if let sid = deletedItem.server?.id {
+                model.removeAssets(ids: [sid])
+              }
+            }
+            device.refresh()
+            rebuildDayGroups()
+          }
         }
       }
     }
@@ -1763,6 +1771,7 @@ struct NativeUnifiedGalleryViewer: View {
   let device: NativeDeviceLibrary
   let items: [NativeGridItem]
   let initialItem: NativeGridItem
+  var onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil
 
   @Environment(\.dismiss) private var dismiss
   @State private var currentIndex: Int = 0
@@ -1772,12 +1781,23 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var isProcessingFavorite = false
   @State private var dragOffset: CGSize = .zero
   @State private var shareItem: Any? = nil
+  @State private var showDeleteLocalAlert = false
+  @State private var showDeleteAllAlert = false
+  @State private var isDeletingItem = false
+  @State private var deleteErrorMessage: String? = nil
 
-  init(client: NativeImmichClient, device: NativeDeviceLibrary, items: [NativeGridItem], initialItem: NativeGridItem) {
+  init(
+    client: NativeImmichClient,
+    device: NativeDeviceLibrary,
+    items: [NativeGridItem],
+    initialItem: NativeGridItem,
+    onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil
+  ) {
     self.client = client
     self.device = device
     self.items = items
     self.initialItem = initialItem
+    self.onDeleteItem = onDeleteItem
     let index = items.firstIndex(where: { $0.id == initialItem.id }) ?? 0
     _currentIndex = State(initialValue: index)
     _isFavorite = State(initialValue: initialItem.server?.isFavorite ?? false)
@@ -1889,14 +1909,14 @@ struct NativeUnifiedGalleryViewer: View {
           Spacer()
 
           // Bottom Bar
-          HStack(spacing: 36) {
+          HStack(spacing: 24) {
             // Share
             Button {
               triggerShare()
             } label: {
               VStack(spacing: 4) {
                 Image(systemName: "square.and.arrow.up")
-                  .font(.system(size: 20))
+                  .font(.system(size: 19))
                 Text("分享").font(.caption2)
               }
               .foregroundColor(.white)
@@ -1908,7 +1928,7 @@ struct NativeUnifiedGalleryViewer: View {
             } label: {
               VStack(spacing: 4) {
                 Image(systemName: isFavorite ? "heart.fill" : "heart")
-                  .font(.system(size: 20))
+                  .font(.system(size: 19))
                   .foregroundColor(isFavorite ? .red : .white)
                 Text(isFavorite ? "已收藏" : "收藏").font(.caption2)
                   .foregroundColor(.white)
@@ -1923,20 +1943,76 @@ struct NativeUnifiedGalleryViewer: View {
             } label: {
               VStack(spacing: 4) {
                 Image(systemName: "info.circle")
-                  .font(.system(size: 20))
+                  .font(.system(size: 19))
                 Text("详情").font(.caption2)
               }
               .foregroundColor(.white)
             }
+
+            // Delete Local
+            Button {
+              showDeleteLocalAlert = true
+            } label: {
+              VStack(spacing: 4) {
+                Image(systemName: "iphone.slash")
+                  .font(.system(size: 19))
+                Text("删本地").font(.caption2)
+              }
+              .foregroundColor(.white)
+            }
+            .disabled(isDeletingItem || currentItem?.local == nil)
+            .opacity(currentItem?.local != nil ? 1 : 0.4)
+
+            // Delete All (or remote if only remote)
+            Button {
+              showDeleteAllAlert = true
+            } label: {
+              VStack(spacing: 4) {
+                Image(systemName: "trash")
+                  .font(.system(size: 19))
+                  .foregroundColor(.red)
+                Text("全删").font(.caption2)
+                  .foregroundColor(.red)
+              }
+            }
+            .disabled(isDeletingItem || currentItem == nil)
+            .opacity(currentItem != nil ? 1 : 0.4)
           }
-          .padding(.vertical, 12)
-          .padding(.horizontal, 24)
-          .background(Color.black.opacity(0.6))
+          .padding(.vertical, 10)
+          .padding(.horizontal, 18)
+          .background(Color.black.opacity(0.65))
           .cornerRadius(24)
           .padding(.bottom, 24)
         }
         .transition(.opacity)
       }
+    }
+    .alert("仅删除本地照片？", isPresented: $showDeleteLocalAlert) {
+      Button("取消", role: .cancel) {}
+      Button("删除本地", role: .destructive) {
+        performDeleteItem(scope: .localOnly)
+      }
+    } message: {
+      Text("将从系统相册彻底删除该照片/视频，云端副本将保留。")
+    }
+    .alert("删除照片？", isPresented: $showDeleteAllAlert) {
+      Button("取消", role: .cancel) {}
+      Button("彻底删除", role: .destructive) {
+        performDeleteItem(scope: .all)
+      }
+    } message: {
+      if currentItem?.local != nil && currentItem?.server != nil {
+        Text("将同时从 Immich 服务器和系统相册中删除此项，此操作不可撤销。")
+      } else if currentItem?.server != nil {
+        Text("将从 Immich 服务器中删除此项，此操作不可撤销。")
+      } else {
+        Text("将从系统相册中删除此项，此操作不可撤销。")
+      }
+    }
+    .alert("删除失败", isPresented: Binding(get: { deleteErrorMessage != nil }, set: { if !$0 { deleteErrorMessage = nil } })) {
+      Button("确定", role: .cancel) { deleteErrorMessage = nil }
+    } message: {
+      Text(deleteErrorMessage ?? "未知错误")
     }
     .onChange(of: currentIndex) { newIdx in
       if items.indices.contains(newIdx) {
@@ -1953,6 +2029,27 @@ struct NativeUnifiedGalleryViewer: View {
       set: { if $0 == nil { shareItem = nil } }
     )) { payload in
       NativeActivityView(activityItems: [payload.content])
+    }
+  }
+
+  private func performDeleteItem(scope: NativeDeleteTargetScope) {
+    guard let item = currentItem, !isDeletingItem else { return }
+    isDeletingItem = true
+    UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
+    Task {
+      do {
+        try await nativeDeleteGridItems([item], scope: scope, client: client, device: device)
+        await MainActor.run {
+          isDeletingItem = false
+          onDeleteItem?(item, scope)
+          dismiss()
+        }
+      } catch {
+        await MainActor.run {
+          isDeletingItem = false
+          deleteErrorMessage = "删除失败：\(error.localizedDescription)"
+        }
+      }
     }
   }
 

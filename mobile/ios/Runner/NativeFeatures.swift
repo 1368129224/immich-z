@@ -243,6 +243,7 @@ struct NativeDeviceViewer: View {
         }
       }
     }
+    .statusBarHidden(true)
   }
 }
 
@@ -1662,6 +1663,8 @@ private struct NativeAlbumDetail: View {
   @State private var showDeleteConfirmation = false
   @State private var deletionError: String?
   @State private var isDeleting = false
+  @State private var batchShareItems: [Any]? = nil
+  @State private var isPreparingBatchShare = false
 
   init(client: NativeImmichClient, device: NativeDeviceLibrary, entry: NativeAlbumEntry, mergeAlbums: Bool) {
     self.client = client
@@ -1725,10 +1728,8 @@ private struct NativeAlbumDetail: View {
           Text("已选 \(selectedIDs.count) 项").font(.headline)
         }
       }
-      ToolbarItemGroup(placement: .navigationBarTrailing) {
+      ToolbarItem(placement: .navigationBarTrailing) {
         if isSelecting {
-          Button(role: .destructive) { showDeleteConfirmation = true } label: { Image(systemName: "trash") }
-            .disabled(selectedIDs.isEmpty || isDeleting)
           Button("全选") {
             let matched = NativeSyncCacheStore.shared.matchedServerIDs
             let serverById = Dictionary(serverAssetsToDisplay.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
@@ -1755,6 +1756,45 @@ private struct NativeAlbumDetail: View {
           }
         }
       }
+    }
+    .safeAreaInset(edge: .bottom, spacing: 0) {
+      if isSelecting {
+        HStack {
+          Button {
+            triggerBatchShare()
+          } label: {
+            if isPreparingBatchShare {
+              ProgressView()
+                .scaleEffect(0.85)
+                .frame(width: 28, height: 28)
+            } else {
+              Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 21, weight: .regular))
+            }
+          }
+          .disabled(selectedIDs.isEmpty || isPreparingBatchShare)
+
+          Spacer()
+
+          Button(role: .destructive) {
+            showDeleteConfirmation = true
+          } label: {
+            Image(systemName: "trash")
+              .font(.system(size: 21, weight: .regular))
+              .foregroundColor(selectedIDs.isEmpty || isDeleting ? .secondary : .red)
+          }
+          .disabled(selectedIDs.isEmpty || isDeleting)
+        }
+        .padding(.horizontal, 24)
+        .padding(.vertical, 10)
+        .background(.ultraThinMaterial)
+      }
+    }
+    .sheet(item: Binding<NativeSharePayload?>(
+      get: { batchShareItems.map { NativeSharePayload(contents: $0) } },
+      set: { if $0 == nil { batchShareItems = nil } }
+    )) { payload in
+      NativeActivityView(activityItems: payload.content)
     }
     .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
       if selectedHasBothCopies {
@@ -1813,6 +1853,23 @@ private struct NativeAlbumDetail: View {
       deletionError = "可能已有部分照片删除成功，请刷新确认。\(error.localizedDescription)"
       device.refresh()
       if let id = entry.server?.id { await model.load(albumId: id, reset: true) }
+    }
+  }
+
+  private func triggerBatchShare() {
+    guard !isPreparingBatchShare else { return }
+    let targets = selectedTargets
+    guard !targets.isEmpty else { return }
+    isPreparingBatchShare = true
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    Task {
+      let contents = await nativePrepareBatchShare(items: targets, client: client)
+      await MainActor.run {
+        isPreparingBatchShare = false
+        if !contents.isEmpty {
+          batchShareItems = contents
+        }
+      }
     }
   }
 }

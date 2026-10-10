@@ -809,6 +809,8 @@ struct NativePhotosView: View {
   @State private var showDeleteConfirmation = false
   @State private var deletionError: String?
   @State private var isDeleting = false
+  @State private var batchShareItems: [Any]? = nil
+  @State private var isPreparingBatchShare = false
   @State private var isRefreshing = false
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
@@ -866,10 +868,6 @@ struct NativePhotosView: View {
   @ViewBuilder
   private var trailingToolbarContent: some View {
     if isSelecting {
-      Button(role: .destructive) { showDeleteConfirmation = true } label: {
-        Image(systemName: "trash")
-      }
-      .disabled(selectedIDs.isEmpty || isDeleting)
       Button("全选") {
         selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
       }
@@ -1200,20 +1198,52 @@ struct NativePhotosView: View {
           if hasInitialScrolled { scrollToBottom(proxy: proxy, animated: true) }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-          if !device.authorized {
-            Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
-          }
-          if let message = cloud.message {
-            HStack(spacing: 8) {
-              Text(message).font(.caption).lineLimit(3)
-              Spacer(minLength: 4)
-              Button("重试核验") { Task { await cloud.retry(device.assets, client: client) } }
-                .font(.caption).fixedSize()
+          if isSelecting {
+            HStack {
+              Button {
+                triggerBatchShare()
+              } label: {
+                if isPreparingBatchShare {
+                  ProgressView()
+                    .scaleEffect(0.85)
+                    .frame(width: 28, height: 28)
+                } else {
+                  Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 21, weight: .regular))
+                }
+              }
+              .disabled(selectedIDs.isEmpty || isPreparingBatchShare)
+
+              Spacer()
+
+              Button(role: .destructive) {
+                showDeleteConfirmation = true
+              } label: {
+                Image(systemName: "trash")
+                  .font(.system(size: 21, weight: .regular))
+                  .foregroundColor(selectedIDs.isEmpty || isDeleting ? .secondary : .red)
+              }
+              .disabled(selectedIDs.isEmpty || isDeleting)
             }
-            .padding(6)
-          }
-          if let message = model.error {
-            HStack { Text(message).font(.caption).lineLimit(2); Button("重试") { Task { await model.retry() } } }.padding(6)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 10)
+            .background(.ultraThinMaterial)
+          } else {
+            if !device.authorized {
+              Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
+            }
+            if let message = cloud.message {
+              HStack(spacing: 8) {
+                Text(message).font(.caption).lineLimit(3)
+                Spacer(minLength: 4)
+                Button("重试核验") { Task { await cloud.retry(device.assets, client: client) } }
+                  .font(.caption).fixedSize()
+              }
+              .padding(6)
+            }
+            if let message = model.error {
+              HStack { Text(message).font(.caption).lineLimit(2); Button("重试") { Task { await model.retry() } } }.padding(6)
+            }
           }
         }
         .navigationTitle("照片")
@@ -1273,6 +1303,12 @@ struct NativePhotosView: View {
         .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
           Button("确定", role: .cancel) { deletionError = nil }
         } message: { Text(deletionError ?? "未知错误") }
+        .sheet(item: Binding<NativeSharePayload?>(
+          get: { batchShareItems.map { NativeSharePayload(contents: $0) } },
+          set: { if $0 == nil { batchShareItems = nil } }
+        )) { payload in
+          NativeActivityView(activityItems: payload.content)
+        }
         .sheet(isPresented: $showServerSettings) {
           NativeServerSettingsSheet(client: client, onLogout: onLogout)
         }
@@ -1325,6 +1361,23 @@ struct NativePhotosView: View {
       device.refresh()
       await model.loadInitial()
       rebuildDayGroups()
+    }
+  }
+
+  private func triggerBatchShare() {
+    guard !isPreparingBatchShare else { return }
+    let targets = cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
+    guard !targets.isEmpty else { return }
+    isPreparingBatchShare = true
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    Task {
+      let contents = await nativePrepareBatchShare(items: targets, client: client)
+      await MainActor.run {
+        isPreparingBatchShare = false
+        if !contents.isEmpty {
+          batchShareItems = contents
+        }
+      }
     }
   }
 
@@ -2028,8 +2081,9 @@ struct NativeUnifiedGalleryViewer: View {
       get: { shareItem.map { NativeSharePayload(content: $0) } },
       set: { if $0 == nil { shareItem = nil } }
     )) { payload in
-      NativeActivityView(activityItems: [payload.content])
+      NativeActivityView(activityItems: payload.content)
     }
+    .statusBarHidden(true)
   }
 
   private func performDeleteItem(scope: NativeDeleteTargetScope) {
@@ -2098,12 +2152,24 @@ struct NativeUnifiedGalleryViewer: View {
   }
 }
 
-private struct NativeSharePayload: Identifiable {
+struct NativeSharePayload: Identifiable {
   let id = UUID()
-  let content: Any
+  let content: [Any]
+
+  init(content: Any) {
+    if let array = content as? [Any] {
+      self.content = array
+    } else {
+      self.content = [content]
+    }
+  }
+
+  init(contents: [Any]) {
+    self.content = contents
+  }
 }
 
-private struct NativeActivityView: UIViewControllerRepresentable {
+struct NativeActivityView: UIViewControllerRepresentable {
   let activityItems: [Any]
 
   func makeUIViewController(context: Context) -> UIActivityViewController {
@@ -2111,6 +2177,62 @@ private struct NativeActivityView: UIViewControllerRepresentable {
   }
 
   func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+
+@MainActor
+func nativePrepareBatchShare(items: [NativeGridItem], client: NativeImmichClient) async -> [Any] {
+  let targets = Array(items.prefix(30))
+  return await withTaskGroup(of: Any?.self) { group in
+    for item in targets {
+      group.addTask {
+        if let local = item.local {
+          guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return nil }
+          if local.isVideo {
+            let options = PHVideoRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .highQualityFormat
+            return await withCheckedContinuation { (continuation: CheckedContinuation<Any?, Never>) in
+              PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
+                if let urlAsset = avAsset as? AVURLAsset {
+                  continuation.resume(returning: urlAsset.url)
+                } else {
+                  continuation.resume(returning: nil)
+                }
+              }
+            }
+          } else {
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .highQualityFormat
+            return await withCheckedContinuation { (continuation: CheckedContinuation<Any?, Never>) in
+              PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 2560, height: 2560), contentMode: .aspectFit, options: options) { img, _ in
+                continuation.resume(returning: img)
+              }
+            }
+          }
+        } else if let server = item.server {
+          if let url = client.originalURL(for: server) {
+            if server.isImage {
+              if let data = try? await client.imageData(for: url), let img = UIImage(data: data) {
+                return img
+              }
+            } else {
+              return url
+            }
+          }
+          return nil
+        }
+        return nil
+      }
+    }
+    var results: [Any] = []
+    for await res in group {
+      if let res {
+        results.append(res)
+      }
+    }
+    return results
+  }
 }
 
 private struct NativeSingleAssetPage: View {

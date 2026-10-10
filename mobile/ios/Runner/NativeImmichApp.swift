@@ -222,7 +222,7 @@ final class NativeImmichClient {
     self.session = session
   }
 
-  static func normalize(_ raw: String) -> String {
+  nonisolated static func normalize(_ raw: String) -> String {
     var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
     if !value.hasPrefix("http://") && !value.hasPrefix("https://") { value = "https://" + value }
     while value.hasSuffix("/") { value.removeLast() }
@@ -466,13 +466,13 @@ final class NativeImmichClient {
     return f
   }()
 
-  static func parseISODate(_ value: String) -> Date? {
+  nonisolated static func parseISODate(_ value: String) -> Date? {
     if let d = isoFormatterWithFractional.date(from: value) { return d }
     if let d = isoFormatterStandard.date(from: value) { return d }
     return parseDate(value)
   }
 
-  static func formatChineseDate(_ date: Date, includeDay: Bool = true) -> String {
+  nonisolated static func formatChineseDate(_ date: Date, includeDay: Bool = true) -> String {
     let calendar = Calendar.current
     let currentYear = calendar.component(.year, from: Date())
     let year = calendar.component(.year, from: date)

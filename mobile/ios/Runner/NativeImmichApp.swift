@@ -402,12 +402,12 @@ final class NativeImmichClient {
     try await send(path: "assets/\(id)", method: "GET")
   }
 
-  func originalURL(for asset: NativeAsset) -> URL? {
+  nonisolated func originalURL(for asset: NativeAsset) -> URL? {
     let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
     return URL(string: base + "/assets/\(asset.id)/original")
   }
 
-  func thumbnailURL(for asset: NativeAsset, size: String = "preview") -> URL? {
+  nonisolated func thumbnailURL(for asset: NativeAsset, size: String = "preview") -> URL? {
     let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
     var components = URLComponents(string: base + "/assets/\(asset.id)/thumbnail")
     components?.queryItems = [URLQueryItem(name: "size", value: size)]
@@ -2181,58 +2181,46 @@ struct NativeActivityView: UIViewControllerRepresentable {
 
 @MainActor
 func nativePrepareBatchShare(items: [NativeGridItem], client: NativeImmichClient) async -> [Any] {
-  let targets = Array(items.prefix(30))
-  return await withTaskGroup(of: Any?.self) { group in
-    for item in targets {
-      group.addTask {
-        if let local = item.local {
-          guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return nil }
-          if local.isVideo {
-            let options = PHVideoRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .highQualityFormat
-            return await withCheckedContinuation { (continuation: CheckedContinuation<Any?, Never>) in
-              PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
-                if let urlAsset = avAsset as? AVURLAsset {
-                  continuation.resume(returning: urlAsset.url)
-                } else {
-                  continuation.resume(returning: nil)
-                }
-              }
-            }
-          } else {
-            let options = PHImageRequestOptions()
-            options.isNetworkAccessAllowed = true
-            options.deliveryMode = .highQualityFormat
-            return await withCheckedContinuation { (continuation: CheckedContinuation<Any?, Never>) in
-              PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 2560, height: 2560), contentMode: .aspectFit, options: options) { img, _ in
-                continuation.resume(returning: img)
-              }
-            }
+  var results: [Any] = []
+  for item in items.prefix(30) {
+    if let local = item.local {
+      guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { continue }
+      if local.isVideo {
+        let options = PHVideoRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .highQualityFormat
+        if let url = await withCheckedContinuation({ (continuation: CheckedContinuation<URL?, Never>) in
+          PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
+            continuation.resume(returning: (avAsset as? AVURLAsset)?.url)
           }
-        } else if let server = item.server {
-          if let url = client.originalURL(for: server) {
-            if server.isImage {
-              if let data = try? await client.imageData(for: url), let img = UIImage(data: data) {
-                return img
-              }
-            } else {
-              return url
-            }
-          }
-          return nil
+        }) {
+          results.append(url)
         }
-        return nil
+      } else {
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .highQualityFormat
+        if let img = await withCheckedContinuation({ (continuation: CheckedContinuation<UIImage?, Never>) in
+          PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 2560, height: 2560), contentMode: .aspectFit, options: options) { img, _ in
+            continuation.resume(returning: img)
+          }
+        }) {
+          results.append(img)
+        }
+      }
+    } else if let server = item.server {
+      if let url = client.originalURL(for: server) {
+        if server.isImage {
+          if let data = try? await client.imageData(for: url), let img = UIImage(data: data) {
+            results.append(img)
+          }
+        } else {
+          results.append(url)
+        }
       }
     }
-    var results: [Any] = []
-    for await res in group {
-      if let res {
-        results.append(res)
-      }
-    }
-    return results
   }
+  return results
 }
 
 private struct NativeSingleAssetPage: View {

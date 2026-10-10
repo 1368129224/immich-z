@@ -7,23 +7,44 @@ import UIKit
 // The complete Flutter app remains available for features not yet ported.
 
 @MainActor
-final class NativeDeviceLibrary: ObservableObject {
+final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
   @Published private(set) var authorized = false
   @Published private(set) var assets: [NativeDeviceAsset] = []
   @Published private(set) var albums: [NativeDeviceAlbum] = []
   @Published private(set) var isLoading = false
   private var refreshGeneration = 0
+  private var isObserving = false
 
-  init() { refresh() }
+  override init() {
+    super.init()
+    refresh()
+  }
+
+  nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
+    Task { @MainActor [weak self] in
+      self?.refresh()
+    }
+  }
 
   func requestAccess() async {
     let status = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
     if status == .authorized || status == .limited { refresh() }
   }
 
+  func refreshAndWait() async {
+    refresh()
+    while isLoading {
+      try? await Task.sleep(nanoseconds: 50_000_000)
+    }
+  }
+
   func refresh() {
     let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
     authorized = status == .authorized || status == .limited
+    if authorized && !isObserving {
+      PHPhotoLibrary.shared().register(self)
+      isObserving = true
+    }
     guard authorized else {
       assets = []
       albums = []
@@ -260,7 +281,9 @@ struct NativeDeviceGrid: View {
     ScrollViewReader { proxy in
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 4) {
-          let groups = Dictionary(grouping: assets) { Calendar.current.startOfDay(for: $0.date) }
+          var calendar = Calendar.autoupdatingCurrent
+          calendar.timeZone = .autoupdatingCurrent
+          let groups = Dictionary(grouping: assets) { calendar.startOfDay(for: $0.date) }
           ForEach(groups.keys.sorted(), id: \.self) { day in
             VStack(alignment: .leading, spacing: 2) {
               Text(NativeImmichClient.formatChineseDate(day)).font(.headline).padding(.horizontal)
@@ -432,9 +455,7 @@ extension NativeImmichClient {
   private static func decodeAsset(_ item: [String: Any]) -> NativeAsset? {
     guard let id = item["id"] as? String else { return nil }
     let dateText = (item["localDateTime"] as? String) ?? (item["fileCreatedAt"] as? String) ?? ""
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    let date = formatter.date(from: dateText) ?? ISO8601DateFormatter().date(from: dateText) ?? .distantPast
+    let date = NativeImmichClient.parseISODate(dateText) ?? .distantPast
     return NativeAsset(id: id, date: date, isImage: (item["type"] as? String) != "VIDEO", isFavorite: item["isFavorite"] as? Bool ?? false, thumbhash: item["thumbhash"] as? String, livePhotoVideoId: item["livePhotoVideoId"] as? String)
   }
 
@@ -598,7 +619,9 @@ struct NativeResultGrid: View {
   var body: some View {
     ScrollView {
       LazyVStack(spacing: 4) {
-        let groups = Dictionary(grouping: merged) { Calendar.current.startOfDay(for: $0.date) }
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = .autoupdatingCurrent
+        let groups = Dictionary(grouping: merged) { calendar.startOfDay(for: $0.date) }
         ForEach(groups.keys.sorted(by: >), id: \.self) { day in
           VStack(alignment: .leading, spacing: 2) {
             Text(NativeImmichClient.formatChineseDate(day)).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
@@ -672,6 +695,22 @@ struct NativeResultGrid: View {
                     startDragSelectionInSelectMode(startingWith: entry.id)
                   }
                 }
+                .simultaneousGesture(
+                  DragGesture(minimumDistance: 4, coordinateSpace: .named("resultGridScrollSpace"))
+                    .onChanged { drag in
+                      guard isSelecting, !isMagnifying else { return }
+                      if !isDragSelecting {
+                        guard let hitID = itemBounds.first(where: { $0.value.contains(drag.startLocation) })?.key else { return }
+                        isDragSelecting = true
+                        startDragSelectionInSelectMode(startingWith: hitID, at: drag.startLocation)
+                      }
+                      handle2DDragSelection(at: drag.location)
+                    }
+                    .onEnded { _ in
+                      isDragSelecting = false
+                      finishDragSelection()
+                    }
+                )
                 .id(entry.id)
               }
             }
@@ -1347,6 +1386,22 @@ private struct NativeAlbumsView: View {
                   startDragSelectionInAlbumMode(startingWith: entry.id)
                 }
               }
+              .simultaneousGesture(
+                DragGesture(minimumDistance: 4, coordinateSpace: .named("albumsScrollSpace"))
+                  .onChanged { drag in
+                    guard isSelecting else { return }
+                    if !isDragSelecting {
+                      guard let hitID = itemBounds.first(where: { $0.value.contains(drag.startLocation) })?.key else { return }
+                      isDragSelecting = true
+                      startDragSelectionInAlbumMode(startingWith: hitID, at: drag.startLocation)
+                    }
+                    handle2DDragSelection(at: drag.location)
+                  }
+                  .onEnded { _ in
+                    isDragSelecting = false
+                    finishDragSelection()
+                  }
+              )
               .id(entry.id)
             }
           }

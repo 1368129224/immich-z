@@ -354,7 +354,7 @@ final class NativeImmichClient {
     return ids.enumerated().compactMap { index, rawID in
       guard let id = rawID as? String else { return nil }
       let dateString = (dates[safe: index] as? String) ?? (created[safe: index] as? String) ?? bucket.id
-      let date = Self.parseISODate(dateString) ?? .distantPast
+      let date = Self.parseISODate(dateString) ?? Self.parseISODate(bucket.id) ?? .distantPast
       return NativeAsset(
         id: id,
         date: date,
@@ -455,6 +455,11 @@ final class NativeImmichClient {
   }
 
   nonisolated static func parseISODate(_ value: String) -> Date? {
+    // Immich metadata normally carries an explicit offset. Some compatible
+    // servers send wall-clock timestamps without one; interpret those in the
+    // current app/device timezone instead of silently treating them as UTC.
+    let hasExplicitZone = value.range(of: #"(?:Z|[+-]\d{2}:?\d{2})$"#, options: .regularExpression) != nil
+    if !hasExplicitZone { return parseDate(value) }
     let f1 = ISO8601DateFormatter()
     f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     if let d = f1.date(from: value) { return d }
@@ -465,7 +470,8 @@ final class NativeImmichClient {
   }
 
   nonisolated static func formatChineseDate(_ date: Date, includeDay: Bool = true) -> String {
-    let calendar = Calendar.current
+    var calendar = Calendar.autoupdatingCurrent
+    calendar.timeZone = .autoupdatingCurrent
     let currentYear = calendar.component(.year, from: Date())
     let year = calendar.component(.year, from: date)
     let month = calendar.component(.month, from: date)
@@ -488,7 +494,9 @@ final class NativeImmichClient {
   nonisolated private static func parseDate(_ value: String) -> Date? {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
-    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    // Naive timestamps from compatible Immich servers represent wall-clock
+    // time in the device/app timezone; explicit offsets remain authoritative.
+    formatter.timeZone = .autoupdatingCurrent
     for format in [
       "yyyy-MM-dd'T'HH:mm:ss.SSSSSSXXXXX",
       "yyyy-MM-dd'T'HH:mm:ss.SSSSSS",
@@ -719,6 +727,38 @@ private final class NativeTimelineModel: ObservableObject {
     }
   }
 
+  func refreshLatest() async {
+    guard !isLoading else { return }
+    isLoading = true
+    defer { isLoading = false }
+    do {
+      if searchFallbackEnabled {
+        let page = try await client.searchPage(cursor: nil, filter: ["visibility": ["eq": "timeline"]])
+        var seen = Set<String>()
+        assets = (page.assets + assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
+        searchCursor = page.next
+        hasOlder = page.next != nil
+      } else {
+        let refreshedBuckets = try await client.timelineBuckets()
+        var incoming = [NativeAsset]()
+        for bucket in refreshedBuckets.prefix(pageSize) {
+          do { incoming.append(contentsOf: try await client.assets(in: bucket)) }
+          catch { continue }
+        }
+        var seen = Set<String>()
+        assets = (incoming + assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
+        buckets = refreshedBuckets
+        nextBucket = min(pageSize, buckets.count)
+        hasOlder = nextBucket < buckets.count
+      }
+      error = nil
+    } catch {
+      // Keep the already loaded timeline visible if foreground refresh fails.
+      error = error.localizedDescription
+    }
+  }
+
+
   func loadOlder() async {
     guard !isLoading, hasOlder else { return }
     isLoading = true
@@ -793,6 +833,8 @@ struct NativePhotosView: View {
   @State private var itemBounds: [String: CGRect] = [:]
   @State private var hasInitialScrolled = false
   @State private var initialRemoteLoaded = false
+  @State private var lastForegroundRefreshTime: Date = .distantPast
+  @State private var needsForegroundRefresh = false
   @State private var didInitialPosition = false
   @State private var initialScrollVisible = false
   @State private var loadingOlderAnchor: String?
@@ -926,7 +968,8 @@ struct NativePhotosView: View {
   private var firstGroupDatesInMonth: Set<Date> {
     var seenYearMonths = Set<Int>()
     var result = Set<Date>()
-    let calendar = Calendar.current
+    var calendar = Calendar.autoupdatingCurrent
+    calendar.timeZone = .autoupdatingCurrent
     for group in cachedDayGroups {
       let year = calendar.component(.year, from: group.date)
       let month = calendar.component(.month, from: group.date)
@@ -1075,32 +1118,15 @@ struct NativePhotosView: View {
           itemBounds = frames
         }
         .simultaneousGesture(
-          LongPressGesture(minimumDuration: 0.28, maximumDistance: 15)
-            .sequenced(before: DragGesture(coordinateSpace: .named("photosScrollSpace")))
-            .onChanged { value in
-              guard !isMagnifying else { return }
-              switch value {
-              case .first:
-                break
-              case .second(true, let drag):
-                if !isDragSelecting {
-                  isDragSelecting = true
-                  let loc = drag?.startLocation ?? drag?.location
-                  if let loc = loc,
-                     let hitID = itemBounds.first(where: { $0.value.contains(loc) })?.key {
-                    if !isSelecting {
-                      enterSelection(startingWith: hitID, at: loc)
-                    } else {
-                      startDragSelectionInSelectMode(startingWith: hitID, at: loc)
-                    }
-                  }
-                }
-                if let drag = drag {
-                  handle2DDragSelection(at: drag.location)
-                }
-              default:
-                break
+          DragGesture(minimumDistance: 4, coordinateSpace: .named("photosScrollSpace"))
+            .onChanged { drag in
+              guard isSelecting, !isMagnifying else { return }
+              if !isDragSelecting {
+                guard let hitID = itemBounds.first(where: { $0.value.contains(drag.startLocation) })?.key else { return }
+                isDragSelecting = true
+                startDragSelectionInSelectMode(startingWith: hitID, at: drag.startLocation)
               }
+              handle2DDragSelection(at: drag.location)
             }
             .onEnded { _ in
               isDragSelecting = false
@@ -1161,6 +1187,11 @@ struct NativePhotosView: View {
           Task { await cloud.check(device.assets, client: client) }
           positionInitiallyIfReady(proxy: proxy)
         }
+        .onChange(of: device.isLoading) { loading in
+          guard !loading, initialRemoteLoaded, !isSelecting else { return }
+          rebuildDayGroups()
+          scrollToBottom(proxy: proxy, animated: false)
+        }
         .onAppear {
           rebuildDayGroups()
           if model.assets.isEmpty && !model.isLoading {
@@ -1188,6 +1219,24 @@ struct NativePhotosView: View {
           guard now.timeIntervalSince(lastScrollToBottomTime) > 0.25 else { return }
           lastScrollToBottomTime = now
           if hasInitialScrolled { scrollToBottom(proxy: proxy, animated: true) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+          needsForegroundRefresh = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+          guard needsForegroundRefresh, !isSelecting else { return }
+          needsForegroundRefresh = false
+          let now = Date()
+          guard now.timeIntervalSince(lastForegroundRefreshTime) > 2 else { return }
+          lastForegroundRefreshTime = now
+          Task {
+            await device.refreshAndWait()
+            if !model.isLoading { await model.refreshLatest() }
+            rebuildDayGroups()
+            initialRemoteLoaded = true
+            await cloud.check(device.assets, client: client)
+            scrollToBottom(proxy: proxy, animated: false)
+          }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
           if isSelecting {
@@ -1411,7 +1460,8 @@ struct NativePhotosView: View {
         }
       }
     } else {
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+      DispatchQueue.main.async {
+        guard hasInitialScrolled, didInitialPosition else { return }
         if animated {
           withAnimation(.easeInOut(duration: 0.25)) {
             proxy.scrollTo(bottomAnchor, anchor: .bottom)
@@ -1471,8 +1521,10 @@ struct NativePhotosView: View {
       return lhs.date < rhs.date
     }
     var grouped: [Date: [NativeGridItem]] = [:]
+    var calendar = Calendar.autoupdatingCurrent
+    calendar.timeZone = .autoupdatingCurrent
     for item in merged {
-      let date = Calendar.current.startOfDay(for: item.date)
+      let date = calendar.startOfDay(for: item.date)
       grouped[date, default: []].append(item)
     }
     cachedDayGroups = grouped.keys.sorted().map { date in

@@ -454,21 +454,13 @@ final class NativeImmichClient {
     }
   }
 
-  private static let isoFormatterWithFractional: ISO8601DateFormatter = {
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return f
-  }()
-
-  private static let isoFormatterStandard: ISO8601DateFormatter = {
-    let f = ISO8601DateFormatter()
-    f.formatOptions = [.withInternetDateTime]
-    return f
-  }()
-
   nonisolated static func parseISODate(_ value: String) -> Date? {
-    if let d = isoFormatterWithFractional.date(from: value) { return d }
-    if let d = isoFormatterStandard.date(from: value) { return d }
+    let f1 = ISO8601DateFormatter()
+    f1.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f1.date(from: value) { return d }
+    let f2 = ISO8601DateFormatter()
+    f2.formatOptions = [.withInternetDateTime]
+    if let d = f2.date(from: value) { return d }
     return parseDate(value)
   }
 
@@ -493,7 +485,7 @@ final class NativeImmichClient {
     }
   }
 
-  private static func parseDate(_ value: String) -> Date? {
+  nonisolated private static func parseDate(_ value: String) -> Date? {
     let formatter = DateFormatter()
     formatter.locale = Locale(identifier: "en_US_POSIX")
     formatter.timeZone = TimeZone(secondsFromGMT: 0)

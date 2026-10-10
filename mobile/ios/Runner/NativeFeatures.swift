@@ -277,13 +277,17 @@ struct NativeDeviceGrid: View {
   @State private var positioned = false
   private let bottom = "device-bottom"
 
+  private var deviceAssetGroups: [Date: [NativeDeviceAsset]] {
+    var calendar = Calendar.autoupdatingCurrent
+    calendar.timeZone = .autoupdatingCurrent
+    return Dictionary(grouping: assets) { calendar.startOfDay(for: $0.date) }
+  }
+
   var body: some View {
     ScrollViewReader { proxy in
       ScrollView {
         LazyVStack(alignment: .leading, spacing: 4) {
-          var calendar = Calendar.autoupdatingCurrent
-          calendar.timeZone = .autoupdatingCurrent
-          let groups = Dictionary(grouping: assets) { calendar.startOfDay(for: $0.date) }
+          let groups = deviceAssetGroups
           ForEach(groups.keys.sorted(), id: \.self) { day in
             VStack(alignment: .leading, spacing: 2) {
               Text(NativeImmichClient.formatChineseDate(day)).font(.headline).padding(.horizontal)
@@ -616,18 +620,21 @@ struct NativeResultGrid: View {
     return items.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
   }
 
+  private var mergedGroups: [Date: [NativeGridItem]] {
+    var calendar = Calendar.autoupdatingCurrent
+    calendar.timeZone = .autoupdatingCurrent
+    return Dictionary(grouping: merged) { calendar.startOfDay(for: $0.date) }
+  }
+
   var body: some View {
     ScrollView {
       LazyVStack(spacing: 4) {
-        var calendar = Calendar.autoupdatingCurrent
-        calendar.timeZone = .autoupdatingCurrent
-        let groups = Dictionary(grouping: merged) { calendar.startOfDay(for: $0.date) }
-        ForEach(groups.keys.sorted(by: >), id: \.self) { day in
+        ForEach(mergedGroups.keys.sorted(by: >), id: \.self) { day in
           VStack(alignment: .leading, spacing: 2) {
             Text(NativeImmichClient.formatChineseDate(day)).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
             let gridSpacing: CGFloat = columns > 7 ? 1 : 2
             LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
-              ForEach(groups[day] ?? []) { entry in
+              ForEach(mergedGroups[day] ?? []) { entry in
                 ZStack(alignment: .topTrailing) {
                   Color.clear
                     .aspectRatio(1, contentMode: .fit)

@@ -754,7 +754,7 @@ private final class NativeTimelineModel: ObservableObject {
       error = nil
     } catch {
       // Keep the already loaded timeline visible if foreground refresh fails.
-      error = error.localizedDescription
+      self.error = error.localizedDescription
     }
   }
 

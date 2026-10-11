@@ -825,6 +825,7 @@ struct NativePhotosView: View {
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
   @State private var isDragSelecting = false
+  @State private var dragSelectionIntent: NativeDragSelectionIntent = .undecided
   @State private var isMagnifying = false
   @State private var dragInitialSelectedIDs: Set<String> = []
   @State private var dragSelectMode: Bool = true // true = selecting, false = deselecting
@@ -1121,6 +1122,11 @@ struct NativePhotosView: View {
           DragGesture(minimumDistance: 4, coordinateSpace: .named("photosScrollSpace"))
             .onChanged { drag in
               guard isSelecting, !isMagnifying else { return }
+              if dragSelectionIntent == .undecided {
+                let intent = nativeDragSelectionIntent(for: drag.translation)
+                if intent != .undecided { dragSelectionIntent = intent }
+              }
+              guard dragSelectionIntent == .select else { return }
               if !isDragSelecting {
                 guard let hitID = itemBounds.first(where: { $0.value.contains(drag.startLocation) })?.key else { return }
                 isDragSelecting = true
@@ -1130,6 +1136,7 @@ struct NativePhotosView: View {
             }
             .onEnded { _ in
               isDragSelecting = false
+              dragSelectionIntent = .undecided
               finishDragSelection()
             }
         )

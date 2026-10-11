@@ -6,6 +6,19 @@ import UIKit
 // First native vertical slice against the official Immich v3.2.4 OpenAPI.
 // The complete Flutter app remains available for features not yet ported.
 
+enum NativeDragSelectionIntent: Equatable {
+  case undecided
+  case select
+  case scroll
+}
+
+func nativeDragSelectionIntent(for translation: CGSize) -> NativeDragSelectionIntent {
+  let horizontal = abs(translation.width)
+  let vertical = abs(translation.height)
+  guard max(horizontal, vertical) >= 10 else { return .undecided }
+  return horizontal >= vertical * 0.5 ? .select : .scroll
+}
+
 @MainActor
 final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
   @Published private(set) var authorized = false
@@ -540,6 +553,8 @@ struct NativeResultGrid: View {
   @State private var internalSelectedIDs: Set<String> = []
 
   @State private var isDragSelecting = false
+  @State private var dragSelectionIntent: NativeDragSelectionIntent = .undecided
+  @State private var longPressDragIntent: NativeDragSelectionIntent = .undecided
   @State private var isMagnifying = false
   @State private var columns: Int = 4
   @State private var gestureBaseColumns: Int? = nil
@@ -706,6 +721,11 @@ struct NativeResultGrid: View {
                   DragGesture(minimumDistance: 4, coordinateSpace: .named("resultGridScrollSpace"))
                     .onChanged { drag in
                       guard isSelecting, !isMagnifying else { return }
+                      if dragSelectionIntent == .undecided {
+                        let intent = nativeDragSelectionIntent(for: drag.translation)
+                        if intent != .undecided { dragSelectionIntent = intent }
+                      }
+                      guard dragSelectionIntent == .select else { return }
                       if !isDragSelecting {
                         guard let hitID = itemBounds.first(where: { $0.value.contains(drag.startLocation) })?.key else { return }
                         isDragSelecting = true
@@ -715,6 +735,7 @@ struct NativeResultGrid: View {
                     }
                     .onEnded { _ in
                       isDragSelecting = false
+                      dragSelectionIntent = .undecided
                       finishDragSelection()
                     }
                 )
@@ -743,6 +764,11 @@ struct NativeResultGrid: View {
           case .first:
             break
           case .second(true, let drag):
+            if let drag = drag, longPressDragIntent == .undecided {
+              let intent = nativeDragSelectionIntent(for: drag.translation)
+              if intent != .undecided { longPressDragIntent = intent }
+            }
+            guard longPressDragIntent == .select else { break }
             if !isDragSelecting {
               isDragSelecting = true
               let loc = drag?.startLocation ?? drag?.location
@@ -764,6 +790,7 @@ struct NativeResultGrid: View {
         }
         .onEnded { _ in
           isDragSelecting = false
+          longPressDragIntent = .undecided
           finishDragSelection()
         }
     )
@@ -1286,6 +1313,8 @@ private struct NativeAlbumsView: View {
 
   @State private var isSelecting = false
   @State private var isDragSelecting = false
+  @State private var dragSelectionIntent: NativeDragSelectionIntent = .undecided
+  @State private var longPressDragIntent: NativeDragSelectionIntent = .undecided
   @State private var selectedAlbumIDs: Set<String> = []
   @State private var itemBounds: [String: CGRect] = [:]
   @State private var dragStartLocation: CGPoint? = nil
@@ -1397,6 +1426,11 @@ private struct NativeAlbumsView: View {
                 DragGesture(minimumDistance: 4, coordinateSpace: .named("albumsScrollSpace"))
                   .onChanged { drag in
                     guard isSelecting else { return }
+                    if dragSelectionIntent == .undecided {
+                      let intent = nativeDragSelectionIntent(for: drag.translation)
+                      if intent != .undecided { dragSelectionIntent = intent }
+                    }
+                    guard dragSelectionIntent == .select else { return }
                     if !isDragSelecting {
                       guard let hitID = itemBounds.first(where: { $0.value.contains(drag.startLocation) })?.key else { return }
                       isDragSelecting = true
@@ -1406,6 +1440,7 @@ private struct NativeAlbumsView: View {
                   }
                   .onEnded { _ in
                     isDragSelecting = false
+                    dragSelectionIntent = .undecided
                     finishDragSelection()
                   }
               )
@@ -1430,6 +1465,11 @@ private struct NativeAlbumsView: View {
             case .first:
               break
             case .second(true, let drag):
+              if let drag = drag, longPressDragIntent == .undecided {
+                let intent = nativeDragSelectionIntent(for: drag.translation)
+                if intent != .undecided { longPressDragIntent = intent }
+              }
+              guard longPressDragIntent == .select else { break }
               if !isDragSelecting {
                 isDragSelecting = true
                 let loc = drag?.startLocation ?? drag?.location
@@ -1449,10 +1489,11 @@ private struct NativeAlbumsView: View {
               break
             }
           }
-          .onEnded { _ in
-            isDragSelecting = false
-            finishDragSelection()
-          }
+        .onEnded { _ in
+          isDragSelecting = false
+          longPressDragIntent = .undecided
+          finishDragSelection()
+        }
       )
       .navigationTitle("")
       .navigationBarTitleDisplayMode(.inline)

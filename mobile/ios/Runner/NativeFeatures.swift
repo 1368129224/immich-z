@@ -399,6 +399,30 @@ struct NativeServerAlbum: Identifiable {
   let thumbnailAssetId: String?
 }
 
+func nativePhotosExcludedAlbumIDs(from rawValue: String) -> Set<String> {
+  guard let data = rawValue.data(using: .utf8),
+        let ids = try? JSONDecoder().decode([String].self, from: data) else { return [] }
+  return Set(ids)
+}
+
+func nativePhotosAlbumIDsString(_ ids: Set<String>) -> String {
+  guard let data = try? JSONEncoder().encode(ids.sorted()),
+        let value = String(data: data, encoding: .utf8) else { return "[]" }
+  return value
+}
+
+func nativePhotosHiddenLocalAssetIDs(
+  in albums: [NativeDeviceAlbum],
+  excludedAlbumIDs: Set<String>,
+  assetsForAlbum: (NativeDeviceAlbum) -> [NativeDeviceAsset]
+) -> Set<String> {
+  albums
+    .filter { excludedAlbumIDs.contains($0.id) }
+    .reduce(into: Set<String>()) { result, album in
+      result.formUnion(assetsForAlbum(album).map(\.id))
+    }
+}
+
 struct NativeSearchPage {
   let assets: [NativeAsset]
   let next: String?
@@ -483,6 +507,19 @@ extension NativeImmichClient {
       let thumbId = row["albumThumbnailAssetId"] as? String
       return NativeServerAlbum(id: id, name: name, count: row["assetCount"] as? Int ?? 0, thumbnailAssetId: thumbId)
     }
+  }
+
+  func assetIDs(inServerAlbum albumID: String) async throws -> Set<String> {
+    var assetIDs = Set<String>()
+    var cursor: String?
+    var visitedCursors = Set<String>()
+    while true {
+      let page = try await searchPage(albumId: albumID, cursor: cursor)
+      assetIDs.formUnion(page.assets.map(\.id))
+      guard let next = page.next, next != cursor, visitedCursors.insert(next).inserted else { break }
+      cursor = next
+    }
+    return assetIDs
   }
 }
 
@@ -1977,6 +2014,106 @@ private struct NativeAlbumDetail: View {
   }
 }
 
+private struct NativePhotosPageSettingsView: View {
+  let client: NativeImmichClient
+  @ObservedObject var device: NativeDeviceLibrary
+  @AppStorage("immichz_photos_excluded_local_album_ids") private var excludedLocalIDsRaw = "[]"
+  @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerIDsRaw = "[]"
+  @State private var serverAlbums: [NativeServerAlbum] = []
+  @State private var serverError: String?
+  @State private var isLoadingServerAlbums = false
+
+  private var excludedLocalIDs: Set<String> {
+    nativePhotosExcludedAlbumIDs(from: excludedLocalIDsRaw)
+  }
+
+  private var excludedServerIDs: Set<String> {
+    nativePhotosExcludedAlbumIDs(from: excludedServerIDsRaw)
+  }
+
+  var body: some View {
+    List {
+      Section {
+        Text("关闭相册开关后，该相册中的照片将从照片页隐藏；相册内照片若同时属于其他相册，也会一并隐藏。未归入相册的照片仍会显示。")
+          .font(.footnote)
+          .foregroundColor(.secondary)
+      }
+
+      Section("设备相册") {
+        if !device.authorized {
+          Button("允许访问设备相册") {
+            Task { await device.requestAccess() }
+          }
+        } else if device.albums.isEmpty {
+          Text("没有可配置的设备相册").foregroundColor(.secondary)
+        } else {
+          ForEach(device.albums) { album in
+            Toggle(isOn: Binding(
+              get: { !excludedLocalIDs.contains(album.id) },
+              set: { isShown in
+                var updated = excludedLocalIDs
+                if isShown { updated.remove(album.id) } else { updated.insert(album.id) }
+                excludedLocalIDsRaw = nativePhotosAlbumIDsString(updated)
+              }
+            )) {
+              HStack {
+                Text(album.name)
+                Spacer()
+                Text("\(album.count)").font(.caption).foregroundColor(.secondary)
+              }
+            }
+          }
+        }
+      }
+
+      Section("Immich 相册") {
+        if isLoadingServerAlbums {
+          ProgressView("正在加载相册…")
+        } else if let serverError {
+          VStack(alignment: .leading, spacing: 8) {
+            Text(serverError).font(.footnote).foregroundColor(.red)
+            Button("重试") { Task { await loadServerAlbums() } }
+          }
+        } else if serverAlbums.isEmpty {
+          Text("没有可配置的 Immich 相册").foregroundColor(.secondary)
+        } else {
+          ForEach(serverAlbums) { album in
+            Toggle(isOn: Binding(
+              get: { !excludedServerIDs.contains(album.id) },
+              set: { isShown in
+                var updated = excludedServerIDs
+                if isShown { updated.remove(album.id) } else { updated.insert(album.id) }
+                excludedServerIDsRaw = nativePhotosAlbumIDsString(updated)
+              }
+            )) {
+              HStack {
+                Text(album.name)
+                Spacer()
+                Text("\(album.count)").font(.caption).foregroundColor(.secondary)
+              }
+            }
+          }
+        }
+      }
+    }
+    .navigationTitle("照片页")
+    .navigationBarTitleDisplayMode(.inline)
+    .task { await loadServerAlbums() }
+  }
+
+  @MainActor
+  private func loadServerAlbums() async {
+    isLoadingServerAlbums = true
+    defer { isLoadingServerAlbums = false }
+    do {
+      serverAlbums = try await client.serverAlbums().sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+      serverError = nil
+    } catch {
+      serverError = "加载 Immich 相册失败：\(error.localizedDescription)"
+    }
+  }
+}
+
 private struct NativeLibraryView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
@@ -2022,6 +2159,9 @@ private struct NativeLibraryView: View {
       List {
         Section("相册偏好") {
           Toggle("合并本地和远端相册", isOn: $mergeAlbums)
+          NavigationLink("照片页") {
+            NativePhotosPageSettingsView(client: client, device: device)
+          }
         }
         Section("快捷入口") {
           NavigationLink("收藏") { NativeFilteredView(client: client, title: "收藏", filter: ["isFavorite": ["eq": true]]) }

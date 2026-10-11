@@ -821,6 +821,9 @@ struct NativePhotosView: View {
   @State private var columns: Int = 4
   @State private var gestureBaseColumns: Int? = nil
   @State private var cachedDayGroups: [NativeDayGroup] = []
+  @AppStorage("immichz_photos_excluded_local_album_ids") private var excludedLocalAlbumIDsRaw = "[]"
+  @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerAlbumIDsRaw = "[]"
+  @State private var excludedServerAssetIDs = Set<String>()
   @State private var activeViewerItem: NativeGridItem?
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
@@ -1194,6 +1197,14 @@ struct NativePhotosView: View {
           Task { await cloud.check(device.assets, client: client) }
           positionInitiallyIfReady(proxy: proxy)
         }
+        .onChange(of: excludedLocalAlbumIDsRaw) { _ in
+          rebuildDayGroups()
+          updateSelectionAfterTimelineChange()
+        }
+        .onChange(of: excludedServerAlbumIDsRaw) { _ in
+          refreshExcludedServerAssetIDs()
+          updateSelectionAfterTimelineChange()
+        }
         .onChange(of: device.isLoading) { loading in
           guard !loading, initialRemoteLoaded, !isSelecting else { return }
           rebuildDayGroups()
@@ -1201,6 +1212,7 @@ struct NativePhotosView: View {
         }
         .onAppear {
           rebuildDayGroups()
+          refreshExcludedServerAssetIDs()
           if model.assets.isEmpty && !model.isLoading {
             Task {
               await model.loadInitial()
@@ -1495,17 +1507,65 @@ struct NativePhotosView: View {
     }
   }
 
+  private func updateSelectionAfterTimelineChange() {
+    let visibleIDs = Set(cachedDayGroups.flatMap { $0.assets.map(\.id) })
+    selectedIDs.formIntersection(visibleIDs)
+    if selectedIDs.isEmpty { isSelecting = false }
+  }
+
+  private func refreshExcludedServerAssetIDs() {
+    let albumIDs = nativePhotosExcludedAlbumIDs(from: excludedServerAlbumIDsRaw)
+    guard !albumIDs.isEmpty else {
+      excludedServerAssetIDs = []
+      rebuildDayGroups()
+      updateSelectionAfterTimelineChange()
+      return
+    }
+    Task {
+      var excludedIDs = Set<String>()
+      do {
+        for albumID in albumIDs {
+          try Task.checkCancellation()
+          excludedIDs.formUnion(try await client.assetIDs(inServerAlbum: albumID))
+        }
+      } catch {
+        // Keep known exclusions rather than showing albums after a transient API error.
+        excludedIDs = excludedServerAssetIDs
+      }
+      guard albumIDs == nativePhotosExcludedAlbumIDs(from: excludedServerAlbumIDsRaw) else { return }
+      await MainActor.run {
+        excludedServerAssetIDs = excludedIDs
+        rebuildDayGroups()
+        updateSelectionAfterTimelineChange()
+      }
+    }
+  }
+
   private func rebuildDayGroups() {
     let matchedLocalToServer = cloud.matchedServerIDs
+    let excludedLocalAlbumIDs = nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw)
+    let excludedLocalAssetIDs = nativePhotosHiddenLocalAssetIDs(
+      in: device.albums,
+      excludedAlbumIDs: excludedLocalAlbumIDs,
+      assetsForAlbum: device.assets(in:)
+    )
+    var hiddenServerAssetIDs = excludedServerAssetIDs
+    for localID in excludedLocalAssetIDs {
+      if let serverID = matchedLocalToServer[localID] { hiddenServerAssetIDs.insert(serverID) }
+    }
     let serverAssetByID = Dictionary(model.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
 
     var usedServerIDs = Set<String>()
     var merged: [NativeGridItem] = []
     merged.reserveCapacity(model.assets.count + device.assets.count)
 
-    // 1. Process all local assets from the device
-    for localAsset in device.assets {
-      if let serverID = matchedLocalToServer[localAsset.id], let serverAsset = serverAssetByID[serverID] {
+    // 1. Process all local assets from the device, omitting assets in excluded albums.
+    for localAsset in device.assets where !excludedLocalAssetIDs.contains(localAsset.id) {
+      if let serverID = matchedLocalToServer[localAsset.id], hiddenServerAssetIDs.contains(serverID) {
+        continue
+      }
+      if let serverID = matchedLocalToServer[localAsset.id],
+         let serverAsset = serverAssetByID[serverID] {
         // Matched and server asset is loaded -> unified single item
         merged.append(NativeGridItem(server: serverAsset, local: localAsset))
         usedServerIDs.insert(serverAsset.id)
@@ -1515,8 +1575,8 @@ struct NativePhotosView: View {
       }
     }
 
-    // 2. Process all server assets
-    for serverAsset in model.assets {
+    // 2. Process all server assets, omitting items in excluded Immich albums.
+    for serverAsset in model.assets where !hiddenServerAssetIDs.contains(serverAsset.id) {
       if !usedServerIDs.contains(serverAsset.id) {
         // Server asset not already merged with a local asset -> display as remote item
         merged.append(NativeGridItem(server: serverAsset, local: nil))
@@ -1873,7 +1933,7 @@ import AVKit
 struct NativeUnifiedGalleryViewer: View {
   let client: NativeImmichClient
   let device: NativeDeviceLibrary
-  let items: [NativeGridItem]
+  @State private var items: [NativeGridItem]
   let initialItem: NativeGridItem
   var onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil
 
@@ -1887,6 +1947,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var shareItem: Any? = nil
   @State private var showDeleteLocalAlert = false
   @State private var showDeleteAllAlert = false
+  @State private var showDeleteScopeDialog = false
   @State private var isDeletingItem = false
   @State private var deleteErrorMessage: String? = nil
 
@@ -1899,7 +1960,7 @@ struct NativeUnifiedGalleryViewer: View {
   ) {
     self.client = client
     self.device = device
-    self.items = items
+    _items = State(initialValue: items)
     self.initialItem = initialItem
     self.onDeleteItem = onDeleteItem
     let index = items.firstIndex(where: { $0.id == initialItem.id }) ?? 0
@@ -1917,7 +1978,7 @@ struct NativeUnifiedGalleryViewer: View {
       Color.black.ignoresSafeArea()
 
       if items.isEmpty {
-        Text("无可预览照片").foregroundColor(.white)
+        Text("当前照片已删除").foregroundColor(.white)
       } else {
         TabView(selection: $currentIndex) {
           ForEach(items.indices, id: \.self) { idx in
@@ -1931,6 +1992,7 @@ struct NativeUnifiedGalleryViewer: View {
                 }
               }
             )
+            .id(items[idx].id)
             .tag(idx)
           }
         }
@@ -2055,7 +2117,11 @@ struct NativeUnifiedGalleryViewer: View {
 
             // Delete Local
             Button {
-              showDeleteLocalAlert = true
+              if currentItem?.server != nil {
+                showDeleteScopeDialog = true
+              } else {
+                showDeleteLocalAlert = true
+              }
             } label: {
               VStack(spacing: 4) {
                 Image(systemName: "iphone.slash")
@@ -2069,7 +2135,11 @@ struct NativeUnifiedGalleryViewer: View {
 
             // Delete All (or remote if only remote)
             Button {
-              showDeleteAllAlert = true
+              if currentItem?.local != nil && currentItem?.server != nil {
+                showDeleteScopeDialog = true
+              } else {
+                showDeleteAllAlert = true
+              }
             } label: {
               VStack(spacing: 4) {
                 Image(systemName: "trash")
@@ -2090,6 +2160,20 @@ struct NativeUnifiedGalleryViewer: View {
         }
         .transition(.opacity)
       }
+    }
+    .confirmationDialog("删除范围", isPresented: $showDeleteScopeDialog, titleVisibility: .visible) {
+      if currentItem?.local != nil {
+        Button("仅删除本地", role: .destructive) { performDeleteItem(scope: .localOnly) }
+      }
+      if currentItem?.server != nil {
+        Button("仅删除云端", role: .destructive) { performDeleteItem(scope: .remoteOnly) }
+      }
+      if currentItem?.local != nil && currentItem?.server != nil {
+        Button("全部删除", role: .destructive) { performDeleteItem(scope: .all) }
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("选择要删除的副本。")
     }
     .alert("仅删除本地照片？", isPresented: $showDeleteLocalAlert) {
       Button("取消", role: .cancel) {}
@@ -2147,7 +2231,7 @@ struct NativeUnifiedGalleryViewer: View {
         await MainActor.run {
           isDeletingItem = false
           onDeleteItem?(item, scope)
-          dismiss()
+          retainViewerAfterDeleting(item, scope: scope)
         }
       } catch {
         await MainActor.run {
@@ -2155,6 +2239,42 @@ struct NativeUnifiedGalleryViewer: View {
           deleteErrorMessage = "删除失败：\(error.localizedDescription)"
         }
       }
+    }
+  }
+
+  private func retainViewerAfterDeleting(_ deletedItem: NativeGridItem, scope: NativeDeleteTargetScope) {
+    guard items.indices.contains(currentIndex) else { return }
+    switch scope {
+    case .all:
+      removeCurrentViewerItem()
+    case .localOnly:
+      if let server = deletedItem.server {
+        items[currentIndex] = NativeGridItem(server: server, local: nil)
+      } else {
+        removeCurrentViewerItem()
+      }
+    case .remoteOnly:
+      if let local = deletedItem.local {
+        items[currentIndex] = NativeGridItem(server: nil, local: local)
+      } else {
+        removeCurrentViewerItem()
+      }
+    }
+    if items.indices.contains(currentIndex) {
+      isFavorite = items[currentIndex].server?.isFavorite ?? false
+    }
+    dragOffset = .zero
+    showChrome = true
+  }
+
+  private func removeCurrentViewerItem() {
+    guard items.indices.contains(currentIndex) else { return }
+    items.remove(at: currentIndex)
+    if items.isEmpty {
+      currentIndex = 0
+    } else {
+      currentIndex = min(currentIndex, items.count - 1)
+      isFavorite = items[currentIndex].server?.isFavorite ?? false
     }
   }
 

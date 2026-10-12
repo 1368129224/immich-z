@@ -1456,7 +1456,10 @@ struct NativePhotosView: View {
                 }
               }
             }
-            Color.clear.frame(height: 1).id(bottomAnchor)
+            Color.clear
+              .frame(maxWidth: .infinity)
+              .frame(height: 1)
+              .id(bottomAnchor)
           }
   }
 
@@ -1582,7 +1585,9 @@ struct NativePhotosView: View {
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: device.hasLoadedInitialSnapshot) { _ in
+          rebuildDayGroups()
           positionInitiallyIfReady(proxy: proxy)
+          keepBottomUntilUserScrolls(proxy: proxy)
         }
         .onChange(of: cachedExcludedLocalIDs) { _ in
           keepBottomUntilUserScrolls(proxy: proxy)
@@ -1603,6 +1608,7 @@ struct NativePhotosView: View {
           refreshExcludedLocalAssetIDs()
           rebuildDayGroups()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
+          keepBottomUntilUserScrolls(proxy: proxy)
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onAppear {
@@ -1615,12 +1621,14 @@ struct NativePhotosView: View {
               initialRemoteLoaded = true
               rebuildDayGroups()
               positionInitiallyIfReady(proxy: proxy)
+              keepBottomUntilUserScrolls(proxy: proxy)
               scheduleMatchedHydration()
             }
           } else {
             initialRemoteLoaded = true
             scheduleMatchedHydration()
             positionInitiallyIfReady(proxy: proxy)
+            keepBottomUntilUserScrolls(proxy: proxy)
           }
         }
         .onChange(of: model.assets.count) { _ in
@@ -1631,7 +1639,11 @@ struct NativePhotosView: View {
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: model.isLoading) { loading in
-          if !loading { positionInitiallyIfReady(proxy: proxy) }
+          if !loading {
+            rebuildDayGroups()
+            positionInitiallyIfReady(proxy: proxy)
+            keepBottomUntilUserScrolls(proxy: proxy)
+          }
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onReceive(NotificationCenter.default.publisher(for: .immichScrollPhotosToBottom)) { _ in
@@ -2151,6 +2163,9 @@ struct NativePhotosView: View {
     let expectedSource = sourceFilter
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
       guard pendingSourceChangeScroll, !userMovedTimeline, sourceFilter == expectedSource else { return }
+      if let targetAssetID = cachedDayGroups.last?.assets.last?.id {
+        withAnimation(.none) { proxy.scrollTo(targetAssetID, anchor: .bottom) }
+      }
       withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
       pendingSourceChangeScroll = false
     }
@@ -2158,6 +2173,7 @@ struct NativePhotosView: View {
 
   private func positionInitiallyIfReady(proxy: ScrollViewProxy) {
     guard !hasInitialScrolled, !userMovedTimeline else { return }
+    guard !cachedDayGroups.isEmpty else { return }
     guard nativeInitialTimelineReady(
       source: sourceFilter,
       remoteLoaded: initialRemoteLoaded,
@@ -2169,8 +2185,16 @@ struct NativePhotosView: View {
   }
 
   private func keepBottomUntilUserScrolls(proxy: ScrollViewProxy) {
-    guard isBootstrappingTimeline, hasInitialScrolled, !userMovedTimeline,
-          !pendingSourceChangeScroll, bottomPositionTask == nil else { return }
+    guard nativeShouldKeepTimelineAtBottom(
+      isBootstrapping: isBootstrappingTimeline,
+      userMovedTimeline: userMovedTimeline,
+      pendingSourceChange: pendingSourceChangeScroll,
+      hasAssets: !cachedDayGroups.isEmpty
+    ) else { return }
+    if !hasInitialScrolled {
+      positionInitiallyIfReady(proxy: proxy)
+      return
+    }
     scrollToBottom(proxy: proxy, animated: false, initial: true)
   }
 
@@ -2187,13 +2211,21 @@ struct NativePhotosView: View {
     bottomPositionTask?.cancel()
     bottomPositionRequest += 1
     let request = bottomPositionRequest
+    let targetAssetID = cachedDayGroups.last?.assets.last?.id
     // LazyVStack estimates heights for off-screen days. Revisit its bottom
     // after layout materializes them, rather than trusting a single scrollTo.
     bottomPositionTask = Task { @MainActor in
-      for (index, delay) in [0, 80, 200, 450, 900].enumerated() {
+      for (index, delay) in [0, 50, 150, 350, 700].enumerated() {
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000) }
         guard !Task.isCancelled, request == bottomPositionRequest, !userMovedTimeline,
               !initial || (isBootstrappingTimeline && !pendingSourceChangeScroll) else { return }
+        if let targetAssetID {
+          if animated && index == 0 {
+            withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(targetAssetID, anchor: .bottom) }
+          } else {
+            withAnimation(.none) { proxy.scrollTo(targetAssetID, anchor: .bottom) }
+          }
+        }
         if animated && index == 0 {
           withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
         } else {

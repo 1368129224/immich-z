@@ -20,6 +20,14 @@ final class RunnerTests: XCTestCase {
     XCTAssertTrue(nativeInitialTimelineReady(source: .server, remoteLoaded: true, remoteLoading: false, localSnapshotLoaded: false, localLoading: true))
   }
 
+  func testTimelineKeepsBottomOnlyDuringBootstrapWithoutInterruption() {
+    XCTAssertTrue(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: true))
+    XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: false, userMovedTimeline: false, pendingSourceChange: false, hasAssets: true))
+    XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: true, pendingSourceChange: false, hasAssets: true))
+    XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: true, hasAssets: true))
+    XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: false))
+  }
+
   func testViewerImageFitsViewportWithoutCropping() {
     let viewport = CGSize(width: 390, height: 844)
     XCTAssertEqual(nativeAspectFitImageSize(imageSize: CGSize(width: 4000, height: 3000), viewportSize: viewport), CGSize(width: 390, height: 292.5))

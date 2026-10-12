@@ -32,6 +32,15 @@ func nativeInitialTimelineReady(
   }
 }
 
+func nativeShouldKeepTimelineAtBottom(
+  isBootstrapping: Bool,
+  userMovedTimeline: Bool,
+  pendingSourceChange: Bool,
+  hasAssets: Bool
+) -> Bool {
+  isBootstrapping && !userMovedTimeline && !pendingSourceChange && hasAssets
+}
+
 func nativePhotosSourceIncludes(_ source: NativePhotosSource, hasLocal: Bool, hasServer: Bool, hasVerifiedMatch: Bool) -> Bool {
   switch source {
   case .all: return hasLocal || hasServer
@@ -190,10 +199,12 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
         return (entries, localAlbums)
       }.value
       guard let self, self.refreshGeneration == generation else { return }
-      self.assets = library.0
-      self.albums = library.1
-      self.isLoading = false
-      self.hasLoadedInitialSnapshot = true
+      await MainActor.run {
+        self.assets = library.0
+        self.albums = library.1
+        self.isLoading = false
+        self.hasLoadedInitialSnapshot = true
+      }
     }
   }
 
@@ -2983,7 +2994,7 @@ struct NativeTabShell: View {
       didStartLibrary = true
       // Let the first Photos frame render before scanning the system library.
       Task { @MainActor in
-        try? await Task.sleep(nanoseconds: 450_000_000)
+        try? await Task.sleep(nanoseconds: 50_000_000)
         guard !Task.isCancelled else { return }
         device.refresh()
       }

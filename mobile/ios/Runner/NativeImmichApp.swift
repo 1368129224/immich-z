@@ -1185,10 +1185,7 @@ struct NativePhotosView: View {
     }
   }
 
-  var body: some View {
-    NavigationView {
-      ScrollViewReader { proxy in
-        ScrollView {
+  private func timelineGridContent(proxy: ScrollViewProxy) -> some View {
           LazyVStack(spacing: 4) {
             newPhotosBanner(proxy: proxy)
             if sourceFilter != .device && model.hasOlder && !model.assets.isEmpty {
@@ -1311,7 +1308,10 @@ struct NativePhotosView: View {
             Color.clear.frame(height: 1).id(bottomAnchor)
           }
           .opacity(initialScrollVisible ? 1 : 0)
-        }
+  }
+
+  private func timelineGestureContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
+    content
         .coordinateSpace(name: "photosScrollSpace")
         .nativeScrollDisabled(isDragSelecting)
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
@@ -1362,6 +1362,10 @@ struct NativePhotosView: View {
               DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { isMagnifying = false }
             }
         )
+  }
+
+  private func timelineLifecycleContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
+    content
         .onChange(of: cloud.matchedServerIDs) { _ in
           let anchor = visibleAnchorID
           rebuildDayGroups()
@@ -1460,6 +1464,10 @@ struct NativePhotosView: View {
             if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
           }
         }
+  }
+
+  private func timelineChromeContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
+    content
         .safeAreaInset(edge: .bottom, spacing: 0) {
           if isSelecting {
             HStack(spacing: 0) {
@@ -1536,6 +1544,10 @@ struct NativePhotosView: View {
             trailingToolbarContent
           }
         }
+  }
+
+  private func timelineModalContent<Content: View>(_ content: Content) -> some View {
+    content
         .confirmationDialog("选择相册来源", isPresented: $showAlbumTargetDialog, titleVisibility: .visible) {
           Button("加入本机相册") { showLocalAlbumPicker = true }
           Button("加入云端相册") { showServerAlbumPicker = true }
@@ -1620,6 +1632,20 @@ struct NativePhotosView: View {
             onServerAssetArchived: { model.removeAssets(ids: [$0]) }
           )
         }
+  }
+
+  var body: some View {
+    NavigationView {
+      ScrollViewReader { proxy in
+        timelineModalContent(
+          timelineChromeContent(
+            timelineLifecycleContent(
+              timelineGestureContent(ScrollView { timelineGridContent(proxy: proxy) }, proxy: proxy),
+              proxy: proxy
+            ),
+            proxy: proxy
+          )
+        )
       }
     }
     .navigationViewStyle(.stack)

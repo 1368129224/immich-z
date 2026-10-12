@@ -32,10 +32,13 @@ struct NativeServerConfig: Codable {
 }
 
 private enum NativeSessionStore {
-  private static let service = "flutter_secure_storage_service"
-  private static let legacyService = "com.it_nomads.flutter_secure_storage_service"
+  private static let service = "com.immichz.session"
+  // These identifiers are read-only migration keys for existing installations.
+  private static let legacyService = "flutter_secure_storage_service"
+  private static let olderService = "com.it_nomads.flutter_secure_storage_service"
   private static let account = "immich.server_config"
-  private static let fallbackKey = "flutter.secure_fallback.immich.server_config"
+  private static let fallbackKey = "immichz.session.fallback"
+  private static let legacyFallbackKey = "flutter.secure_fallback.immich.server_config"
   private static let unprefixedFallbackKey = "secure_fallback.immich.server_config"
 
   static func read() -> NativeServerConfig? {
@@ -46,7 +49,7 @@ private enum NativeSessionStore {
       kSecReturnData as String: true,
       kSecMatchLimit as String: kSecMatchLimitOne,
     ]
-    // FlutterSecureStorage stores the key as the generic-password account.
+    // Keep existing installations signed in across the native migration.
     var result: CFTypeRef?
     let status = SecItemCopyMatching(query as CFDictionary, &result)
     if status == errSecSuccess, let data = result as? Data,
@@ -62,6 +65,13 @@ private enum NativeSessionStore {
        let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
       return config
     }
+    query[kSecAttrService as String] = olderService
+    result = nil
+    if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
+       let data = result as? Data,
+       let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
+      return config
+    }
     query.removeValue(forKey: kSecAttrService as String)
     result = nil
     if SecItemCopyMatching(query as CFDictionary, &result) == errSecSuccess,
@@ -69,16 +79,15 @@ private enum NativeSessionStore {
        let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
       return config
     }
-    // Preserve compatibility with Flutter's documented SharedPreferences
-    // fallback used by unsigned iOS builds without Keychain entitlements.
-    for key in [fallbackKey, unprefixedFallbackKey] {
+    // Preserve legacy session fallback values for existing installations.
+    for key in [fallbackKey, legacyFallbackKey, unprefixedFallbackKey] {
       if let raw = UserDefaults.standard.string(forKey: key),
          let data = raw.data(using: .utf8),
          let config = try? JSONDecoder().decode(NativeServerConfig.self, from: data) {
         return config
       }
     }
-    // SharedPreferences persists fallback values in a plist dictionary.
+    // Older versions also persisted fallback values in a plist dictionary.
     if let preferences = readPreferencesFallback() {
       return try? JSONDecoder().decode(NativeServerConfig.self, from: preferences)
     }
@@ -104,9 +113,10 @@ private enum NativeSessionStore {
     }
     if writeStatus == errSecSuccess {
       UserDefaults.standard.removeObject(forKey: fallbackKey)
+      UserDefaults.standard.removeObject(forKey: legacyFallbackKey)
       UserDefaults.standard.removeObject(forKey: unprefixedFallbackKey)
     } else {
-      // SharedPreferences uses the flutter. prefix for the legacy API.
+      // Keep unsigned builds usable when Keychain access is unavailable.
       UserDefaults.standard.set(String(data: data, encoding: .utf8), forKey: fallbackKey)
     }
   }
@@ -692,7 +702,6 @@ struct NativeAsset: Identifiable {
 // MARK: - SwiftUI app and login
 
 struct NativeImmichRootView: View {
-  let onUseFlutter: () -> Void
   @State private var config: NativeServerConfig?
   @State private var restoring = true
   @State private var restoreError: String?
@@ -702,7 +711,7 @@ struct NativeImmichRootView: View {
       if restoring {
         ProgressView("正在恢复登录状态…")
       } else if let config {
-        NativeTabShell(client: NativeImmichClient(config: config), onUseFlutter: onUseFlutter) {
+        NativeTabShell(client: NativeImmichClient(config: config)) {
           NativeSyncCacheStore.shared.clear()
           NativeSessionStore.clear()
           self.config = nil
@@ -710,7 +719,7 @@ struct NativeImmichRootView: View {
         }
         .id("\(config.serverUrl)|\(config.userId ?? "unverified")")
       } else {
-        NativeLoginView(error: restoreError, onUseFlutter: onUseFlutter) { config = $0 }
+        NativeLoginView(error: restoreError) { config = $0 }
       }
     }
     .task {
@@ -752,7 +761,7 @@ struct NativeImmichRootView: View {
 
 private extension NativeSessionStore {
   static func clear() {
-    let services: [String?] = [service, legacyService, nil]
+    let services: [String?] = [service, legacyService, olderService, nil]
     for serviceName in services {
       var query: [String: Any] = [
         kSecClass as String: kSecClassGenericPassword,
@@ -764,6 +773,7 @@ private extension NativeSessionStore {
       SecItemDelete(query as CFDictionary)
     }
     UserDefaults.standard.removeObject(forKey: fallbackKey)
+    UserDefaults.standard.removeObject(forKey: legacyFallbackKey)
     UserDefaults.standard.removeObject(forKey: unprefixedFallbackKey)
   }
 
@@ -773,7 +783,7 @@ private extension NativeSessionStore {
             .appendingPathComponent("Preferences", isDirectory: true)
             .appendingPathComponent("\(bundleId).plist"),
           let dictionary = NSDictionary(contentsOf: preferencesUrl) as? [String: Any],
-          let raw = (dictionary[fallbackKey] ?? dictionary[unprefixedFallbackKey]) as? String else {
+          let raw = (dictionary[fallbackKey] ?? dictionary[legacyFallbackKey] ?? dictionary[unprefixedFallbackKey]) as? String else {
       return nil
     }
     return raw.data(using: .utf8)
@@ -782,7 +792,6 @@ private extension NativeSessionStore {
 
 private struct NativeLoginView: View {
   let error: String?
-  let onUseFlutter: () -> Void
   let onLogin: (NativeServerConfig) -> Void
   @State private var server = ""
   @State private var email = ""
@@ -1021,7 +1030,6 @@ private final class NativeTimelineModel: ObservableObject {
 struct NativePhotosView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
-  let onUseFlutter: () -> Void
   let onLogout: () -> Void
   let matchedAssetDiagnostics: NativeMatchedAssetDiagnostics
   @StateObject private var model: NativeTimelineModel
@@ -1060,6 +1068,8 @@ struct NativePhotosView: View {
   @State private var didInitialPosition = false
   @State private var userMovedTimeline = false
   @State private var hydrationTask: Task<Void, Never>?
+  @State private var bottomPositionTask: Task<Void, Never>?
+  @State private var bottomPositionRequest = 0
   @State private var loadingOlderAnchor: String?
   @State private var showServerSettings = false
   @State private var showSyncSettings = false
@@ -1084,10 +1094,9 @@ struct NativePhotosView: View {
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
 
-  init(client: NativeImmichClient, device: NativeDeviceLibrary, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void, matchedAssetDiagnostics: NativeMatchedAssetDiagnostics) {
+  init(client: NativeImmichClient, device: NativeDeviceLibrary, onLogout: @escaping () -> Void, matchedAssetDiagnostics: NativeMatchedAssetDiagnostics) {
     self.client = client
     self.device = device
-    self.onUseFlutter = onUseFlutter
     self.onLogout = onLogout
     self.matchedAssetDiagnostics = matchedAssetDiagnostics
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
@@ -1478,6 +1487,8 @@ struct NativePhotosView: View {
                 if abs(drag.translation.height) > 12 {
                   isBootstrappingTimeline = false
                   userMovedTimeline = true
+                  bottomPositionTask?.cancel()
+                  bottomPositionTask = nil
                   pendingSourceChangeScroll = false
                   if !didInitialPosition { didInitialPosition = true }
                 }
@@ -1547,6 +1558,8 @@ struct NativePhotosView: View {
           scheduleMatchedHydration()
         }
         .onChange(of: sourceFilter) { _ in
+          bottomPositionTask?.cancel()
+          bottomPositionTask = nil
           isBootstrappingTimeline = false
           actionMessage = nil
           rebuildDayGroups()
@@ -1554,6 +1567,8 @@ struct NativePhotosView: View {
           positionAtLatestAfterSourceChange(proxy: proxy)
         }
         .refreshable {
+          bottomPositionTask?.cancel()
+          bottomPositionTask = nil
           isBootstrappingTimeline = false
           device.refresh()
           await model.refreshLatest()
@@ -1622,9 +1637,8 @@ struct NativePhotosView: View {
         .onReceive(NotificationCenter.default.publisher(for: .immichScrollPhotosToBottom)) { _ in
           let now = Date()
           guard now.timeIntervalSince(lastScrollToBottomTime) > 0.25 else { return }
-          isBootstrappingTimeline = false
           lastScrollToBottomTime = now
-          if hasInitialScrolled { scrollToBottom(proxy: proxy, animated: true) }
+          scrollToBottom(proxy: proxy, animated: true)
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
           needsForegroundRefresh = true
@@ -1632,6 +1646,8 @@ struct NativePhotosView: View {
           hydrationTask = nil
         }
         .onDisappear {
+          bottomPositionTask?.cancel()
+          bottomPositionTask = nil
           hydrationTask?.cancel()
           hydrationTask = nil
           excludedLocalRefreshTask?.cancel()
@@ -2149,41 +2165,43 @@ struct NativePhotosView: View {
       localSnapshotLoaded: device.hasLoadedInitialSnapshot,
       localLoading: device.isLoading
     ) else { return }
-    scrollToBottom(proxy: proxy, animated: false)
+    scrollToBottom(proxy: proxy, animated: false, initial: true)
   }
 
   private func keepBottomUntilUserScrolls(proxy: ScrollViewProxy) {
-    guard isBootstrappingTimeline, hasInitialScrolled, didInitialPosition, !userMovedTimeline, !pendingSourceChangeScroll else { return }
-    // The first page is followed by PhotoKit and match hydration. Re-anchor
-    // after SwiftUI has laid out each update, but never override a user's drag.
-    DispatchQueue.main.async {
-      guard isBootstrappingTimeline, hasInitialScrolled, didInitialPosition, !userMovedTimeline, !pendingSourceChangeScroll else { return }
-      withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-    }
+    guard isBootstrappingTimeline, hasInitialScrolled, !userMovedTimeline,
+          !pendingSourceChangeScroll, bottomPositionTask == nil else { return }
+    scrollToBottom(proxy: proxy, animated: false, initial: true)
   }
 
-  private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
-    if !hasInitialScrolled {
-      guard !userMovedTimeline else { return }
-      hasInitialScrolled = true
-      // One layout pass positions the first loaded content. Never repeatedly
-      // snap back while the user is dragging or background pages arrive.
-      DispatchQueue.main.async {
-        guard !userMovedTimeline else { didInitialPosition = true; return }
-        withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-        didInitialPosition = true
-      }
+  private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool, initial: Bool = false) {
+    if initial {
+      guard isBootstrappingTimeline, !userMovedTimeline, !pendingSourceChangeScroll else { return }
     } else {
-      DispatchQueue.main.async {
-        guard hasInitialScrolled, didInitialPosition else { return }
-        if animated {
-          withAnimation(.easeInOut(duration: 0.25)) {
-            proxy.scrollTo(bottomAnchor, anchor: .bottom)
-          }
+      // A double tap is an explicit request even if initial positioning failed.
+      isBootstrappingTimeline = false
+      pendingSourceChangeScroll = false
+      userMovedTimeline = false
+    }
+    hasInitialScrolled = true
+    bottomPositionTask?.cancel()
+    bottomPositionRequest += 1
+    let request = bottomPositionRequest
+    // LazyVStack estimates heights for off-screen days. Revisit its bottom
+    // after layout materializes them, rather than trusting a single scrollTo.
+    bottomPositionTask = Task { @MainActor in
+      for (index, delay) in [0, 80, 200, 450, 900].enumerated() {
+        if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000) }
+        guard !Task.isCancelled, request == bottomPositionRequest, !userMovedTimeline,
+              !initial || (isBootstrappingTimeline && !pendingSourceChangeScroll) else { return }
+        if animated && index == 0 {
+          withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
         } else {
           withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
         }
+        didInitialPosition = true
       }
+      if request == bottomPositionRequest { bottomPositionTask = nil }
     }
   }
 

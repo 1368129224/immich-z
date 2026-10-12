@@ -1,16 +1,13 @@
-# immich_z
+# Immich Z for iOS
 
-A new Flutter project.
+SwiftUI/PhotoKit iOS client for Immich. Open `ios/Runner.xcodeproj` in Xcode to develop and run the app. The bundle identifier is `com.immichz.immichz`.
 
-## Getting Started
+## Build
 
-This project is a starting point for a Flutter application.
+```bash
+xcodebuild -project ios/Runner.xcodeproj -scheme Runner \
+  -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+```
 
-A few resources to get you started if this is your first Flutter project:
-
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+The GitHub Actions iOS workflow packages the unsigned app into an IPA. An unsigned IPA must be signed before installing on a standard device. Tests can be run with the `Runner` scheme on an iOS simulator in Xcode.

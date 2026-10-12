@@ -1,6 +1,6 @@
 # AGENTS.md — immich-z contributor guide
 
-> Immich iOS client implemented natively in Swift (SwiftUI) hosted within a Flutter shell,
+> Immich iOS client implemented natively in Swift (SwiftUI),
 > mirroring the official Immich app (`https://github.com/immich-app/immich`) against the public REST API.
 
 Remote: `https://github.com/1368129224/immich-z.git`, branch `main`.
@@ -13,7 +13,7 @@ Remote: `https://github.com/1368129224/immich-z.git`, branch `main`.
   - `NativeImmichApp.swift`: Root SwiftUI app, timeline photo grid, pull-to-refresh, navigation, and auth state.
   - `NativeFeatures.swift`: Album list, search grid, full-screen asset viewer (`NativeAssetViewer`), and unified grid items (`NativeGridItem`).
   - `NativeCloudStatus.swift`: Asset hashing, persistent cache store (`NativeSyncCacheStore`), and server verification (`bulk-upload-check`).
-  - `AppDelegate.swift`: Flutter engine hosting and native window bootstrapping.
+  - `AppDelegate.swift`: Native UIWindow and SwiftUI root view bootstrapping.
 
 ---
 
@@ -71,40 +71,26 @@ Remote: `https://github.com/1368129224/immich-z.git`, branch `main`.
 
 ---
 
-## Environment / toolchain (local dev machine)
+## Environment / toolchain
+
+Native builds require macOS with Xcode. From the repository root:
 
 ```bash
-export PATH="/tmp/toolchain/flutter/bin:$PATH"
-export JAVA_HOME=/tmp/toolchain/jdk
-export PATH="$JAVA_HOME/bin:$PATH"
-flutter --version   # Flutter 3.35.1 • Dart 3.9.0 expected
+xcodebuild -project mobile/ios/Runner.xcodeproj -scheme Runner \
+  -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+xcodebuild -project mobile/ios/Runner.xcodeproj -scheme Runner \
+  -destination 'platform=iOS Simulator,name=iPhone 16' test
 ```
 
-- Flutter binary: `/tmp/toolchain/flutter/bin/flutter`
-- JDK 17: `/tmp/toolchain/jdk/bin/java`
-- Always run flutter commands from `mobile/`:
-  `cd /mnt/ssd/code/immich-z/mobile`
-
-## Common commands
-
-```bash
-cd mobile
-flutter pub get
-flutter analyze --no-fatal-infos   # CI gate: warnings FAIL, infos allowed → must exit 0 with no warning/error lines
-flutter test
-# Regenerate API client after spec or generator changes:
-python3 ../tools/generate_api.py ../openapi/immich-openapi-specs.json lib/src/api/generated
-```
+The current Linux host cannot compile or run iOS tests; CI provides the device build check.
 
 ---
 
 ## CI/CD (must stay green)
 
-- `flutter analyze --no-fatal-infos` runs in both workflows — **zero warnings**.
-  `analysis_options.yaml` excludes `lib/src/api/generated/**`.
-- Unsigned iOS workflow does NOT use `flutter build ipa` (it skips IPA without a team).
-  Flow: `flutter build ios --config-only --no-codesign` → `pod install` →
-  `xcodebuild … CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build` →
+- The iOS workflow builds the standalone Xcode project without Flutter or CocoaPods.
+- Unsigned iOS flow: `xcodebuild -project mobile/ios/Runner.xcodeproj … CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build` →
   `Payload/` + `/usr/bin/zip --symlinks` → `ImmichZ-unsigned.ipa`
   (artifact `immich-z-ios-ipa-unsigned`).
 
@@ -138,14 +124,11 @@ python3 ../tools/generate_api.py ../openapi/immich-openapi-specs.json lib/src/ap
 
 ## Versioning rule (mandatory)
 
-- Before every push, increment the final numeric component of the
-  Flutter version in `mobile/pubspec.yaml` by exactly 1. The format is
-  `major.minor.patch+build`; increment `build` for every push, keeping the
-  semantic version at `0.0.1` unless intentionally changed. Never reuse a
-  version/build number for a new push. If one push adds commits after a failed
-  CI run, increment the build number again before pushing the follow-up.
-- The version declared in `pubspec.yaml` is propagated to iOS by
-  Flutter's Xcode build settings; do not hard-code separate app versions.
+- Before every push, increment `CURRENT_PROJECT_VERSION` by exactly 1 in all three
+  Runner configurations in `mobile/ios/Runner.xcodeproj/project.pbxproj`.
+  Never reuse a build number; increment again before a follow-up push after CI failure.
+- Keep `MARKETING_VERSION` consistent across Runner configurations (currently `0.0.2`).
+  `Runner/Info.plist` reads both values from Xcode build settings.
 
 ## Git conventions
 

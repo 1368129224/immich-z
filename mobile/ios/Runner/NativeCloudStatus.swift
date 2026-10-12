@@ -28,8 +28,8 @@ final class NativeSyncCacheStore: @unchecked Sendable {
     folder = directory ?? (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
       ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!)
     try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    // The old unscoped file and Flutter backup markers cannot be trusted as
-    // account-specific evidence; re-verify originals after upgrading.
+    // The old unscoped cache cannot be trusted as account-specific evidence;
+    // re-verify originals after upgrading.
     try? FileManager.default.removeItem(at: folder.appendingPathComponent("native_cloud_sync_cache.json"))
   }
 

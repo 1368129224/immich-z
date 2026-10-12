@@ -3,8 +3,7 @@ import Photos
 import SwiftUI
 import UIKit
 
-// First native vertical slice against the official Immich v3.2.4 OpenAPI.
-// The complete Flutter app remains available for features not yet ported.
+// Native iOS client against the official Immich v3.2.4 OpenAPI.
 
 enum NativeDragSelectionIntent: Equatable {
   case undecided
@@ -2479,7 +2478,7 @@ private struct NativeLibraryView: View {
         }
         Section("快捷访问") {
           NavigationLink("服务器文件夹") { NativeFoldersView(client: client) }
-          NavigationLink("锁定文件夹 · 使用完整应用") { NativeFallbackNote() }
+          NavigationLink("锁定文件夹 · 开发中") { NativeFallbackNote() }
           NavigationLink("伙伴共享") {
             NativeLibrarySection(client: client, title: "伙伴共享", path: "partners", query: [URLQueryItem(name: "direction", value: "shared-by")]) { row in
               guard let id = row["id"] as? String else { return nil }
@@ -2958,31 +2957,15 @@ private struct TabBarDoubleTapHelper: UIViewRepresentable {
 
 struct NativeTabShell: View {
   let client: NativeImmichClient
-  let onUseFlutter: () -> Void
   let onLogout: () -> Void
   @StateObject private var device = NativeDeviceLibrary()
   @StateObject private var matchedAssetDiagnostics = NativeMatchedAssetDiagnostics()
   @State private var selectedTab = 0
-  @State private var lastTab0Tap: Date = .distantPast
   @State private var didStartLibrary = false
 
   var body: some View {
-    let tabBinding = Binding<Int>(
-      get: { selectedTab },
-      set: { newTab in
-        if newTab == 0 {
-          let now = Date()
-          if now.timeIntervalSince(lastTab0Tap) < 0.55 {
-            NotificationCenter.default.post(name: .immichScrollPhotosToBottom, object: nil)
-          }
-          lastTab0Tap = now
-        }
-        selectedTab = newTab
-      }
-    )
-
-    TabView(selection: tabBinding) {
-      NativePhotosView(client: client, device: device, onUseFlutter: onUseFlutter, onLogout: onLogout, matchedAssetDiagnostics: matchedAssetDiagnostics)
+    TabView(selection: $selectedTab) {
+      NativePhotosView(client: client, device: device, onLogout: onLogout, matchedAssetDiagnostics: matchedAssetDiagnostics)
         .tabItem { Label("照片", systemImage: "photo.on.rectangle") }
         .tag(0)
       NativeSearchView(client: client)
@@ -3008,7 +2991,11 @@ struct NativeTabShell: View {
     .background(
       TabBarDoubleTapHelper {
         selectedTab = 0
-        NotificationCenter.default.post(name: .immichScrollPhotosToBottom, object: nil)
+        // Let Photos reappear before delivering the scroll request when
+        // double-tapping the tab from another screen.
+        DispatchQueue.main.async {
+          NotificationCenter.default.post(name: .immichScrollPhotosToBottom, object: nil)
+        }
       }
     )
   }

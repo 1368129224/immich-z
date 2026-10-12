@@ -1,5 +1,4 @@
-import Flutter
-import Runner
+@testable import Runner
 import UIKit
 import XCTest
 

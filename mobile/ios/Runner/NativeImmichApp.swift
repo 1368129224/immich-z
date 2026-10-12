@@ -2739,7 +2739,6 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var showInfoSheet = false
   @State private var isFavorite = false
   @State private var isProcessingFavorite = false
-  @State private var showMoreActions = false
   @State private var isPreparingShare = false
   @State private var shareTask: Task<Void, Never>?
   @State private var sharePreparationID: UUID?
@@ -2890,85 +2889,62 @@ struct NativeUnifiedGalleryViewer: View {
           // Bottom Bar
           HStack(spacing: 12) {
             // Share
-            Button {
-              triggerShare()
-            } label: {
-              VStack(spacing: 4) {
-                if isPreparingShare { ProgressView().tint(.white) }
-                else { Image(systemName: "square.and.arrow.up").font(.system(size: 19)) }
-                Text("分享").font(.caption2)
-              }
-              .foregroundColor(.white)
-            }
-            .disabled(isPreparingShare)
-            if isPreparingShare {
-              Button("取消准备") {
-                sharePreparationID = nil
-                shareTask?.cancel()
-                shareTask = nil
-                isPreparingShare = false
-              }
-              .font(.caption2)
-              .foregroundColor(.white)
+            viewerActionButton(
+              title: isPreparingShare ? "准备中" : "分享",
+              disabled: isPreparingShare,
+              action: triggerShare
+            ) {
+              if isPreparingShare { ProgressView().tint(.white) }
+              else { Image(systemName: "square.and.arrow.up").font(.system(size: 19)) }
             }
 
             // Favorite
-            Button {
-              toggleFavorite()
-            } label: {
-              VStack(spacing: 4) {
-                Image(systemName: isFavorite ? "heart.fill" : "heart")
-                  .font(.system(size: 19))
-                  .foregroundColor(isFavorite ? .red : .white)
-                Text(isFavorite ? "已收藏" : "收藏").font(.caption2)
-                  .foregroundColor(.white)
-              }
+            viewerActionButton(
+              title: isFavorite ? "已收藏" : "收藏",
+              disabled: isProcessingFavorite || currentItem == nil,
+              opacity: currentItem != nil ? 1 : 0.4,
+              action: toggleFavorite
+            ) {
+              Image(systemName: isFavorite ? "heart.fill" : "heart")
+                .font(.system(size: 19))
+                .foregroundColor(isFavorite ? .red : .white)
             }
-            .disabled(isProcessingFavorite || currentItem == nil)
-            .opacity(currentItem != nil ? 1 : 0.4)
 
             // Info Details
-            Button {
-              showInfoSheet = true
-            } label: {
-              VStack(spacing: 4) {
-                Image(systemName: "info.circle")
-                  .font(.system(size: 19))
-                Text("详情").font(.caption2)
-              }
-              .foregroundColor(.white)
+            viewerActionButton(
+              title: "详情",
+              action: { showInfoSheet = true }
+            ) {
+              Image(systemName: "info.circle").font(.system(size: 19))
             }
 
-            Button {
-              if currentItem?.server != nil && currentItem?.local == nil {
-                requestRemoteOnlyDeletion()
-              } else {
-                showDeleteScopeDialog = true
-              }
-            } label: {
-              VStack(spacing: 4) {
-                Image(systemName: "trash").font(.system(size: 19))
-                Text("删除").font(.caption2)
-              }
-              .foregroundColor(.white)
+            // Archive (directly shown)
+            viewerActionButton(
+              title: "归档",
+              disabled: isDeletingItem || currentItem?.server == nil,
+              opacity: currentItem?.server != nil ? 1 : 0.4,
+              action: { Task { await archiveCurrentServerCopy() } }
+            ) {
+              Image(systemName: "archivebox").font(.system(size: 19))
             }
-            .disabled(isDeletingItem || currentItem == nil)
 
-            if currentItem?.server != nil {
-              Button {
-                showMoreActions = true
-              } label: {
-                VStack(spacing: 4) {
-                  Image(systemName: "ellipsis.circle").font(.system(size: 19))
-                  Text("更多").font(.caption2)
+            // Delete
+            viewerActionButton(
+              title: "删除",
+              disabled: isDeletingItem || currentItem == nil,
+              action: {
+                if currentItem?.server != nil && currentItem?.local == nil {
+                  requestRemoteOnlyDeletion()
+                } else {
+                  showDeleteScopeDialog = true
                 }
-                .foregroundColor(.white)
               }
-              .disabled(isDeletingItem)
+            ) {
+              Image(systemName: "trash").font(.system(size: 19))
             }
           }
-          .padding(.vertical, 10)
-          .padding(.horizontal, 12)
+          .padding(.vertical, 8)
+          .padding(.horizontal, 16)
           .background(Color.black.opacity(0.65))
           .cornerRadius(24)
           .padding(.bottom, 24)
@@ -3027,9 +3003,6 @@ struct NativeUnifiedGalleryViewer: View {
       Button("取消", role: .cancel) {}
       Button("继续删除", role: .destructive) { performDeleteItem(scope: pendingViewerDeleteScope) }
     } message: { Text("此操作会从系统照片中永久删除；若开启 iCloud Photos，删除可能传播至其他设备。") }
-    .confirmationDialog("更多操作", isPresented: $showMoreActions, titleVisibility: .visible) {
-      if currentItem?.server != nil { Button("归档云端副本") { Task { await archiveCurrentServerCopy() } } }
-    } message: { Text("操作只影响具有对应副本的来源。") }
     .sheet(isPresented: $showInfoSheet) {
       if let item = currentItem {
         NativeAssetInfoSheet(client: client, device: device, item: item)
@@ -3042,6 +3015,29 @@ struct NativeUnifiedGalleryViewer: View {
       NativeActivityView(activityItems: payload.content)
     }
     .statusBarHidden(true)
+  }
+
+  @ViewBuilder
+  private func viewerActionButton<IconContent: View>(
+    title: String,
+    disabled: Bool = false,
+    opacity: Double = 1.0,
+    action: @escaping () -> Void,
+    @ViewBuilder icon: () -> IconContent
+  ) -> some View {
+    Button(action: action) {
+      VStack(spacing: 4) {
+        icon()
+          .frame(width: 24, height: 24, alignment: .center)
+        Text(title)
+          .font(.caption2)
+          .lineLimit(1)
+      }
+      .frame(minWidth: 44, minHeight: 44)
+      .foregroundColor(.white)
+    }
+    .disabled(disabled)
+    .opacity(opacity)
   }
 
   private func requestRemoteOnlyDeletion() {
@@ -3358,8 +3354,13 @@ private struct NativeSingleAssetPage: View {
               .frame(width: proxy.size.width, height: proxy.size.height)
               .allowsHitTesting(false)
           } else if let livePhoto {
-            NativeLivePhotoView(livePhoto: livePhoto, isPlaying: isLivePlaying)
-              .frame(width: proxy.size.width, height: proxy.size.height)
+            NativeZoomableLivePhotoView(
+              livePhoto: livePhoto,
+              isPlaying: isLivePlaying,
+              size: proxy.size,
+              onTap: onTap,
+              onZoomChanged: onZoomChanged
+            )
           } else if let image {
             NativeZoomableImageView(image: image, size: proxy.size, onTap: onTap, onZoomChanged: onZoomChanged)
           } else {
@@ -3377,7 +3378,9 @@ private struct NativeSingleAssetPage: View {
       }
       .contentShape(Rectangle())
       .onTapGesture {
-        onTap()
+        if item.isVideo || (livePhoto == nil && image == nil) {
+          onTap()
+        }
       }
       .onLongPressGesture(minimumDuration: 0.35, maximumDistance: 15, pressing: { pressing in
         if !pressing { stopLivePlayback() }
@@ -3526,32 +3529,122 @@ private struct NativeSingleAssetPage: View {
   }
 }
 
-// PhotoKit owns the local Live Photo playback (including its paired motion/audio).
-private struct NativeLivePhotoView: UIViewRepresentable {
+// PhotoKit owns the local Live Photo playback and zooming.
+private struct NativeZoomableLivePhotoView: UIViewRepresentable {
   let livePhoto: PHLivePhoto
   let isPlaying: Bool
+  let size: CGSize
+  let onTap: () -> Void
+  let onZoomChanged: (Bool) -> Void
 
-  func makeUIView(context: Context) -> PHLivePhotoView {
-    let view = PHLivePhotoView()
-    view.contentMode = .scaleAspectFit
-    view.isMuted = false
-    return view
+  func makeUIView(context: Context) -> UIScrollView {
+    let scrollView = UIScrollView()
+    scrollView.delegate = context.coordinator
+    scrollView.maximumZoomScale = 5.0
+    scrollView.minimumZoomScale = 1.0
+    scrollView.bouncesZoom = false
+    scrollView.showsVerticalScrollIndicator = false
+    scrollView.showsHorizontalScrollIndicator = false
+    scrollView.backgroundColor = .clear
+
+    let photoView = PHLivePhotoView()
+    photoView.contentMode = .scaleAspectFit
+    photoView.isMuted = false
+    photoView.tag = 101
+    scrollView.addSubview(photoView)
+
+    let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
+    tapGesture.numberOfTapsRequired = 1
+    scrollView.addGestureRecognizer(tapGesture)
+
+    let doubleTapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
+    doubleTapGesture.numberOfTapsRequired = 2
+    scrollView.addGestureRecognizer(doubleTapGesture)
+    tapGesture.require(toFail: doubleTapGesture)
+
+    return scrollView
   }
 
-  func updateUIView(_ view: PHLivePhotoView, context: Context) {
-    if view.livePhoto !== livePhoto { view.livePhoto = livePhoto }
+  func updateUIView(_ uiView: UIScrollView, context: Context) {
+    context.coordinator.onTap = onTap
+    context.coordinator.onZoomChanged = onZoomChanged
+    guard let photoView = uiView.viewWithTag(101) as? PHLivePhotoView else { return }
+    if photoView.livePhoto !== livePhoto { photoView.livePhoto = livePhoto }
     if isPlaying && !context.coordinator.wasPlaying {
-      view.startPlayback(with: .full)
+      photoView.startPlayback(with: .full)
     } else if !isPlaying && context.coordinator.wasPlaying {
-      view.stopPlayback()
+      photoView.stopPlayback()
     }
     context.coordinator.wasPlaying = isPlaying
+
+    let fittedSize = nativeAspectFitImageSize(imageSize: livePhoto.size, viewportSize: size)
+    guard fittedSize != .zero else { return }
+    let sizeChanged = photoView.bounds.size != fittedSize
+    if sizeChanged {
+      uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
+      photoView.frame = CGRect(origin: .zero, size: fittedSize)
+      uiView.contentSize = fittedSize
+      onZoomChanged(false)
+    }
+    context.coordinator.centerView(in: uiView)
   }
 
-  func makeCoordinator() -> Coordinator { Coordinator() }
+  func makeCoordinator() -> Coordinator {
+    Coordinator(onTap: onTap, onZoomChanged: onZoomChanged)
+  }
 
-  class Coordinator {
+  class Coordinator: NSObject, UIScrollViewDelegate {
+    var onTap: () -> Void
+    var onZoomChanged: (Bool) -> Void
     var wasPlaying = false
+
+    init(onTap: @escaping () -> Void, onZoomChanged: @escaping (Bool) -> Void) {
+      self.onTap = onTap
+      self.onZoomChanged = onZoomChanged
+    }
+
+    func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+      scrollView.viewWithTag(101)
+    }
+
+    func centerView(in scrollView: UIScrollView) {
+      guard let view = scrollView.viewWithTag(101) else { return }
+      let contentWidth = view.bounds.width * scrollView.zoomScale
+      let contentHeight = view.bounds.height * scrollView.zoomScale
+      let viewport = scrollView.bounds.size
+      scrollView.contentInset = UIEdgeInsets(
+        top: max(0, (viewport.height - contentHeight) / 2),
+        left: max(0, (viewport.width - contentWidth) / 2),
+        bottom: max(0, (viewport.height - contentHeight) / 2),
+        right: max(0, (viewport.width - contentWidth) / 2)
+      )
+    }
+
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
+      centerView(in: scrollView)
+      onZoomChanged(scrollView.zoomScale > scrollView.minimumZoomScale + 0.01)
+    }
+
+    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+      centerView(in: scrollView)
+      onZoomChanged(scale > scrollView.minimumZoomScale + 0.01)
+    }
+
+    @objc func handleTap() {
+      onTap()
+    }
+
+    @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+      guard let scrollView = gesture.view as? UIScrollView else { return }
+      if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
+        scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
+      } else if let view = scrollView.viewWithTag(101) {
+        let point = gesture.location(in: view)
+        let side = min(view.bounds.width, view.bounds.height) / 2
+        let rect = CGRect(x: point.x - side / 2, y: point.y - side / 2, width: side, height: side)
+        scrollView.zoom(to: rect, animated: true)
+      }
+    }
   }
 }
 

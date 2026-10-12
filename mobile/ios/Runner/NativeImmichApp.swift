@@ -351,6 +351,14 @@ final class NativeImmichClient {
     let favorites = strings("isFavorite")
     let hashes = strings("thumbhash")
     let livePhotoIDs = strings("livePhotoVideoId")
+    let fileNames = strings("originalFileName")
+    let mimeTypes = strings("originalMimeType")
+    let widths = strings("width")
+    let heights = strings("height")
+    let sizes = strings("fileSizeInByte")
+    let latitudes = strings("latitude")
+    let longitudes = strings("longitude")
+    let visibility = strings("visibility")
     return ids.enumerated().compactMap { index, rawID in
       guard let id = rawID as? String else { return nil }
       let dateString = (dates[safe: index] as? String) ?? (created[safe: index] as? String) ?? bucket.id
@@ -361,7 +369,15 @@ final class NativeImmichClient {
         isImage: images[safe: index] as? Bool ?? true,
         isFavorite: favorites[safe: index] as? Bool ?? false,
         thumbhash: hashes[safe: index] as? String,
-        livePhotoVideoId: livePhotoIDs[safe: index] as? String
+        livePhotoVideoId: livePhotoIDs[safe: index] as? String,
+        originalFileName: fileNames[safe: index] as? String,
+        originalMimeType: mimeTypes[safe: index] as? String,
+        width: widths[safe: index] as? Int,
+        height: heights[safe: index] as? Int,
+        fileSizeInByte: (sizes[safe: index] as? NSNumber)?.int64Value,
+        latitude: (latitudes[safe: index] as? NSNumber)?.doubleValue,
+        longitude: (longitudes[safe: index] as? NSNumber)?.doubleValue,
+        isArchived: (visibility[safe: index] as? String) == "archive" || (visibility[safe: index] as? String) == "ARCHIVE"
       )
     }
   }
@@ -372,11 +388,8 @@ final class NativeImmichClient {
 
   func deleteAssets(ids: [String]) async throws {
     guard !ids.isEmpty else { return }
-    let payload: [String: Any] = [
-      "ids": ids,
-      "force": true
-    ]
-    _ = try await send(path: "assets", method: "DELETE", body: payload)
+    // Omit `force` so Immich applies its normal trash/recycle-bin semantics.
+    _ = try await send(path: "assets", method: "DELETE", body: ["ids": ids])
   }
 
   func createAlbum(name: String) async throws -> [String: Any] {
@@ -391,15 +404,62 @@ final class NativeImmichClient {
   }
 
   func updateFavorite(id: String, isFavorite: Bool) async throws {
-    let payload: [String: Any] = [
-      "ids": [id],
-      "isFavorite": isFavorite
-    ]
-    _ = try await send(path: "assets", method: "PUT", body: payload)
+    try await updateFavorites(ids: [id], isFavorite: isFavorite)
+  }
+
+  func updateFavorites(ids: [String], isFavorite: Bool) async throws {
+    guard !ids.isEmpty else { return }
+    _ = try await send(path: "assets", method: "PUT", body: ["ids": ids, "isFavorite": isFavorite])
+  }
+
+  func updateVisibility(ids: [String], visibility: String) async throws {
+    guard !ids.isEmpty else { return }
+    _ = try await send(path: "assets", method: "PUT", body: ["ids": ids, "visibility": visibility])
+  }
+
+
+  func addAssetsToAlbum(ids: [String], albumID: String) async throws -> [[String: Any]] {
+    guard !ids.isEmpty else { return [] }
+    let base = config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")
+    guard let url = URL(string: base + "/albums/\(albumID)/assets") else { throw NativeAPIError.invalidServer }
+    var request = URLRequest(url: url)
+    request.httpMethod = "PUT"
+    request.setValue("application/json", forHTTPHeaderField: "Accept")
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.httpBody = try JSONSerialization.data(withJSONObject: ["ids": ids])
+    applyAuth(to: &request)
+    let (data, response) = try await nativeData(for: request, using: session)
+    try check(response: response, data: data)
+    guard let results = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+      throw NativeAPIError.invalidJSON("/albums/{id}/assets")
+    }
+    return results
   }
 
   func assetInfo(id: String) async throws -> [String: Any] {
     try await send(path: "assets/\(id)", method: "GET")
+  }
+
+  func serverAsset(id: String) async throws -> NativeAsset? {
+    NativeImmichClient.decodeAsset(try await assetInfo(id: id))
+  }
+
+  func originalFile(for asset: NativeAsset) async throws -> URL {
+    guard let url = originalURL(for: asset),
+          let endpoint = URL(string: config.apiEndpoint ?? (Self.normalize(config.serverUrl) + "/api")),
+          url.scheme == endpoint.scheme, url.host == endpoint.host, url.port == endpoint.port,
+          url.path.hasPrefix(endpoint.path + "/") else { throw NativeAPIError.invalidServer }
+    var request = URLRequest(url: url)
+    request.setValue("*/*", forHTTPHeaderField: "Accept")
+    applyAuth(to: &request)
+    let (downloadedURL, response) = try await session.download(for: request)
+    try check(response: response, data: Data())
+    let suggestedName = asset.originalFileName ?? "immich-\(asset.id).\(asset.isImage ? "jpg" : "mp4")"
+    let fileName = URL(fileURLWithPath: suggestedName).lastPathComponent
+    let target = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString)-\(fileName)")
+    do { try FileManager.default.moveItem(at: downloadedURL, to: target) }
+    catch { try? FileManager.default.removeItem(at: downloadedURL); throw error }
+    return target
   }
 
   nonisolated func originalURL(for asset: NativeAsset) -> URL? {
@@ -529,6 +589,14 @@ struct NativeAsset: Identifiable {
   let isFavorite: Bool
   let thumbhash: String?
   var livePhotoVideoId: String? = nil
+  var originalFileName: String? = nil
+  var originalMimeType: String? = nil
+  var width: Int? = nil
+  var height: Int? = nil
+  var fileSizeInByte: Int64? = nil
+  var latitude: Double? = nil
+  var longitude: Double? = nil
+  var isArchived: Bool = false
 }
 
 // MARK: - SwiftUI app and login
@@ -687,6 +755,7 @@ private final class NativeTimelineModel: ObservableObject {
   @Published private(set) var assets: [NativeAsset] = []
   @Published private(set) var isLoading = false
   @Published private(set) var hasOlder = true
+  @Published private(set) var newlyAddedCount = 0
   @Published var error: String?
 
   private let client: NativeImmichClient
@@ -703,14 +772,21 @@ private final class NativeTimelineModel: ObservableObject {
     isLoading = true
     error = nil
     defer { isLoading = false }
+    let existingAssets = assets
+    let existingIDs = Set(existingAssets.map(\.id))
+    let existingBuckets = buckets
+    let existingNextBucket = nextBucket
+    let existingSearchFallback = searchFallbackEnabled
+    let existingSearchCursor = searchCursor
     do {
-      assets = []
       searchFallbackEnabled = false
       searchCursor = nil
       buckets = try await client.timelineBuckets()
       nextBucket = 0
       hasOlder = !buckets.isEmpty
       try await loadNextPage()
+      newlyAddedCount = assets.filter { !existingIDs.contains($0.id) }.count
+      assets = (existingAssets + assets).reduce(into: [String: NativeAsset]()) { $0[$1.id] = $1 }.values.sorted { $0.date < $1.date }
       // If the first page of buckets had very few assets, load more to fill view
       while assets.count < 100 && hasOlder {
         try await loadNextPage()
@@ -721,9 +797,16 @@ private final class NativeTimelineModel: ObservableObject {
       do {
         searchFallbackEnabled = true
         searchCursor = nil
-        assets = []
+        assets = existingAssets
         try await loadSearchFallbackPage()
-      } catch { self.error = error.localizedDescription }
+      } catch {
+        assets = existingAssets
+        buckets = existingBuckets
+        nextBucket = existingNextBucket
+        searchFallbackEnabled = existingSearchFallback
+        searchCursor = existingSearchCursor
+        self.error = error.localizedDescription
+      }
     }
   }
 
@@ -734,6 +817,8 @@ private final class NativeTimelineModel: ObservableObject {
     do {
       if searchFallbackEnabled {
         let page = try await client.searchPage(cursor: nil, filter: ["visibility": ["eq": "timeline"]])
+        let existingIDs = Set(assets.map(\.id))
+        newlyAddedCount = page.assets.filter { !existingIDs.contains($0.id) }.count
         var seen = Set<String>()
         assets = (page.assets + assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
         searchCursor = page.next
@@ -742,9 +827,10 @@ private final class NativeTimelineModel: ObservableObject {
         let refreshedBuckets = try await client.timelineBuckets()
         var incoming = [NativeAsset]()
         for bucket in refreshedBuckets.prefix(pageSize) {
-          do { incoming.append(contentsOf: try await client.assets(in: bucket)) }
-          catch { continue }
+          incoming.append(contentsOf: try await client.assets(in: bucket))
         }
+        let existingIDs = Set(assets.map(\.id))
+        newlyAddedCount = incoming.filter { !existingIDs.contains($0.id) }.count
         var seen = Set<String>()
         assets = (incoming + assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
         buckets = refreshedBuckets
@@ -771,7 +857,7 @@ private final class NativeTimelineModel: ObservableObject {
   }
 
   func retry() async {
-    if buckets.isEmpty {
+    if error != nil {
       await loadInitial()
     } else {
       await loadOlder()
@@ -793,12 +879,8 @@ private final class NativeTimelineModel: ObservableObject {
     let page = buckets[nextBucket..<end]
     var result: [NativeAsset] = []
     for bucket in page {
-      do {
-        let bucketAssets = try await client.assets(in: bucket)
-        result.append(contentsOf: bucketAssets)
-      } catch {
-        // Continue with remaining buckets even if one bucket query errors
-      }
+      let bucketAssets = try await client.assets(in: bucket)
+      result.append(contentsOf: bucketAssets)
     }
     nextBucket = end
     hasOlder = nextBucket < buckets.count
@@ -809,6 +891,14 @@ private final class NativeTimelineModel: ObservableObject {
   func removeAssets(ids: Set<String>) {
     assets.removeAll { ids.contains($0.id) }
   }
+
+  func upsert(_ asset: NativeAsset) {
+    assets.removeAll { $0.id == asset.id }
+    assets.append(asset)
+    assets.sort { $0.date < $1.date }
+  }
+
+  func acknowledgeNewAssets() { newlyAddedCount = 0 }
 }
 
 struct NativePhotosView: View {
@@ -819,7 +909,11 @@ struct NativePhotosView: View {
   @StateObject private var model: NativeTimelineModel
   @StateObject private var cloud = NativeCloudStatus()
   @State private var columns: Int = 4
-  @State private var gestureBaseColumns: Int? = nil
+  @State private var cellSize: CGFloat = 94
+  @State private var gestureBaseCellSize: CGFloat? = nil
+  @State private var gestureAnchorID: String?
+  @State private var loadingMatchedServerIDs = Set<String>()
+  @State private var sourceFilter: NativePhotosSource = .all
   @State private var cachedDayGroups: [NativeDayGroup] = []
   @AppStorage("immichz_photos_excluded_local_album_ids") private var excludedLocalAlbumIDsRaw = "[]"
   @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerAlbumIDsRaw = "[]"
@@ -845,11 +939,20 @@ struct NativePhotosView: View {
   @State private var showServerSettings = false
   @State private var showSyncSettings = false
   @State private var showDeleteConfirmation = false
+  @State private var showLocalDeleteWarning = false
+  @State private var pendingDeleteScope: NativeDeleteTargetScope = .all
   @State private var deletionError: String?
   @State private var isDeleting = false
   @State private var batchShareItems: [Any]? = nil
   @State private var isPreparingBatchShare = false
   @State private var isRefreshing = false
+  @State private var actionMessage: String?
+  @State private var archivedServerIDs = Set<String>()
+  @State private var showSaveConfirmation = false
+  @State private var showAlbumTargetDialog = false
+  @State private var showLocalAlbumPicker = false
+  @State private var showServerAlbumPicker = false
+  @State private var duplicateSaveCount = 0
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
 
@@ -863,6 +966,55 @@ struct NativePhotosView: View {
 
   private var totalDisplayCount: Int {
     cachedDayGroups.reduce(0) { $0 + $1.assets.count }
+  }
+
+
+
+  private var filteredTimelineAssets: [NativeGridItem] {
+    let matched = cloud.matchedServerIDs
+    let serverByID = Dictionary(model.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let serverToLocal = Dictionary(matched.map { ($0.value, $0.key) }, uniquingKeysWith: { first, _ in first })
+    let localByID = Dictionary(device.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    var seenServer = Set<String>()
+    var result = [NativeGridItem]()
+    for local in device.assets {
+      let item: NativeGridItem
+      if let serverID = matched[local.id] {
+        if let server = serverByID[serverID] {
+          item = NativeGridItem(server: server, local: local)
+        } else {
+          // Keep the local copy visible in All, but don't project an unhydrated
+          // server match as an actionable cloud asset until its DTO is loaded.
+          seenServer.insert(serverID)
+          if sourceFilter == .server { continue }
+          item = NativeGridItem(server: nil, local: local)
+        }
+        seenServer.insert(serverID)
+        if excludedServerAssetIDs.contains(serverID) { continue }
+        if sourceFilter == .server && archivedServerIDs.contains(serverID) { continue }
+      } else { item = NativeGridItem(server: nil, local: local) }
+      if nativePhotosSourceIncludes(sourceFilter, hasLocal: item.local != nil, hasServer: item.server != nil, hasVerifiedMatch: matched[local.id] != nil),
+         !excludedLocalAssetIDsForTimeline.contains(local.id) {
+        result.append(item)
+      }
+    }
+    if sourceFilter != .device {
+      for server in model.assets where !seenServer.contains(server.id) && !archivedServerIDs.contains(server.id) {
+        if excludedServerAssetIDs.contains(server.id) { continue }
+        if let localID = serverToLocal[server.id], excludedLocalAssetIDsForTimeline.contains(localID) { continue }
+        let local = serverToLocal[server.id].flatMap { localByID[$0] }
+        result.append(NativeGridItem(server: server, local: local))
+      }
+    }
+    return result.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
+  }
+
+  private var excludedLocalAssetIDsForTimeline: Set<String> {
+    nativePhotosHiddenLocalAssetIDs(
+      in: device.albums,
+      excludedAlbumIDs: nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw),
+      assetsForAlbum: device.assets(in:)
+    )
   }
 
   private var connectionAndSyncBadge: some View {
@@ -887,8 +1039,12 @@ struct NativePhotosView: View {
         Image(systemName: "arrow.clockwise.icloud")
           .font(.system(size: 11, weight: .medium))
           .foregroundColor(.secondary)
+      } else if unknownLocalCount > 0 {
+        Image(systemName: "questionmark.icloud")
+          .font(.system(size: 11, weight: .medium))
+          .foregroundColor(.secondary)
       } else if unsyncedLocalCount > 0 {
-        Image(systemName: "icloud.and.arrow.up")
+        Image(systemName: "icloud.slash")
           .font(.system(size: 11, weight: .medium))
           .foregroundColor(.secondary.opacity(0.6))
       } else {
@@ -900,17 +1056,30 @@ struct NativePhotosView: View {
   }
 
   private var unsyncedLocalCount: Int {
-    device.assets.filter { cloud.matchedServerIDs[$0.id] == nil }.count
+    device.assets.filter { cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
+  }
+
+  private var unknownLocalCount: Int {
+    device.assets.filter { !cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
   @ViewBuilder
   private var trailingToolbarContent: some View {
     if isSelecting {
-      Button("全选") {
-        selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id))
+      Button(selectedIDs.count == totalDisplayCount ? "取消全选" : "全选") {
+        if selectedIDs.count == totalDisplayCount { selectedIDs.removeAll() }
+        else { selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id)) }
       }
     } else {
       HStack(spacing: 2) {
+        Button("选择") {
+          isSelecting = true
+          selectedIDs.removeAll()
+        }
+        .font(.system(size: 14, weight: .medium))
+        .buttonStyle(.plain)
+        .padding(.horizontal, 5)
+
         Button {
           showServerSettings = true
         } label: {
@@ -958,8 +1127,12 @@ struct NativePhotosView: View {
       Image(systemName: "arrow.clockwise.icloud")
         .font(.system(size: 16, weight: .medium))
         .foregroundColor(.secondary)
+    } else if unknownLocalCount > 0 {
+      Image(systemName: "questionmark.icloud")
+        .font(.system(size: 16, weight: .medium))
+        .foregroundColor(.secondary)
     } else if unsyncedLocalCount > 0 {
-      Image(systemName: "icloud.and.arrow.up")
+      Image(systemName: "icloud.slash")
         .font(.system(size: 16, weight: .medium))
         .foregroundColor(.secondary.opacity(0.6))
     } else {
@@ -995,7 +1168,21 @@ struct NativePhotosView: View {
       ScrollViewReader { proxy in
         ScrollView {
           LazyVStack(spacing: 4) {
-            if model.hasOlder && !model.assets.isEmpty {
+            if model.newlyAddedCount > 0 && sourceFilter != .device {
+              Button {
+                model.acknowledgeNewAssets()
+                scrollToBottom(proxy: proxy, animated: true)
+              } label: {
+                Label("有 \(model.newlyAddedCount) 项新照片 · 查看最新", systemImage: "arrow.down.to.line")
+                  .font(.caption.weight(.medium))
+                  .frame(maxWidth: .infinity)
+                  .padding(.vertical, 8)
+                  .background(.thinMaterial, in: Capsule())
+              }
+              .padding(.horizontal)
+              .buttonStyle(.plain)
+            }
+            if sourceFilter != .device && model.hasOlder && !model.assets.isEmpty {
               ProgressView()
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
@@ -1006,7 +1193,7 @@ struct NativePhotosView: View {
                   }
                 }
             }
-            if model.assets.isEmpty && (model.isLoading || device.isLoading) {
+            if sourceFilter != .device && model.assets.isEmpty && (model.isLoading || device.isLoading) {
               VStack(spacing: 10) {
                 ProgressView()
                 Text("正在加载照片…")
@@ -1015,12 +1202,12 @@ struct NativePhotosView: View {
               .frame(maxWidth: .infinity, minHeight: 240)
             }
             if !model.isLoading && !device.isLoading && model.error == nil &&
-                cachedDayGroups.isEmpty && (device.assets.isEmpty || !device.authorized) {
+                cachedDayGroups.isEmpty && (sourceFilter == .device ? (!device.authorized || device.assets.isEmpty) : (model.assets.isEmpty && device.assets.isEmpty)) {
               VStack(spacing: 8) {
                 Image(systemName: "photo.on.rectangle.angled")
                   .font(.largeTitle).foregroundColor(.secondary)
                 Text("暂无照片").font(.headline)
-                Text("当前账号中没有可显示的照片。")
+                Text(sourceFilter == .device && !device.authorized ? "请授予照片访问权限，查看本机照片。" : "当前来源中没有可显示的照片。")
                   .font(.caption).foregroundColor(.secondary)
               }
               .frame(maxWidth: .infinity, minHeight: 220)
@@ -1035,7 +1222,7 @@ struct NativePhotosView: View {
                     .padding(.top, 4)
                 }
                 let gridSpacing: CGFloat = columns > 7 ? 1 : 2
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: cellSize, maximum: cellSize), spacing: gridSpacing)], spacing: gridSpacing) {
                   ForEach(group.assets) { entry in
                     Color.clear
                       .aspectRatio(1, contentMode: .fit)
@@ -1148,49 +1335,47 @@ struct NativePhotosView: View {
           MagnificationGesture()
             .onChanged { value in
               guard !isSelecting else { return }
-              if !isMagnifying {
-                isMagnifying = true
+              isMagnifying = true
+              let base = gestureBaseCellSize ?? cellSize
+              if gestureBaseCellSize == nil {
+                gestureBaseCellSize = base
+                gestureAnchorID = centerVisibleAssetID
               }
-              let base = gestureBaseColumns ?? columns
-              if gestureBaseColumns == nil {
-                gestureBaseColumns = base
-              }
-              let deadzone: Double = 0.12
-              var effectiveValue = value
-              if value > 1.0 {
-                if value < 1.0 + deadzone { return }
-                effectiveValue = 1.0 + (value - 1.0 - deadzone)
-              } else {
-                if value > 1.0 - deadzone { return }
-                effectiveValue = 1.0 - (1.0 - deadzone - value)
-              }
-              let delta: Double
-              if effectiveValue >= 1.0 {
-                delta = -(effectiveValue - 1.0) * 4.0
-              } else {
-                delta = (1.0 / max(0.08, effectiveValue) - 1.0) * 4.0
-              }
-              let target = min(15, max(1, Int(round(Double(base) + delta))))
-              if target != columns {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                  columns = target
-                }
-              }
+              let nextSize = nativeClampedPhotosCellSize(base, magnification: value)
+              cellSize = nextSize
+              let newColumns = max(1, Int((UIScreen.main.bounds.width / nextSize).rounded()))
+              if newColumns != columns { columns = newColumns }
+              if let anchor = gestureAnchorID { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .center) } }
             }
             .onEnded { _ in
-              gestureBaseColumns = nil
-              DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                isMagnifying = false
-              }
+              gestureBaseCellSize = nil
+              gestureAnchorID = nil
+              DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { isMagnifying = false }
             }
         )
-        .onChange(of: cloud.matchedServerIDs) { _ in rebuildDayGroups() }
-        .refreshable {
-          await model.loadInitial()
+        .onChange(of: cloud.matchedServerIDs) { _ in
+          let anchor = visibleAnchorID
           rebuildDayGroups()
-          Task { await cloud.check(device.assets, client: client) }
-          positionInitiallyIfReady(proxy: proxy)
+          if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+          Task { await loadKnownMatchedServerAssets() }
+        }
+        .onChange(of: sourceFilter) { _ in
+          let anchor = visibleAnchorID
+          let anchorDate = cachedDayGroups.flatMap(\.assets).first(where: { $0.id == anchor })?.date
+          rebuildDayGroups()
+          updateSelectionAfterTimelineChange()
+          let nextAnchor = cachedDayGroups.flatMap(\.assets).first(where: { $0.id == anchor })?.id
+            ?? anchorDate.flatMap { date in cachedDayGroups.flatMap(\.assets).min(by: { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) })?.id }
+          if let nextAnchor { withAnimation(.none) { proxy.scrollTo(nextAnchor, anchor: .top) } }
+        }
+        .refreshable {
+          let anchor = visibleAnchorID
+          await model.refreshLatest()
+          await device.refreshAndWait()
+          rebuildDayGroups()
+          await cloud.check(device.assets, client: client)
+          await loadKnownMatchedServerAssets()
+          if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
         }
         .onChange(of: device.assets.count) { _ in
           rebuildDayGroups()
@@ -1206,9 +1391,9 @@ struct NativePhotosView: View {
           updateSelectionAfterTimelineChange()
         }
         .onChange(of: device.isLoading) { loading in
-          guard !loading, initialRemoteLoaded, !isSelecting else { return }
+          guard !loading else { return }
           rebuildDayGroups()
-          scrollToBottom(proxy: proxy, animated: false)
+          if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
         }
         .onAppear {
           rebuildDayGroups()
@@ -1220,19 +1405,24 @@ struct NativePhotosView: View {
               rebuildDayGroups()
               positionInitiallyIfReady(proxy: proxy)
               await cloud.check(device.assets, client: client)
+              await loadKnownMatchedServerAssets()
             }
           } else {
             initialRemoteLoaded = true
-            Task { await cloud.check(device.assets, client: client) }
+            Task {
+              await cloud.check(device.assets, client: client)
+              await loadKnownMatchedServerAssets()
+            }
             positionInitiallyIfReady(proxy: proxy)
           }
         }
         .onChange(of: model.assets.count) { _ in
+          let anchor = visibleAnchorID
           rebuildDayGroups()
-          positionInitiallyIfReady(proxy: proxy)
+          if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
+          else if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
         }
         .onChange(of: model.isLoading) { _ in positionInitiallyIfReady(proxy: proxy) }
-        .onChange(of: device.isLoading) { _ in positionInitiallyIfReady(proxy: proxy) }
         .onReceive(NotificationCenter.default.publisher(for: .immichScrollPhotosToBottom)) { _ in
           let now = Date()
           guard now.timeIntervalSince(lastScrollToBottomTime) > 0.25 else { return }
@@ -1249,47 +1439,31 @@ struct NativePhotosView: View {
           guard now.timeIntervalSince(lastForegroundRefreshTime) > 2 else { return }
           lastForegroundRefreshTime = now
           Task {
+            let anchor = visibleAnchorID
             await device.refreshAndWait()
             if !model.isLoading { await model.refreshLatest() }
             rebuildDayGroups()
             initialRemoteLoaded = true
             await cloud.check(device.assets, client: client)
-            scrollToBottom(proxy: proxy, animated: false)
+            await loadKnownMatchedServerAssets()
+            if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
           }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
           if isSelecting {
-            HStack {
-              Button {
-                triggerBatchShare()
-              } label: {
-                if isPreparingBatchShare {
-                  ProgressView()
-                    .scaleEffect(0.85)
-                    .frame(width: 28, height: 28)
-                } else {
-                  Image(systemName: "square.and.arrow.up")
-                    .font(.system(size: 21, weight: .regular))
-                }
-              }
-              .disabled(selectedIDs.isEmpty || isPreparingBatchShare)
-
-              Spacer()
-
-              Button(role: .destructive) {
-                showDeleteConfirmation = true
-              } label: {
-                Image(systemName: "trash")
-                  .font(.system(size: 21, weight: .regular))
-                  .foregroundColor(selectedIDs.isEmpty || isDeleting ? .secondary : .red)
-              }
-              .disabled(selectedIDs.isEmpty || isDeleting)
+            HStack(spacing: 0) {
+              batchActionButton("square.and.arrow.up", label: "分享", disabled: selectedIDs.isEmpty || isPreparingBatchShare) { triggerBatchShare() }
+              batchActionButton("heart", label: "收藏", disabled: selectedIDs.isEmpty) { Task { await updateBatchFavorites() } }
+              batchActionButton("archivebox", label: "归档", disabled: !selectedItems.contains(where: { $0.server != nil })) { Task { await archiveSelected() } }
+              batchActionButton("plus.rectangle.on.folder", label: "加入相册", disabled: !selectedItems.contains(where: { $0.server != nil || $0.local != nil })) { showAlbumTargetDialog = true }
+              batchActionButton("square.and.arrow.down", label: "保存", disabled: !selectedItems.contains(where: { $0.server != nil })) { prepareSaveToDevice() }
+              batchActionButton("trash", label: "删除", disabled: selectedIDs.isEmpty || isDeleting, destructive: true) { showDeleteConfirmation = true }
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 10)
             .background(.ultraThinMaterial)
           } else {
-            if !device.authorized {
+            if !device.authorized && sourceFilter != .server {
               Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
             }
             if let message = cloud.message {
@@ -1338,28 +1512,61 @@ struct NativePhotosView: View {
           ToolbarItem(placement: .principal) {
             if isSelecting {
               Text("已选 \(selectedIDs.count) 项").font(.headline)
+            } else {
+              Picker("照片来源", selection: $sourceFilter) {
+                ForEach(NativePhotosSource.allCases) { source in Text(source.rawValue).tag(source) }
+              }
+              .pickerStyle(.segmented)
+              .frame(maxWidth: 230)
+              .accessibilityLabel("照片来源")
             }
           }
           ToolbarItem(placement: .navigationBarTrailing) {
             trailingToolbarContent
           }
         }
+        .confirmationDialog("选择相册来源", isPresented: $showAlbumTargetDialog, titleVisibility: .visible) {
+          Button("加入本机相册") { showLocalAlbumPicker = true }
+          Button("加入云端相册") { showServerAlbumPicker = true }
+          Button("取消", role: .cancel) {}
+        } message: { Text("本机资产和云端资产分别操作，不会自动上传。") }
         .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
-          if selectedHasBothCopies {
-            Button("全部删除（本地与云端）", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
-            Button("仅删除本地照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
-            Button("仅删除云端照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
+          if selectionSpansBothSources {
+            Button("删除所有所选副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+            Button("仅删除本机副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
+            Button("仅删除云端副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
+          } else if selectedHasBothCopies {
+            Button("删除本机和云端副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+            Button("仅删除本机副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
+            Button("仅删除云端副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
           } else {
             Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
           }
           Button("取消", role: .cancel) {}
         } message: {
-          if selectedHasBothCopies {
-            Text("选中的照片中包含本地和云端都存在的照片，请选择删除范围。")
+          if selectionSpansBothSources {
+            Text(selectedHasBothCopies ? "选择的内容包含双端副本或不同来源的资产，请明确删除范围。" : "选择的内容包含本机与云端资产，请明确删除范围。")
           } else {
             Text("确认删除选中的照片？此操作不可撤销。")
           }
         }
+        .alert("保存到本机照片", isPresented: $showSaveConfirmation) {
+          Button("取消", role: .cancel) {}
+          Button("继续保存") { Task { await saveSelectedToDevice() } }
+        } message: {
+          Text(duplicateSaveCount > 0 ? "所选内容中有 \(duplicateSaveCount) 项已存在本机副本，继续操作可能产生重复照片。" : "将下载云端原件并保存到系统照片。")
+        }
+        .alert("操作结果", isPresented: Binding(get: { actionMessage != nil }, set: { if !$0 { actionMessage = nil } })) {
+          Button("好", role: .cancel) { actionMessage = nil }
+        } message: { Text(actionMessage ?? "") }
+        .alert("本机删除确认", isPresented: $showLocalDeleteWarning) {
+          Button("取消", role: .cancel) {}
+          Button("继续", role: .destructive) {
+            let targets = selectedItems
+            let scope = pendingDeleteScope
+            Task { await performSelectedDeletion(items: targets, scope: scope) }
+          }
+        } message: { Text("删除本机照片会永久从系统照片中移除；若开启 iCloud 照片，可能同步到其他设备。将仅执行你刚才选择的删除范围。") }
         .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
           Button("确定", role: .cancel) { deletionError = nil }
         } message: { Text(deletionError ?? "未知错误") }
@@ -1374,6 +1581,12 @@ struct NativePhotosView: View {
         }
         .sheet(isPresented: $showSyncSettings) {
           NativeSyncSettingsSheet(client: client, device: device, cloud: cloud)
+        }
+        .sheet(isPresented: $showLocalAlbumPicker) {
+          NativePhotosLocalAlbumPicker(albums: device.albums) { albumID in Task { await addSelectedToLocalAlbum(albumID) } }
+        }
+        .sheet(isPresented: $showServerAlbumPicker) {
+          NativePhotosServerAlbumPicker(client: client) { albumID in Task { await addSelectedToServerAlbum(albumID) } }
         }
         .fullScreenCover(item: $activeViewerItem) { item in
           NativeUnifiedGalleryViewer(
@@ -1396,46 +1609,216 @@ struct NativePhotosView: View {
     .navigationViewStyle(.stack)
   }
 
+  private var selectedItems: [NativeGridItem] {
+    cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
+  }
+
+  private var visibleAnchorID: String? {
+    let viewportHeight = UIScreen.main.bounds.height
+    return itemBounds.filter { $0.value.maxY > 0 && $0.value.minY < viewportHeight }
+      .min(by: { $0.value.minY < $1.value.minY })?.key
+  }
+
+  private var centerVisibleAssetID: String? {
+    let viewport = UIScreen.main.bounds
+    let center = CGPoint(x: viewport.midX, y: viewport.midY)
+    return itemBounds.filter { $0.value.maxY > 0 && $0.value.minY < viewport.height }
+      .min(by: { hypot($0.value.midX - center.x, $0.value.midY - center.y) < hypot($1.value.midX - center.x, $1.value.midY - center.y) })?.key
+  }
+
+  @MainActor private func loadKnownMatchedServerAssets() async {
+    let loaded = Set(model.assets.map(\.id))
+    let missing = cloud.matchedServerIDs.values.filter { !loaded.contains($0) && !loadingMatchedServerIDs.contains($0) }
+    guard !missing.isEmpty else { return }
+    loadingMatchedServerIDs.formUnion(missing)
+    for id in missing {
+      do {
+        if let asset = try await client.serverAsset(id: id) { model.upsert(asset) }
+      } catch {
+        actionMessage = "已知匹配的云端资产信息暂时无法载入，状态保持未知；重试或刷新后可再次加载。"
+      }
+      loadingMatchedServerIDs.remove(id)
+    }
+  }
+
+  private func batchActionButton(_ symbol: String, label: String, disabled: Bool, destructive: Bool = false, action: @escaping () -> Void) -> some View {
+    Button(action: action) {
+      VStack(spacing: 3) {
+        Image(systemName: symbol).font(.system(size: 18, weight: .medium))
+        Text(label).font(.system(size: 10, weight: .medium))
+      }
+      .foregroundColor(disabled ? .secondary : (destructive ? .red : .primary))
+      .frame(maxWidth: .infinity, minHeight: 42)
+      .contentShape(Rectangle())
+    }
+    .buttonStyle(.plain)
+    .disabled(disabled)
+    .accessibilityLabel(label)
+  }
+
   private var selectedHasBothCopies: Bool {
-    let items = cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
-    return items.contains { $0.server != nil && $0.local != nil }
+    selectedItems.contains { $0.server != nil && $0.local != nil }
+  }
+
+  private var selectionSpansBothSources: Bool {
+    selectedItems.contains(where: { $0.local != nil }) && selectedItems.contains(where: { $0.server != nil })
   }
 
   private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
     guard !isDeleting else { return }
-    let items = cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
+    let items = selectedItems
     guard !items.isEmpty else { return }
+    if scope != .remoteOnly && items.contains(where: { $0.local != nil }) {
+      pendingDeleteScope = scope
+      showLocalDeleteWarning = true
+      return
+    }
+    await performSelectedDeletion(items: items, scope: scope)
+  }
+
+  private func performSelectedDeletion(items: [NativeGridItem], scope: NativeDeleteTargetScope) async {
+    guard !isDeleting else { return }
     isDeleting = true
     defer { isDeleting = false }
     do {
       try await nativeDeleteGridItems(items, scope: scope, client: client, device: device)
       if scope == .all || scope == .remoteOnly {
-        model.removeAssets(ids: Set(items.compactMap { $0.server?.id }))
+        let serverIDs = Set(items.compactMap { $0.server?.id })
+        model.removeAssets(ids: serverIDs)
+        let invalidatedLocalIDs = Set(items.compactMap { item in
+          guard let local = item.local,
+                let serverID = cloud.matchedServerIDs[local.id], serverIDs.contains(serverID) else { return nil }
+          return local.id
+        })
+        cloud.forgetMatches(localIDs: invalidatedLocalIDs)
       }
       selectedIDs.removeAll()
       isSelecting = false
       device.refresh()
       rebuildDayGroups()
     } catch {
+      if scope == .all || scope == .remoteOnly {
+        cloud.forgetMatches(localIDs: Set(items.compactMap { item in
+          guard let local = item.local,
+                let serverID = item.server?.id,
+                cloud.matchedServerIDs[local.id] == serverID else { return nil }
+          return local.id
+        }))
+      }
       deletionError = "可能已有部分照片删除成功，请刷新确认。\(error.localizedDescription)"
       device.refresh()
-      await model.loadInitial()
+      await model.refreshLatest()
       rebuildDayGroups()
     }
   }
 
+  private func updateBatchFavorites() async {
+    let items = selectedItems
+    guard !items.isEmpty else { return }
+    let target = !items.allSatisfy(\.isFavorite)
+    var succeeded = 0
+    var failed = 0
+    let serverIDs = items.compactMap { $0.server?.id }
+    for id in serverIDs {
+      do { try await client.updateFavorites(ids: [id], isFavorite: target); succeeded += 1 }
+      catch { failed += 1 }
+    }
+    let localIDs = items.compactMap { $0.local?.id }
+    if !localIDs.isEmpty {
+      if await device.updateFavorite(ids: localIDs, isFavorite: target) { succeeded += localIDs.count }
+      else { failed += localIDs.count }
+    }
+    actionMessage = "收藏\(target ? "已开启" : "已关闭")：成功 \(succeeded) 项，失败 \(failed) 项。"
+    device.refresh()
+    await model.refreshLatest()
+    rebuildDayGroups()
+  }
+
+  private func archiveSelected() async {
+    let targets = selectedItems
+    let missingServerInfo = targets.filter { $0.server == nil && $0.local.flatMap { cloud.matchedServerIDs[$0.id] } != nil }.count
+    let candidates = targets.compactMap { item -> (NativeGridItem, String)? in
+      guard let server = item.server else { return nil }
+      return (item, server.id)
+    }
+    guard !candidates.isEmpty else { return }
+    var succeeded = Set<String>()
+    var failures = [String]()
+    for (_, id) in candidates {
+      do { try await client.updateVisibility(ids: [id], visibility: "archive"); succeeded.insert(id) }
+      catch { failures.append(id) }
+    }
+    archivedServerIDs.formUnion(succeeded)
+    model.removeAssets(ids: succeeded)
+    selectedIDs.subtract(Set(candidates.filter { succeeded.contains($0.1) }.map { $0.0.id }))
+    rebuildDayGroups()
+    let localOnlySkipped = targets.filter { $0.server == nil && $0.local != nil }.count
+    actionMessage = "归档成功 \(succeeded.count) 项，失败 \(failures.count) 项，跳过本机独有项 \(localOnlySkipped) 项，已匹配但云端信息缺失 \(missingServerInfo) 项。"
+  }
+
+  private func prepareSaveToDevice() {
+    let targets = selectedItems.filter { $0.server != nil }
+    guard !targets.isEmpty else { actionMessage = "没有可保存的云端原件。"; return }
+    duplicateSaveCount = targets.filter { $0.local != nil }.count
+    showSaveConfirmation = true
+  }
+
+  private func saveSelectedToDevice() async {
+    guard device.authorized else {
+      await device.requestAccess()
+      guard device.authorized else { actionMessage = "未获得本机照片写入权限。请在系统设置中允许访问后重试。"; return }
+    }
+    let targets = selectedItems.filter { $0.server != nil }
+    var urls: [URL] = []
+    var failed = 0
+    for item in targets {
+      guard let server = item.server else { continue }
+      do { urls.append(try await client.originalFile(for: server)) }
+      catch { failed += 1 }
+    }
+    let result = await device.saveFilesToPhotos(urls)
+    urls.forEach { try? FileManager.default.removeItem(at: $0) }
+    actionMessage = "保存到本机：成功 \(result.saved) 项，失败 \(result.failed + failed) 项。"
+  }
+
+  private func addSelectedToServerAlbum(_ albumID: String) async {
+    let ids = selectedItems.compactMap { $0.server?.id }
+    let skipped = selectedItems.count - ids.count
+    guard !ids.isEmpty else { actionMessage = "没有可加入云端相册的资产。"; return }
+    do {
+      let results = try await client.addAssetsToAlbum(ids: ids, albumID: albumID)
+      let failed = results.filter { ($0["success"] as? Bool) != true }.count
+      let reported = results.count
+      let succeeded = max(0, reported - failed)
+      let unreported = max(0, ids.count - reported)
+      actionMessage = "加入云端相册：成功 \(succeeded) 项，失败 \(failed) 项，未确认 \(unreported) 项。\(skipped > 0 ? "跳过本机独有项 \(skipped) 项。" : "")"
+    } catch { actionMessage = "加入云端相册失败：\(error.localizedDescription)" }
+  }
+
+  private func addSelectedToLocalAlbum(_ albumID: String) async {
+    let ids = selectedItems.compactMap { $0.local?.id }
+    let skipped = selectedItems.count - ids.count
+    guard !ids.isEmpty else { actionMessage = "没有可加入本机相册的资产。"; return }
+    if await device.addAssets(ids, toAlbum: albumID) {
+      actionMessage = "已加入本机相册 \(ids.count) 项。\(skipped > 0 ? "跳过云端独有项 \(skipped) 项。" : "")"
+    } else { actionMessage = "加入本机相册失败；请检查照片权限。" }
+  }
+
   private func triggerBatchShare() {
     guard !isPreparingBatchShare else { return }
-    let targets = cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
+    let targets = selectedItems
     guard !targets.isEmpty else { return }
     isPreparingBatchShare = true
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
     Task {
-      let contents = await nativePrepareBatchShare(items: targets, client: client)
+      let result = await nativePrepareBatchShare(items: targets, client: client)
       await MainActor.run {
         isPreparingBatchShare = false
-        if !contents.isEmpty {
-          batchShareItems = contents
+        if !result.files.isEmpty {
+          batchShareItems = result.files
+          if result.failed > 0 { actionMessage = "已准备 \(result.files.count) 项原件；\(result.failed) 项原件暂不可用而跳过。" }
+        } else {
+          actionMessage = "没有可分享的原件；未以预览替代。"
         }
       }
     }
@@ -1444,14 +1827,15 @@ struct NativePhotosView: View {
   private func triggerRefresh(proxy: ScrollViewProxy) {
     guard !isRefreshing else { return }
     isRefreshing = true
+    let anchor = visibleAnchorID
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
     Task {
-      await model.loadInitial()
+      await model.refreshLatest()
+      await device.refreshAndWait()
       rebuildDayGroups()
       await cloud.check(device.assets, client: client)
-      await MainActor.run {
-        isRefreshing = false
-      }
+      if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+      isRefreshing = false
     }
   }
 
@@ -1494,7 +1878,7 @@ struct NativePhotosView: View {
 
   private func requestOlder(proxy: ScrollViewProxy) {
     guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading, didInitialPosition else { return }
-    let anchor = cachedDayGroups.first?.assets.first?.id
+    let anchor = visibleAnchorID ?? cachedDayGroups.first?.assets.first?.id
     loadingOlderAnchor = anchor ?? "pending"
     Task {
       await model.loadOlder()
@@ -1502,8 +1886,11 @@ struct NativePhotosView: View {
         await Task.yield()
         withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) }
       }
-      try? await Task.sleep(nanoseconds: 300_000_000)
-      loadingOlderAnchor = nil
+      if model.error != nil { loadingOlderAnchor = nil }
+      else {
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        loadingOlderAnchor = nil
+      }
     }
   }
 
@@ -1542,55 +1929,10 @@ struct NativePhotosView: View {
   }
 
   private func rebuildDayGroups() {
-    let matchedLocalToServer = cloud.matchedServerIDs
-    let excludedLocalAlbumIDs = nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw)
-    let excludedLocalAssetIDs = nativePhotosHiddenLocalAssetIDs(
-      in: device.albums,
-      excludedAlbumIDs: excludedLocalAlbumIDs,
-      assetsForAlbum: device.assets(in:)
-    )
-    var hiddenServerAssetIDs = excludedServerAssetIDs
-    for localID in excludedLocalAssetIDs {
-      if let serverID = matchedLocalToServer[localID] { hiddenServerAssetIDs.insert(serverID) }
-    }
-    let serverAssetByID = Dictionary(model.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-
-    var usedServerIDs = Set<String>()
-    var merged: [NativeGridItem] = []
-    merged.reserveCapacity(model.assets.count + device.assets.count)
-
-    // 1. Process all local assets from the device, omitting assets in excluded albums.
-    for localAsset in device.assets where !excludedLocalAssetIDs.contains(localAsset.id) {
-      if let serverID = matchedLocalToServer[localAsset.id], hiddenServerAssetIDs.contains(serverID) {
-        continue
-      }
-      if let serverID = matchedLocalToServer[localAsset.id],
-         let serverAsset = serverAssetByID[serverID] {
-        // Matched and server asset is loaded -> unified single item
-        merged.append(NativeGridItem(server: serverAsset, local: localAsset))
-        usedServerIDs.insert(serverAsset.id)
-      } else {
-        // Local only, or server asset not yet loaded in model
-        merged.append(NativeGridItem(server: nil, local: localAsset))
-      }
-    }
-
-    // 2. Process all server assets, omitting items in excluded Immich albums.
-    for serverAsset in model.assets where !hiddenServerAssetIDs.contains(serverAsset.id) {
-      if !usedServerIDs.contains(serverAsset.id) {
-        // Server asset not already merged with a local asset -> display as remote item
-        merged.append(NativeGridItem(server: serverAsset, local: nil))
-      }
-    }
-
-    merged.sort { lhs, rhs in
-      if lhs.date == rhs.date { return lhs.id < rhs.id }
-      return lhs.date < rhs.date
-    }
     var grouped: [Date: [NativeGridItem]] = [:]
     var calendar = Calendar.autoupdatingCurrent
     calendar.timeZone = .autoupdatingCurrent
-    for item in merged {
+    for item in filteredTimelineAssets {
       let date = calendar.startOfDay(for: item.date)
       grouped[date, default: []].append(item)
     }
@@ -1704,26 +2046,92 @@ struct NativePhotosView: View {
   }
 
   private func cloudSymbol(for entry: NativeGridItem) -> String {
-    entry.cloudSymbol(matchedServerIDs: cloud.matchedServerIDs)
+    guard let local = entry.local else { return "cloud" }
+    if entry.server != nil || cloud.matchedServerIDs[local.id] != nil { return "checkmark.icloud" }
+    return cloud.checkedIDs.contains(local.id) ? "icloud.slash" : "questionmark.icloud"
   }
 
   private func cloudDescription(for entry: NativeGridItem) -> String {
     let typeName = entry.isVideo ? "视频" : "照片"
     if let local = entry.local {
-      if entry.server != nil || cloud.matchedServerIDs[local.id] != nil {
-        return "已同步\(typeName)"
-      } else {
-        return "未同步\(typeName)"
-      }
-    } else {
-      return "云端\(typeName)"
+      if entry.server != nil || cloud.matchedServerIDs[local.id] != nil { return "已核验云端副本的\(typeName)" }
+      return cloud.checkedIDs.contains(local.id) ? "仅本机\(typeName)" : "云端状态未知的本机\(typeName)"
     }
+    return "仅云端\(typeName)"
   }
 }
 
 private struct NativeDayGroup {
   let date: Date
   let assets: [NativeGridItem]
+}
+
+private struct NativePhotosLocalAlbumPicker: View {
+  let albums: [NativeDeviceAlbum]
+  let onSelect: (String) -> Void
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    NavigationView {
+      List(albums) { album in
+        Button {
+          dismiss()
+          onSelect(album.id)
+        } label: {
+          HStack {
+            Text(album.name)
+            Spacer()
+            Text("\(album.count)").foregroundColor(.secondary)
+          }
+        }
+      }
+      .navigationTitle("选择本机相册")
+      .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("取消") { dismiss() } } }
+    }
+  }
+}
+
+private struct NativePhotosServerAlbumPicker: View {
+  let client: NativeImmichClient
+  let onSelect: (String) -> Void
+  @Environment(\.dismiss) private var dismiss
+  @State private var albums: [NativeServerAlbum] = []
+  @State private var loading = true
+  @State private var error: String?
+
+  var body: some View {
+    NavigationView {
+      Group {
+        if loading { ProgressView("正在加载云端相册…") }
+        else if let error { VStack { Text(error); Button("重试") { Task { await load() } } } }
+        else {
+          List(albums) { album in
+            Button {
+              dismiss()
+              onSelect(album.id)
+            } label: {
+              HStack {
+                Text(album.name)
+                Spacer()
+                Text("\(album.count)").foregroundColor(.secondary)
+              }
+            }
+          }
+        }
+      }
+      .navigationTitle("选择云端相册")
+      .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("取消") { dismiss() } } }
+      .task { await load() }
+    }
+  }
+
+  @MainActor private func load() async {
+    loading = true
+    error = nil
+    do { albums = try await client.serverAlbums() }
+    catch { self.error = error.localizedDescription }
+    loading = false
+  }
 }
 
 struct NativeItemFramePreferenceKey: PreferenceKey {
@@ -1940,14 +2348,19 @@ struct NativeUnifiedGalleryViewer: View {
   @Environment(\.dismiss) private var dismiss
   @State private var currentIndex: Int = 0
   @State private var showChrome = true
+  @State private var isCurrentImageZoomed = false
   @State private var showInfoSheet = false
   @State private var isFavorite = false
   @State private var isProcessingFavorite = false
+  @State private var showMoreActions = false
+  @State private var isPreparingShare = false
+  @State private var preparingShareTask: Task<Void, Never>?
+  @State private var viewerMessage: String?
   @State private var dragOffset: CGSize = .zero
   @State private var shareItem: Any? = nil
-  @State private var showDeleteLocalAlert = false
-  @State private var showDeleteAllAlert = false
   @State private var showDeleteScopeDialog = false
+  @State private var showViewerLocalDeleteWarning = false
+  @State private var pendingViewerDeleteScope: NativeDeleteTargetScope = .all
   @State private var isDeletingItem = false
   @State private var deleteErrorMessage: String? = nil
 
@@ -1965,7 +2378,7 @@ struct NativeUnifiedGalleryViewer: View {
     self.onDeleteItem = onDeleteItem
     let index = items.firstIndex(where: { $0.id == initialItem.id }) ?? 0
     _currentIndex = State(initialValue: index)
-    _isFavorite = State(initialValue: initialItem.server?.isFavorite ?? false)
+    _isFavorite = State(initialValue: initialItem.isFavorite)
   }
 
   private var currentItem: NativeGridItem? {
@@ -1986,6 +2399,9 @@ struct NativeUnifiedGalleryViewer: View {
               client: client,
               device: device,
               item: items[idx],
+              onZoomChanged: { zoomed in
+                if idx == currentIndex { isCurrentImageZoomed = zoomed }
+              },
               onTap: {
                 withAnimation(.easeInOut(duration: 0.2)) {
                   showChrome.toggle()
@@ -2004,12 +2420,14 @@ struct NativeUnifiedGalleryViewer: View {
         .simultaneousGesture(
           DragGesture()
             .onChanged { value in
-              // 仅在主要为下划（向下位移大于横向位移，且下移大于 10pt）时触发下滑关闭手势
+              guard !isCurrentImageZoomed else { return }
+              // Close by swiping down only when the image is at its base zoom.
               if value.translation.height > 10 && abs(value.translation.height) > abs(value.translation.width) {
                 dragOffset = value.translation
               }
             }
             .onEnded { value in
+              guard !isCurrentImageZoomed else { dragOffset = .zero; return }
               if dragOffset.height > 120 {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 dismiss()
@@ -2081,12 +2499,13 @@ struct NativeUnifiedGalleryViewer: View {
               triggerShare()
             } label: {
               VStack(spacing: 4) {
-                Image(systemName: "square.and.arrow.up")
-                  .font(.system(size: 19))
+                if isPreparingShare { ProgressView().tint(.white) }
+                else { Image(systemName: "square.and.arrow.up").font(.system(size: 19)) }
                 Text("分享").font(.caption2)
               }
               .foregroundColor(.white)
             }
+            .disabled(isPreparingShare)
 
             // Favorite
             Button {
@@ -2100,8 +2519,8 @@ struct NativeUnifiedGalleryViewer: View {
                   .foregroundColor(.white)
               }
             }
-            .disabled(isProcessingFavorite || currentItem?.server == nil)
-            .opacity(currentItem?.server != nil ? 1 : 0.4)
+            .disabled(isProcessingFavorite || currentItem == nil)
+            .opacity(currentItem != nil ? 1 : 0.4)
 
             // Info Details
             Button {
@@ -2115,42 +2534,16 @@ struct NativeUnifiedGalleryViewer: View {
               .foregroundColor(.white)
             }
 
-            // Delete Local
             Button {
-              if currentItem?.server != nil {
-                showDeleteScopeDialog = true
-              } else {
-                showDeleteLocalAlert = true
-              }
+              showMoreActions = true
             } label: {
               VStack(spacing: 4) {
-                Image(systemName: "iphone.slash")
-                  .font(.system(size: 19))
-                Text("删本地").font(.caption2)
+                Image(systemName: "ellipsis.circle").font(.system(size: 19))
+                Text("更多").font(.caption2)
               }
               .foregroundColor(.white)
             }
-            .disabled(isDeletingItem || currentItem?.local == nil)
-            .opacity(currentItem?.local != nil ? 1 : 0.4)
-
-            // Delete All (or remote if only remote)
-            Button {
-              if currentItem?.local != nil && currentItem?.server != nil {
-                showDeleteScopeDialog = true
-              } else {
-                showDeleteAllAlert = true
-              }
-            } label: {
-              VStack(spacing: 4) {
-                Image(systemName: "trash")
-                  .font(.system(size: 19))
-                  .foregroundColor(.red)
-                Text("全删").font(.caption2)
-                  .foregroundColor(.red)
-              }
-            }
             .disabled(isDeletingItem || currentItem == nil)
-            .opacity(currentItem != nil ? 1 : 0.4)
           }
           .padding(.vertical, 10)
           .padding(.horizontal, 18)
@@ -2163,39 +2556,23 @@ struct NativeUnifiedGalleryViewer: View {
     }
     .confirmationDialog("删除范围", isPresented: $showDeleteScopeDialog, titleVisibility: .visible) {
       if currentItem?.local != nil {
-        Button("仅删除本地", role: .destructive) { performDeleteItem(scope: .localOnly) }
+        Button("仅删除本地", role: .destructive) {
+          pendingViewerDeleteScope = .localOnly
+          showViewerLocalDeleteWarning = true
+        }
       }
       if currentItem?.server != nil {
         Button("仅删除云端", role: .destructive) { performDeleteItem(scope: .remoteOnly) }
       }
       if currentItem?.local != nil && currentItem?.server != nil {
-        Button("全部删除", role: .destructive) { performDeleteItem(scope: .all) }
+        Button("全部删除", role: .destructive) {
+          pendingViewerDeleteScope = .all
+          showViewerLocalDeleteWarning = true
+        }
       }
       Button("取消", role: .cancel) {}
     } message: {
       Text("选择要删除的副本。")
-    }
-    .alert("仅删除本地照片？", isPresented: $showDeleteLocalAlert) {
-      Button("取消", role: .cancel) {}
-      Button("删除本地", role: .destructive) {
-        performDeleteItem(scope: .localOnly)
-      }
-    } message: {
-      Text("将从系统相册彻底删除该照片/视频，云端副本将保留。")
-    }
-    .alert("删除照片？", isPresented: $showDeleteAllAlert) {
-      Button("取消", role: .cancel) {}
-      Button("彻底删除", role: .destructive) {
-        performDeleteItem(scope: .all)
-      }
-    } message: {
-      if currentItem?.local != nil && currentItem?.server != nil {
-        Text("将同时从 Immich 服务器和系统相册中删除此项，此操作不可撤销。")
-      } else if currentItem?.server != nil {
-        Text("将从 Immich 服务器中删除此项，此操作不可撤销。")
-      } else {
-        Text("将从系统相册中删除此项，此操作不可撤销。")
-      }
     }
     .alert("删除失败", isPresented: Binding(get: { deleteErrorMessage != nil }, set: { if !$0 { deleteErrorMessage = nil } })) {
       Button("确定", role: .cancel) { deleteErrorMessage = nil }
@@ -2203,10 +2580,20 @@ struct NativeUnifiedGalleryViewer: View {
       Text(deleteErrorMessage ?? "未知错误")
     }
     .onChange(of: currentIndex) { newIdx in
-      if items.indices.contains(newIdx) {
-        isFavorite = items[newIdx].server?.isFavorite ?? false
-      }
+      isCurrentImageZoomed = false
+      if items.indices.contains(newIdx) { isFavorite = items[newIdx].isFavorite }
     }
+    .alert("操作结果", isPresented: Binding(get: { viewerMessage != nil }, set: { if !$0 { viewerMessage = nil } })) {
+      Button("好", role: .cancel) { viewerMessage = nil }
+    } message: { Text(viewerMessage ?? "") }
+    .alert("确认删除本机照片", isPresented: $showViewerLocalDeleteWarning) {
+      Button("取消", role: .cancel) {}
+      Button("继续删除", role: .destructive) { performDeleteItem(scope: pendingViewerDeleteScope) }
+    } message: { Text("此操作会从系统照片中永久删除；若开启 iCloud Photos，删除可能传播至其他设备。") }
+    .confirmationDialog("更多操作", isPresented: $showMoreActions, titleVisibility: .visible) {
+      Button("删除…", role: .destructive) { showDeleteScopeDialog = true }
+      if currentItem?.server != nil { Button("归档云端副本") { Task { await archiveCurrentServerCopy() } } }
+    } message: { Text("操作只影响具有对应副本的来源。") }
     .sheet(isPresented: $showInfoSheet) {
       if let item = currentItem {
         NativeAssetInfoSheet(client: client, device: device, item: item)
@@ -2228,12 +2615,23 @@ struct NativeUnifiedGalleryViewer: View {
     Task {
       do {
         try await nativeDeleteGridItems([item], scope: scope, client: client, device: device)
+        if scope == .all || scope == .remoteOnly {
+          if let serverID = item.server?.id { model.removeAssets(ids: [serverID]) }
+          if let local = item.local,
+             NativeSyncCacheStore.shared.serverID(for: local.id) == item.server?.id {
+            cloud.forgetMatches(localIDs: Set([local.id]))
+          }
+        }
         await MainActor.run {
           isDeletingItem = false
           onDeleteItem?(item, scope)
           retainViewerAfterDeleting(item, scope: scope)
         }
       } catch {
+        if scope == .all || scope == .remoteOnly, let local = item.local,
+           NativeSyncCacheStore.shared.serverID(for: local.id) == item.server?.id {
+          cloud.forgetMatches(localIDs: Set([local.id]))
+        }
         await MainActor.run {
           isDeletingItem = false
           deleteErrorMessage = "删除失败：\(error.localizedDescription)"
@@ -2260,9 +2658,7 @@ struct NativeUnifiedGalleryViewer: View {
         removeCurrentViewerItem()
       }
     }
-    if items.indices.contains(currentIndex) {
-      isFavorite = items[currentIndex].server?.isFavorite ?? false
-    }
+    if items.indices.contains(currentIndex) { isFavorite = items[currentIndex].isFavorite }
     dragOffset = .zero
     showChrome = true
   }
@@ -2274,53 +2670,107 @@ struct NativeUnifiedGalleryViewer: View {
       currentIndex = 0
     } else {
       currentIndex = min(currentIndex, items.count - 1)
-      isFavorite = items[currentIndex].server?.isFavorite ?? false
+      isFavorite = items[currentIndex].isFavorite
     }
   }
 
+  private func archiveCurrentServerCopy() async {
+    guard let item = currentItem, let server = item.server else { return }
+    do {
+      try await client.updateVisibility(ids: [server.id], visibility: "archive")
+      model.removeAssets(ids: [server.id])
+      if let local = item.local {
+        items[currentIndex] = NativeGridItem(server: nil, local: local)
+        isFavorite = local.isFavorite
+      } else {
+        removeCurrentViewerItem()
+      }
+      viewerMessage = "已归档云端副本；本机副本保留。"
+    } catch { viewerMessage = "归档失败：\(error.localizedDescription)" }
+  }
+
   private func toggleFavorite() {
-    guard let item = currentItem, let server = item.server, !isProcessingFavorite else { return }
+    guard let item = currentItem, !isProcessingFavorite else { return }
     let newFav = !isFavorite
     isProcessingFavorite = true
     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     Task {
-      do {
-        try await client.updateFavorite(id: server.id, isFavorite: newFav)
-        await MainActor.run {
-          isFavorite = newFav
-          isProcessingFavorite = false
-        }
-      } catch {
-        await MainActor.run {
-          isProcessingFavorite = false
+      var succeeded = 0
+      var failed = 0
+      if let server = item.server {
+        do { try await client.updateFavorite(id: server.id, isFavorite: newFav); succeeded += 1 }
+        catch { failed += 1 }
+      }
+      if let local = item.local {
+        if await device.updateFavorite(ids: [local.id], isFavorite: newFav) { succeeded += 1 }
+        else { failed += 1 }
+      }
+      if succeeded > 0 {
+        isFavorite = newFav
+        if let server = item.server {
+          let updated = NativeAsset(
+            id: server.id, date: server.date, isImage: server.isImage, isFavorite: newFav,
+            thumbhash: server.thumbhash, livePhotoVideoId: server.livePhotoVideoId,
+            originalFileName: server.originalFileName, originalMimeType: server.originalMimeType,
+            width: server.width, height: server.height, fileSizeInByte: server.fileSizeInByte,
+            latitude: server.latitude, longitude: server.longitude, isArchived: server.isArchived
+          )
+          model.upsert(updated)
+          items[currentIndex] = NativeGridItem(server: updated, local: item.local)
         }
       }
+      isProcessingFavorite = false
+      viewerMessage = "收藏更新：成功 \(succeeded) 项，失败 \(failed) 项。"
     }
   }
 
   private func triggerShare() {
-    guard let item = currentItem else { return }
+    guard let item = currentItem, !isPreparingShare else { return }
+    isPreparingShare = true
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    if let local = item.local {
-      guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return }
-      let options = PHImageRequestOptions()
-      options.isNetworkAccessAllowed = true
-      options.deliveryMode = .highQualityFormat
-      PHImageManager.default().requestImage(for: source, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: options) { img, _ in
-        if let img {
-          DispatchQueue.main.async { shareItem = img }
+    Task {
+      do {
+        let shared: Any
+        if let local = item.local {
+          guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else {
+            throw NativeShareError.originalUnavailable
+          }
+          let result = try await nativeOriginalFile(for: source)
+          shared = result
+        } else if let server = item.server {
+          shared = try await client.originalFile(for: server)
+        } else {
+          throw NativeShareError.originalUnavailable
         }
+        shareItem = shared
+      } catch {
+        viewerMessage = "原件暂不可分享。请检查网络、照片权限或 iCloud 原件状态后重试。\n\(error.localizedDescription)"
       }
-    } else if let server = item.server {
-      Task {
-        if let url = client.originalURL(for: server),
-           let data = try? await client.imageData(for: url),
-           let img = UIImage(data: data) {
-          await MainActor.run { shareItem = img }
-        }
-      }
+      isPreparingShare = false
     }
   }
+}
+
+private enum NativeShareError: LocalizedError {
+  case originalUnavailable
+  var errorDescription: String? { "无法读取原件。" }
+}
+
+@MainActor
+private func nativeOriginalFile(for asset: PHAsset) async throws -> URL {
+  guard let resource = asset.getResource() else { throw NativeShareError.originalUnavailable }
+  let ext = URL(fileURLWithPath: resource.originalFilename).pathExtension
+  let fileName = ext.isEmpty ? UUID().uuidString : "\(UUID().uuidString).\(ext)"
+  let target = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+  let options = PHAssetResourceRequestOptions()
+  options.isNetworkAccessAllowed = true
+  try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+    PHAssetResourceManager.default().writeData(for: resource, toFile: target, options: options) { error in
+      if let error { continuation.resume(throwing: error) }
+      else { continuation.resume(returning: ()) }
+    }
+  }
+  return target
 }
 
 struct NativeSharePayload: Identifiable {
@@ -2344,64 +2794,53 @@ struct NativeActivityView: UIViewControllerRepresentable {
   let activityItems: [Any]
 
   func makeUIViewController(context: Context) -> UIActivityViewController {
-    UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    let controller = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    let temporaryURLs = activityItems.compactMap { $0 as? URL }.filter { $0.path.hasPrefix(FileManager.default.temporaryDirectory.path) }
+    controller.completionWithItemsHandler = { _, _, _, _ in
+      temporaryURLs.forEach { try? FileManager.default.removeItem(at: $0) }
+    }
+    return controller
   }
 
   func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
+struct NativeBatchShareResult {
+  let files: [Any]
+  let failed: Int
+}
+
 @MainActor
-func nativePrepareBatchShare(items: [NativeGridItem], client: NativeImmichClient) async -> [Any] {
+func nativePrepareBatchShare(items: [NativeGridItem], client: NativeImmichClient) async -> NativeBatchShareResult {
   var results: [Any] = []
-  for item in items.prefix(30) {
-    if let local = item.local {
-      guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { continue }
-      if local.isVideo {
-        let options = PHVideoRequestOptions()
-        options.isNetworkAccessAllowed = true
-        options.deliveryMode = .highQualityFormat
-        if let url = await withCheckedContinuation({ (continuation: CheckedContinuation<URL?, Never>) in
-          PHImageManager.default().requestAVAsset(forVideo: asset, options: options) { avAsset, _, _ in
-            continuation.resume(returning: (avAsset as? AVURLAsset)?.url)
-          }
-        }) {
-          results.append(url)
-        }
+  var failed = 0
+  for item in items {
+    do {
+      if let local = item.local,
+         let asset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject {
+        results.append(try await nativeOriginalFile(for: asset))
+      } else if let server = item.server {
+        results.append(try await client.originalFile(for: server))
       } else {
-        let options = PHImageRequestOptions()
-        options.isNetworkAccessAllowed = true
-        options.deliveryMode = .highQualityFormat
-        if let img = await withCheckedContinuation({ (continuation: CheckedContinuation<UIImage?, Never>) in
-          PHImageManager.default().requestImage(for: asset, targetSize: CGSize(width: 2560, height: 2560), contentMode: .aspectFit, options: options) { img, _ in
-            continuation.resume(returning: img)
-          }
-        }) {
-          results.append(img)
-        }
+        failed += 1
       }
-    } else if let server = item.server {
-      if let url = client.originalURL(for: server) {
-        if server.isImage {
-          if let data = try? await client.imageData(for: url), let img = UIImage(data: data) {
-            results.append(img)
-          }
-        } else {
-          results.append(url)
-        }
-      }
+    } catch {
+      failed += 1
     }
   }
-  return results
+  return NativeBatchShareResult(files: results, failed: failed)
 }
 
 private struct NativeSingleAssetPage: View {
   let client: NativeImmichClient
   let device: NativeDeviceLibrary
   let item: NativeGridItem
+  let onZoomChanged: (Bool) -> Void
   let onTap: () -> Void
 
   @State private var image: UIImage?
   @State private var isLoading = true
+  @State private var loadError: String?
   @State private var player: AVPlayer?
   @State private var livePhoto: PHLivePhoto?
   @State private var livePlayer: AVPlayer?
@@ -2421,16 +2860,15 @@ private struct NativeSingleAssetPage: View {
             VideoPlayer(player: player)
               .frame(width: proxy.size.width, height: proxy.size.height)
               .ignoresSafeArea()
-              .onAppear {
-                player.play()
-              }
-              .onDisappear {
-                player.pause()
-              }
+              .onAppear { player.play() }
+              .onDisappear { player.pause() }
           } else {
             VStack(spacing: 12) {
-              ProgressView().tint(.white)
-              Text("正在加载视频…").font(.caption).foregroundColor(.white.opacity(0.8))
+              if isLoading { ProgressView().tint(.white) }
+              else {
+                Text(loadError ?? "视频暂不可用").font(.caption).foregroundColor(.white.opacity(0.8)).multilineTextAlignment(.center)
+                Button("重试") { Task { await loadAssetContent() } }.buttonStyle(.bordered).tint(.white)
+              }
             }
           }
         } else {
@@ -2442,18 +2880,17 @@ private struct NativeSingleAssetPage: View {
             NativeLivePhotoView(livePhoto: livePhoto, isPlaying: isLivePlaying)
               .frame(width: proxy.size.width, height: proxy.size.height)
           } else if let image {
-            NativeZoomableImageView(image: image, size: proxy.size, onTap: onTap)
+            NativeZoomableImageView(image: image, size: proxy.size, onTap: onTap, onZoomChanged: onZoomChanged)
           } else {
-            VStack {
-              if isLoading {
-                ProgressView().tint(.white)
-              } else {
-                Image(systemName: "photo")
-                  .font(.system(size: 48))
-                  .foregroundColor(.white.opacity(0.4))
-                Text("无法加载原图").font(.caption).foregroundColor(.white.opacity(0.6))
+            VStack(spacing: 10) {
+              if isLoading { ProgressView().tint(.white) }
+              else {
+                Image(systemName: "photo").font(.system(size: 42)).foregroundColor(.white.opacity(0.5))
+                Text(loadError ?? "无法加载原件").font(.caption).foregroundColor(.white.opacity(0.8)).multilineTextAlignment(.center)
+                Button("重试") { Task { await loadAssetContent() } }.buttonStyle(.bordered).tint(.white)
               }
             }
+            .padding()
           }
         }
       }
@@ -2492,17 +2929,29 @@ private struct NativeSingleAssetPage: View {
 
   private func loadAssetContent() async {
     isLoading = true
+    loadError = nil
     defer { isLoading = false }
 
     if item.isVideo {
       if let local = item.local {
-        guard let phAsset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return }
+        guard let phAsset = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else {
+          loadError = "照片权限不足或本机视频已不存在。"
+          return
+        }
         let options = PHVideoRequestOptions()
         options.isNetworkAccessAllowed = true
-        PHImageManager.default().requestPlayerItem(forVideo: phAsset, options: options) { playerItem, _ in
-          if let playerItem {
-            DispatchQueue.main.async {
-              player = AVPlayer(playerItem: playerItem)
+        options.deliveryMode = .highQualityFormat
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+          PHImageManager.default().requestPlayerItem(forVideo: phAsset, options: options) { playerItem, info in
+            Task { @MainActor in
+              if let playerItem {
+                let avPlayer = AVPlayer(playerItem: playerItem)
+                avPlayer.actionAtItemEnd = .pause
+                player = avPlayer
+              } else {
+                loadError = Self.photoKitErrorMessage(info)
+              }
+              continuation.resume()
             }
           }
         }
@@ -2518,23 +2967,32 @@ private struct NativeSingleAssetPage: View {
           }
           let asset = AVURLAsset(url: videoURL, options: ["AVURLAssetHTTPHeaderFieldsKey": req.allHTTPHeaderFields ?? [:]])
           let item = AVPlayerItem(asset: asset)
-          await MainActor.run {
-            player = AVPlayer(playerItem: item)
-          }
-        }
-      }
+          let avPlayer = AVPlayer(playerItem: item)
+          avPlayer.actionAtItemEnd = .pause
+          player = avPlayer
+        } else { loadError = "服务器视频播放地址无效" }
+      } else { loadError = "视频资产来源不可用" }
+      if player == nil { loadError = "视频暂不可用；请检查网络或访问权限后重试。" }
       return
     }
 
     // Load Image
     if let local = item.local {
-      guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else { return }
+      guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [local.id], options: nil).firstObject else {
+        loadError = "照片权限不足或本机原件已不存在。"
+        return
+      }
       let options = PHImageRequestOptions()
       options.isNetworkAccessAllowed = true
       options.deliveryMode = .highQualityFormat
-      PHImageManager.default().requestImage(for: source, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: options) { result, _ in
-        if let result {
-          DispatchQueue.main.async { image = result }
+      await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+        PHImageManager.default().requestImage(for: source, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: options) { result, info in
+          guard info?[PHImageResultIsDegradedKey] as? Bool != true else { return }
+          Task { @MainActor in
+            if let result { image = result }
+            else { loadError = Self.photoKitErrorMessage(info) }
+            continuation.resume()
+          }
         }
       }
       if local.isLivePhoto {
@@ -2563,18 +3021,27 @@ private struct NativeSingleAssetPage: View {
       if let url = client.originalURL(for: server) {
         do {
           let data = try await client.imageData(for: url)
-          if let decoded = UIImage(data: data) {
-            await MainActor.run { image = decoded }
-          }
+          if let decoded = UIImage(data: data) { image = decoded }
+          else { loadError = "服务器返回的原件格式无法显示" }
         } catch {
-          if let previewURL = client.thumbnailURL(for: server, size: "preview"),
-             let data = try? await client.thumbnailData(for: previewURL),
-             let decoded = UIImage(data: data) {
-            await MainActor.run { image = decoded }
-          }
+          loadError = Self.networkErrorMessage(error)
         }
-      }
+      } else { loadError = "云端原件地址无效" }
     }
+  }
+
+  private static func photoKitErrorMessage(_ info: [AnyHashable: Any]?) -> String {
+    if info?[PHImageCancelledKey] as? Bool == true { return "加载已取消" }
+    if info?[PHImageResultIsInCloudKey] as? Bool == true { return "iCloud 原件尚未下载；请检查网络后重试" }
+    if let error = info?[PHImageErrorKey] as? Error { return "照片权限或原件读取失败：\(error.localizedDescription)" }
+    return "本机原件暂不可用；检查照片权限或 iCloud 状态后重试"
+  }
+
+  private static func networkErrorMessage(_ error: Error) -> String {
+    if let urlError = error as? URLError, urlError.code == .notConnectedToInternet || urlError.code == .networkConnectionLost {
+      return "当前离线；云端原件无法加载"
+    }
+    return "云端原件加载失败：\(error.localizedDescription)"
   }
 }
 
@@ -2612,6 +3079,7 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   let image: UIImage
   let size: CGSize
   let onTap: () -> Void
+  let onZoomChanged: (Bool) -> Void
 
   func makeUIView(context: Context) -> UIScrollView {
     let scrollView = UIScrollView()
@@ -2640,6 +3108,8 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   }
 
   func updateUIView(_ uiView: UIScrollView, context: Context) {
+    context.coordinator.onTap = onTap
+    context.coordinator.onZoomChanged = onZoomChanged
     if let imageView = uiView.viewWithTag(100) as? UIImageView {
       imageView.image = image
       imageView.frame = CGRect(origin: .zero, size: size)
@@ -2648,18 +3118,28 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   }
 
   func makeCoordinator() -> Coordinator {
-    Coordinator(onTap: onTap)
+    Coordinator(onTap: onTap, onZoomChanged: onZoomChanged)
   }
 
   class Coordinator: NSObject, UIScrollViewDelegate {
     let onTap: () -> Void
+    let onZoomChanged: (Bool) -> Void
 
-    init(onTap: @escaping () -> Void) {
+    init(onTap: @escaping () -> Void, onZoomChanged: @escaping (Bool) -> Void) {
       self.onTap = onTap
+      self.onZoomChanged = onZoomChanged
     }
 
     func viewForZooming(in scrollView: UIScrollView) -> UIView? {
       scrollView.viewWithTag(100)
+    }
+
+    func scrollViewDidZoom(_ scrollView: UIScrollView) {
+      onZoomChanged(scrollView.zoomScale > scrollView.minimumZoomScale + 0.01)
+    }
+
+    func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+      onZoomChanged(scale > scrollView.minimumZoomScale + 0.01)
     }
 
     @objc func handleTap() {
@@ -2672,7 +3152,8 @@ private struct NativeZoomableImageView: UIViewRepresentable {
         scrollView.setZoomScale(1.0, animated: true)
       } else {
         let point = gesture.location(in: scrollView)
-        let rect = CGRect(x: point.x - 40, y: point.y - 40, width: 80, height: 80)
+        let side = max(80, min(scrollView.bounds.width, scrollView.bounds.height) / 2)
+        let rect = CGRect(x: point.x - side / 2, y: point.y - side / 2, width: side, height: side)
         scrollView.zoom(to: rect, animated: true)
       }
     }
@@ -2687,7 +3168,28 @@ private struct NativeAssetInfoSheet: View {
 
   @State private var remoteInfo: [String: Any]?
   @State private var loadingInfo = false
+  @State private var infoError: String?
   @Environment(\.dismiss) private var dismiss
+
+  private var infoAsset: [String: Any] { remoteInfo ?? [:] }
+  private var exif: [String: Any] { infoAsset["exifInfo"] as? [String: Any] ?? [:] }
+  private var localAsset: PHAsset? {
+    guard let id = item.local?.id else { return nil }
+    return PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil).firstObject
+  }
+  private var localResource: PHAssetResource? { localAsset?.getResource() }
+  private var resolvedName: String? {
+    (infoAsset["originalFileName"] as? String) ?? item.server?.originalFileName ?? localResource?.originalFilename
+  }
+  private var sizeText: String? {
+    let width = (infoAsset["width"] as? NSNumber)?.intValue ?? item.server?.width ?? localAsset?.pixelWidth
+    let height = (infoAsset["height"] as? NSNumber)?.intValue ?? item.server?.height ?? localAsset?.pixelHeight
+    guard let width, let height, width > 0, height > 0 else { return nil }
+    return "\(width) × \(height)"
+  }
+  private var fileSize: Int64? {
+    (exif["fileSizeInByte"] as? NSNumber)?.int64Value ?? item.server?.fileSizeInByte
+  }
 
   var body: some View {
     NavigationView {
@@ -2695,44 +3197,57 @@ private struct NativeAssetInfoSheet: View {
         Section("基本信息") {
           InfoRow(label: "日期", value: NativeImmichClient.formatChineseDate(item.date))
           InfoRow(label: "类型", value: item.isVideo ? "视频" : "照片")
-          InfoRow(label: "状态", value: item.server != nil ? (item.local != nil ? "已同步 (云端+本地)" : "仅云端") : "仅本地 (未上传)")
-          if let server = item.server {
-            InfoRow(label: "服务器 ID", value: server.id)
-          }
+          InfoRow(label: "来源", value: item.server != nil && item.local != nil ? "本机与云端" : (item.local != nil ? "本机" : "云端"))
+          InfoRow(label: "副本状态", value: item.server != nil && item.local != nil ? "双端已确认" : (item.server != nil ? "仅云端" : (NativeSyncCacheStore.shared.isMatched(localId: item.local?.id) ? "已匹配，云端信息待载入" : "本机；核验状态按下方显示")))
           if let local = item.local {
-            InfoRow(label: "本地标识", value: local.id)
+            InfoRow(label: "云端核验", value: NativeSyncCacheStore.shared.isMatched(localId: local.id) ? "已确认匹配" : "尚未确认；不能据此判断未上传")
           }
+          if let resolvedName { InfoRow(label: "文件名", value: resolvedName) }
+          if let sizeText { InfoRow(label: "尺寸", value: sizeText) }
+          if let mime = (infoAsset["originalMimeType"] as? String) ?? item.server?.originalMimeType ?? localResource?.uniformTypeIdentifier { InfoRow(label: "格式", value: mime) }
+          if let fileSize { InfoRow(label: "文件大小", value: ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)) }
+          if let location = locationText { InfoRow(label: "地点", value: location) }
         }
 
-        if let info = remoteInfo {
-          if let exif = info["exifInfo"] as? [String: Any] {
-            Section("拍摄与硬件参数") {
-              if let make = exif["make"] as? String { InfoRow(label: "设备品牌", value: make) }
-              if let model = exif["model"] as? String { InfoRow(label: "设备型号", value: model) }
-              if let lens = exif["lensModel"] as? String { InfoRow(label: "镜头", value: lens) }
-              if let fNumber = exif["fNumber"] { InfoRow(label: "光圈", value: "f/\(fNumber)") }
-              if let focal = exif["focalLength"] { InfoRow(label: "焦距", value: "\(focal)mm") }
-              if let iso = exif["iso"] { InfoRow(label: "ISO", value: "\(iso)") }
-              if let exp = exif["exposureTime"] { InfoRow(label: "曝光时间", value: "\(exp)s") }
-            }
+        if let infoError {
+          Section("云端详情") { Text(infoError).foregroundColor(.secondary); Button("重试") { Task { await loadInfo() } } }
+        } else if loadingInfo {
+          Section("云端详情") { ProgressView("正在加载详情…") }
+        }
+
+        if !exif.isEmpty {
+          Section("拍摄与硬件参数") {
+            if let make = exif["make"] as? String { InfoRow(label: "设备品牌", value: make) }
+            if let model = exif["model"] as? String { InfoRow(label: "设备型号", value: model) }
+            if let lens = exif["lensModel"] as? String { InfoRow(label: "镜头", value: lens) }
+            if let fNumber = exif["fNumber"] { InfoRow(label: "光圈", value: "f/\(fNumber)") }
+            if let focal = exif["focalLength"] { InfoRow(label: "焦距", value: "\(focal)mm") }
+            if let iso = exif["iso"] { InfoRow(label: "ISO", value: "\(iso)") }
+            if let exp = exif["exposureTime"] { InfoRow(label: "曝光时间", value: "\(exp)s") }
           }
         }
       }
       .navigationTitle("详细信息")
       .navigationBarTitleDisplayMode(.inline)
-      .toolbar {
-        ToolbarItem(placement: .navigationBarTrailing) {
-          Button("完成") { dismiss() }
-        }
-      }
-      .task {
-        if let server = item.server {
-          loadingInfo = true
-          remoteInfo = try? await client.assetInfo(id: server.id)
-          loadingInfo = false
-        }
-      }
+      .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } } }
+      .task { await loadInfo() }
     }
+  }
+
+  private var locationText: String? {
+    let latitude = (exif["latitude"] as? NSNumber)?.doubleValue ?? item.server?.latitude ?? localAsset?.location?.coordinate.latitude
+    let longitude = (exif["longitude"] as? NSNumber)?.doubleValue ?? item.server?.longitude ?? localAsset?.location?.coordinate.longitude
+    guard let latitude, let longitude else { return nil }
+    return String(format: "%.5f, %.5f", latitude, longitude)
+  }
+
+  @MainActor private func loadInfo() async {
+    guard let server = item.server else { return }
+    loadingInfo = true
+    infoError = nil
+    do { remoteInfo = try await client.assetInfo(id: server.id) }
+    catch { infoError = error.localizedDescription }
+    loadingInfo = false
   }
 }
 
@@ -2906,22 +3421,20 @@ struct NativeSyncSettingsSheet: View {
   @Environment(\.dismiss) private var dismiss
 
   @AppStorage("backup_enabled") private var syncEnabled = true
-  @AppStorage("backup_require_wifi") private var requireWifi = true
-  @AppStorage("backup_cellular_videos") private var syncCellularVideos = false
 
-  private var unsyncedCount: Int {
-    device.assets.filter { cloud.matchedServerIDs[$0.id] == nil }.count
+  private var verifiedLocalOnlyCount: Int {
+    device.assets.filter { cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
+  }
+
+  private var unknownCount: Int {
+    device.assets.filter { !cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
   var body: some View {
     NavigationView {
       Form {
-        Section(header: Text("同步控制与网络策略")) {
-          Toggle("开启照片同步", isOn: $syncEnabled)
-          Toggle("仅在 Wi-Fi 下同步", isOn: $requireWifi)
-            .disabled(!syncEnabled)
-          Toggle("允许移动蜂窝网络下同步视频", isOn: $syncCellularVideos)
-            .disabled(!syncEnabled || requireWifi)
+        Section(header: Text("云端状态核验"), footer: Text("此版本仅计算本机原件指纹并查询服务器是否已有匹配资产，不会上传照片。")) {
+          Toggle("开启自动核验", isOn: $syncEnabled)
         }
 
         Section(header: Text("相册与同步状态")) {
@@ -2936,14 +3449,18 @@ struct NativeSyncSettingsSheet: View {
             Text("\(cloud.matchedServerIDs.count) 项").foregroundColor(.secondary)
           }
           HStack {
-            Text("待同步 / 未上传照片")
+            Text("已核验但云端无匹配")
             Spacer()
-            Text("\(unsyncedCount) 项")
-              .foregroundColor(unsyncedCount > 0 ? .orange : .secondary)
+            Text("\(verifiedLocalOnlyCount) 项").foregroundColor(verifiedLocalOnlyCount > 0 ? .orange : .secondary)
+          }
+          HStack {
+            Text("状态未知")
+            Spacer()
+            Text("\(unknownCount) 项").foregroundColor(unknownCount > 0 ? .secondary : .secondary)
           }
         }
 
-        Section(header: Text("核验与操作"), footer: Text("原生上传同步功能正在演进中。开启同步后，系统将自动核验并在符合 Wi-Fi / 蜂窝网络设置的条件下执行照片与视频同步。")) {
+        Section(header: Text("核验")) {
           Button {
             Task {
               await cloud.retry(device.assets, client: client)
@@ -2960,15 +3477,6 @@ struct NativeSyncSettingsSheet: View {
           }
           .disabled(cloud.isRunning || !syncEnabled)
 
-          Button(role: .destructive) {
-            cloud.clearCache()
-            Task {
-              await cloud.check(device.assets, client: client)
-            }
-          } label: {
-            Text("清除匹配缓存并重新比对")
-          }
-          .disabled(!syncEnabled)
         }
       }
       .navigationTitle("同步设置")

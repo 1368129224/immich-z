@@ -76,6 +76,10 @@ final class NativeSyncCacheStore: @unchecked Sendable {
     lock.lock()
     var changed = false
     for (k, v) in matches {
+      if let previous = matchedServerIDs[k], previous != v { reverseMatches.removeValue(forKey: previous) }
+      if let previousLocal = reverseMatches[v], previousLocal != k {
+        matchedServerIDs.removeValue(forKey: previousLocal)
+      }
       if matchedServerIDs[k] != v {
         matchedServerIDs[k] = v
         reverseMatches[v] = k
@@ -98,6 +102,18 @@ final class NativeSyncCacheStore: @unchecked Sendable {
     if changed {
       saveToDisk()
     }
+  }
+
+  func removeMatches(localIDs: Set<String>) {
+    guard !localIDs.isEmpty else { return }
+    lock.lock()
+    for localID in localIDs {
+      if let serverID = matchedServerIDs.removeValue(forKey: localID) {
+        reverseMatches.removeValue(forKey: serverID)
+      }
+    }
+    lock.unlock()
+    saveToDisk()
   }
 
   func clear() {
@@ -146,6 +162,12 @@ final class NativeCloudStatus: ObservableObject {
     self.matchedServerIDs = store.matchedServerIDs
     self.checkedIDs = store.checkedIDs
     self.checksums = store.checksums
+  }
+
+  func forgetMatches(localIDs: Set<String>) {
+    guard !localIDs.isEmpty else { return }
+    NativeSyncCacheStore.shared.removeMatches(localIDs: localIDs)
+    for id in localIDs { matchedServerIDs.removeValue(forKey: id) }
   }
 
   func reset() {
@@ -245,12 +267,28 @@ final class NativeCloudStatus: ObservableObject {
         var newMatches: [String: String] = [:]
         var newChecked: Set<String> = []
 
+        var invalidResults = 0
         for result in results {
-          guard let id = result["id"] as? String, submitted.contains(id), received.insert(id).inserted else { continue }
-          newChecked.insert(id)
-          if result["action"] as? String == "reject" {
-            let serverID = (result["assetId"] as? String) ?? id
+          guard let id = result["id"] as? String, submitted.contains(id) else { continue }
+          guard received.insert(id).inserted else {
+            invalidResults += 1
+            continue
+          }
+          guard let action = result["action"] as? String else {
+            invalidResults += 1
+            continue
+          }
+          if action == "reject" {
+            guard let serverID = result["assetId"] as? String, !serverID.isEmpty else {
+              invalidResults += 1
+              continue
+            }
             newMatches[id] = serverID
+            newChecked.insert(id)
+          } else if action == "accept" {
+            newChecked.insert(id)
+          } else {
+            invalidResults += 1
           }
         }
 
@@ -259,7 +297,9 @@ final class NativeCloudStatus: ObservableObject {
         NativeSyncCacheStore.shared.update(matches: newMatches, checked: newChecked)
 
         let omitted = submitted.subtracting(received).count
-        if omitted > 0 { message = "服务器没有返回 \(omitted) 项的核验结果，状态暂时未知。" }
+        if omitted > 0 || invalidResults > 0 {
+          message = "服务器有 \(omitted + invalidResults) 项未返回有效的核验结果，状态暂时未知。"
+        }
       } catch {
         message = "无法向服务器核验上传状态：\(error.localizedDescription)"
         return

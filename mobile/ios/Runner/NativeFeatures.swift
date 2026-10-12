@@ -12,6 +12,36 @@ enum NativeDragSelectionIntent: Equatable {
   case scroll
 }
 
+enum NativePhotosSource: String, CaseIterable, Identifiable {
+  case all = "全部"
+  case device = "本机"
+  case server = "云端"
+  var id: String { rawValue }
+}
+
+func nativePhotosSourceIncludes(_ source: NativePhotosSource, hasLocal: Bool, hasServer: Bool, hasVerifiedMatch: Bool) -> Bool {
+  switch source {
+  case .all: return hasLocal || hasServer
+  case .device: return hasLocal
+  case .server: return hasServer || (hasLocal && hasVerifiedMatch)
+  }
+}
+
+func nativePhotosSelectionActionAvailability(_ items: [NativeGridItem]) -> (server: Int, local: Int, merged: Int) {
+  let server = items.filter { $0.server != nil }.count
+  let local = items.filter { $0.local != nil }.count
+  let merged = items.filter { $0.server != nil && $0.local != nil }.count
+  return (server, local, merged)
+}
+
+func nativeIsVideoFile(_ url: URL) -> Bool {
+  ["mov", "mp4", "m4v", "avi", "mkv", "3gp", "webm"].contains(url.pathExtension.lowercased())
+}
+
+func nativeClampedPhotosCellSize(_ base: CGFloat, magnification: CGFloat) -> CGFloat {
+  min(320, max(72, base * max(0.35, magnification)))
+}
+
 func nativeDragSelectionIntent(for translation: CGSize) -> NativeDragSelectionIntent {
   let horizontal = abs(translation.width)
   let vertical = abs(translation.height)
@@ -80,7 +110,8 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
             date: item.creationDate ?? .distantPast,
             isVideo: item.mediaType == .video,
             isLivePhoto: item.mediaSubtypes.contains(.photoLive),
-            contentVersion: Int((item.modificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+            contentVersion: Int((item.modificationDate?.timeIntervalSince1970 ?? 0) * 1000),
+            isFavorite: item.isFavorite
           ))
         }
         let collections = PHAssetCollection.fetchAssetCollections(with: .album, subtype: .any, options: nil)
@@ -118,7 +149,8 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
       date: first.creationDate ?? .distantPast,
       isVideo: first.mediaType == .video,
       isLivePhoto: first.mediaSubtypes.contains(.photoLive),
-      contentVersion: Int((first.modificationDate?.timeIntervalSince1970 ?? 0) * 1000)
+      contentVersion: Int((first.modificationDate?.timeIntervalSince1970 ?? 0) * 1000),
+      isFavorite: first.isFavorite
     )
   }
 
@@ -163,8 +195,8 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
     guard authorized, !ids.isEmpty else { return false }
     return await withCheckedContinuation { continuation in
       let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
-      guard fetch.count > 0 else {
-        continuation.resume(returning: true)
+      guard fetch.count == ids.count else {
+        continuation.resume(returning: false)
         return
       }
       PHPhotoLibrary.shared().performChanges({
@@ -179,6 +211,64 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
       }
     }
   }
+
+  func updateFavorite(ids: [String], isFavorite: Bool) async -> Bool {
+    guard authorized, !ids.isEmpty else { return false }
+    return await withCheckedContinuation { continuation in
+      let assets = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+      guard assets.count == ids.count else {
+        continuation.resume(returning: false)
+        return
+      }
+      PHPhotoLibrary.shared().performChanges({
+        assets.enumerateObjects { asset, _, _ in
+          PHAssetChangeRequest(for: asset).isFavorite = isFavorite
+        }
+      }) { [weak self] success, _ in
+        if success { DispatchQueue.main.async { self?.refresh() } }
+        continuation.resume(returning: success)
+      }
+    }
+  }
+
+  func addAssets(_ assetIDs: [String], toAlbum albumID: String) async -> Bool {
+    guard authorized, !assetIDs.isEmpty,
+          let collection = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [albumID], options: nil).firstObject else { return false }
+    let assets = PHAsset.fetchAssets(withLocalIdentifiers: assetIDs, options: nil)
+    guard assets.count == assetIDs.count else { return false }
+    return await withCheckedContinuation { continuation in
+      PHPhotoLibrary.shared().performChanges({
+        guard let request = PHAssetCollectionChangeRequest(for: collection) else { return }
+        request.addAssets(assets)
+      }) { [weak self] success, _ in
+        if success { DispatchQueue.main.async { self?.refresh() } }
+        continuation.resume(returning: success)
+      }
+    }
+  }
+
+  func saveFilesToPhotos(_ urls: [URL]) async -> (saved: Int, failed: Int) {
+    guard authorized, !urls.isEmpty else { return (0, urls.count) }
+    var saved = 0
+    var failed = 0
+    for url in urls {
+      let success: Bool = await withCheckedContinuation { continuation in
+        PHPhotoLibrary.shared().performChanges({
+          let request = PHAssetCreationRequest.forAsset()
+          if nativeIsVideoFile(url) {
+            request.addResource(with: .video, fileURL: url, options: nil)
+          } else {
+            request.addResource(with: .photo, fileURL: url, options: nil)
+          }
+        }) { success, _ in
+          continuation.resume(returning: success)
+        }
+      }
+      if success { saved += 1 } else { failed += 1 }
+    }
+    refresh()
+    return (saved, failed)
+  }
 }
 
 struct NativeDeviceAsset: Identifiable, Sendable {
@@ -187,6 +277,7 @@ struct NativeDeviceAsset: Identifiable, Sendable {
   let isVideo: Bool
   var isLivePhoto: Bool = false
   let contentVersion: Int
+  var isFavorite: Bool = false
 }
 
 struct NativeDeviceAlbum: Identifiable, Sendable {
@@ -493,11 +584,28 @@ extension NativeImmichClient {
     return rows
   }
 
-  private static func decodeAsset(_ item: [String: Any]) -> NativeAsset? {
+  static func decodeAsset(_ item: [String: Any]) -> NativeAsset? {
     guard let id = item["id"] as? String else { return nil }
     let dateText = (item["localDateTime"] as? String) ?? (item["fileCreatedAt"] as? String) ?? ""
     let date = NativeImmichClient.parseISODate(dateText) ?? .distantPast
-    return NativeAsset(id: id, date: date, isImage: (item["type"] as? String) != "VIDEO", isFavorite: item["isFavorite"] as? Bool ?? false, thumbhash: item["thumbhash"] as? String, livePhotoVideoId: item["livePhotoVideoId"] as? String)
+    let exif = item["exifInfo"] as? [String: Any] ?? [:]
+    let visibility = item["visibility"] as? String ?? "timeline"
+    return NativeAsset(
+      id: id,
+      date: date,
+      isImage: (item["type"] as? String) != "VIDEO",
+      isFavorite: item["isFavorite"] as? Bool ?? false,
+      thumbhash: item["thumbhash"] as? String,
+      livePhotoVideoId: item["livePhotoVideoId"] as? String,
+      originalFileName: item["originalFileName"] as? String,
+      originalMimeType: item["originalMimeType"] as? String,
+      width: item["width"] as? Int,
+      height: item["height"] as? Int,
+      fileSizeInByte: (exif["fileSizeInByte"] as? NSNumber)?.int64Value,
+      latitude: (exif["latitude"] as? NSNumber)?.doubleValue,
+      longitude: (exif["longitude"] as? NSNumber)?.doubleValue,
+      isArchived: visibility.lowercased() == "archive"
+    )
   }
 
   func serverAlbums() async throws -> [NativeServerAlbum] {
@@ -669,7 +777,7 @@ struct NativeResultGrid: View {
       }
     }
 
-    return items.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date > $1.date }
+    return items.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
   }
 
   private var mergedGroups: [Date: [NativeGridItem]] {
@@ -987,15 +1095,25 @@ struct NativeResultGrid: View {
 }
 
 enum NativeAssetState {
-  case local   // device only, not synced to server -> icloud.slash
-  case remote  // server only, not on device -> cloud
-  case merged  // synced on both server and device -> checkmark.icloud
+  case local
+  case remote
+  case merged
+  case unknown
 }
 
 enum NativeDeleteTargetScope {
   case all
   case localOnly
   case remoteOnly
+}
+
+enum NativeDeleteOperationError: LocalizedError {
+  case partial([String])
+  var errorDescription: String? {
+    switch self {
+    case .partial(let failures): return "部分删除未成功：\(failures.joined(separator: "；"))"
+    }
+  }
 }
 
 @MainActor
@@ -1020,13 +1138,18 @@ func nativeDeleteGridItems(
     }
   }
 
-  let uniqueServerIDs = Array(Set(serverIDs))
-  let uniqueLocalIDs = Array(Set(localIDs))
+  let uniqueServerIDs = Array(Set(serverIDs)).sorted()
+  let uniqueLocalIDs = Array(Set(localIDs)).sorted()
+  var failures = [String]()
 
-  if !uniqueServerIDs.isEmpty { try await client.deleteAssets(ids: uniqueServerIDs) }
-  if !uniqueLocalIDs.isEmpty {
-    guard await device.deleteAssets(ids: uniqueLocalIDs) else { throw NativeFeatureError.badResponse }
+  if !uniqueServerIDs.isEmpty {
+    do { try await client.deleteAssets(ids: uniqueServerIDs) }
+    catch { failures.append("云端：\(error.localizedDescription)") }
   }
+  if !uniqueLocalIDs.isEmpty, !(await device.deleteAssets(ids: uniqueLocalIDs)) {
+    failures.append("本机：照片权限不足或系统删除失败")
+  }
+  if !failures.isEmpty { throw NativeDeleteOperationError.partial(failures) }
 }
 
 struct NativeGridItem: Identifiable {
@@ -1034,10 +1157,14 @@ struct NativeGridItem: Identifiable {
   let local: NativeDeviceAsset?
 
   var id: String {
-    if let server, let local { return "merged:\(server.id):\(local.id)" }
-    if let server { return "server:\(server.id)" }
-    return "local:\(local?.id ?? "")"
+    if let local { return "local:\(local.id)" }
+    if let server, let localID = NativeSyncCacheStore.shared.localID(for: server.id) {
+      return "local:\(localID)"
+    }
+    return "server:\(server?.id ?? "")"
   }
+
+  var isFavorite: Bool { server?.isFavorite ?? local?.isFavorite ?? false }
 
   var date: Date { server?.date ?? local?.date ?? .distantPast }
 
@@ -1049,26 +1176,22 @@ struct NativeGridItem: Identifiable {
 
   var state: NativeAssetState {
     if let local {
-      if server != nil || NativeSyncCacheStore.shared.isMatched(localId: local.id) {
-        return .merged
-      } else {
-        return .local
-      }
-    } else {
-      return .remote
+      if server != nil || NativeSyncCacheStore.shared.isMatched(localId: local.id) { return .merged }
+      if NativeSyncCacheStore.shared.checkedIDs.contains(local.id) { return .local }
+      return .unknown
     }
+    return .remote
   }
 
-  func cloudSymbol(matchedServerIDs: [String: String] = NativeSyncCacheStore.shared.matchedServerIDs) -> String {
+  func cloudSymbol(
+    matchedServerIDs: [String: String] = NativeSyncCacheStore.shared.matchedServerIDs,
+    checkedIDs: Set<String> = NativeSyncCacheStore.shared.checkedIDs
+  ) -> String {
     if let local {
-      if server != nil || matchedServerIDs[local.id] != nil {
-        return "checkmark.icloud"
-      } else {
-        return "icloud.slash"
-      }
-    } else {
-      return "cloud"
+      if server != nil || matchedServerIDs[local.id] != nil { return "checkmark.icloud" }
+      return checkedIDs.contains(local.id) ? "icloud.slash" : "questionmark.icloud"
     }
+    return "cloud"
   }
 }
 
@@ -1801,6 +1924,8 @@ private struct NativeAlbumDetail: View {
   @State private var isSelecting = false
   @State private var selectedIDs: Set<String> = []
   @State private var showDeleteConfirmation = false
+  @State private var showLocalDeleteWarning = false
+  @State private var pendingDeleteScope: NativeDeleteTargetScope = .all
   @State private var deletionError: String?
   @State private var isDeleting = false
   @State private var batchShareItems: [Any]? = nil
@@ -1877,7 +2002,7 @@ private struct NativeAlbumDetail: View {
             var ids: [String] = []
             for local in localAssetsToDisplay {
               if let sID = matched[local.id], let sAsset = serverById[sID] {
-                ids.append("merged:\(sAsset.id):\(local.id)")
+                ids.append("local:\(local.id)")
                 usedServerIDs.insert(sAsset.id)
               } else {
                 ids.append("local:\(local.id)")
@@ -1952,6 +2077,14 @@ private struct NativeAlbumDetail: View {
         Text("确认删除选中的照片？此操作不可撤销。")
       }
     }
+    .alert("本机删除确认", isPresented: $showLocalDeleteWarning) {
+      Button("取消", role: .cancel) {}
+      Button("继续删除", role: .destructive) {
+        let targets = selectedTargets
+        let scope = pendingDeleteScope
+        Task { await performSelectedDeletion(targets: targets, scope: scope) }
+      }
+    } message: { Text("删除本机照片会永久从系统照片中移除；若开启 iCloud 照片，可能同步到其他设备。将只执行你选择的删除范围。") }
     .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
       Button("确定", role: .cancel) { deletionError = nil }
     } message: { Text(deletionError ?? "未知错误") }
@@ -1978,9 +2111,20 @@ private struct NativeAlbumDetail: View {
   }
 
   private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
+    pendingDeleteScope = scope
     guard !isDeleting else { return }
     let targets = selectedTargets
     guard !targets.isEmpty else { return }
+    if scope != .remoteOnly && targets.contains(where: { $0.local != nil }) {
+      pendingDeleteScope = scope
+      showLocalDeleteWarning = true
+      return
+    }
+    await performSelectedDeletion(targets: targets, scope: scope)
+  }
+
+  private func performSelectedDeletion(targets: [NativeGridItem], scope: NativeDeleteTargetScope) async {
+    guard !isDeleting, !targets.isEmpty else { return }
     isDeleting = true
     defer { isDeleting = false }
     do {
@@ -2003,11 +2147,12 @@ private struct NativeAlbumDetail: View {
     isPreparingBatchShare = true
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
     Task {
-      let contents = await nativePrepareBatchShare(items: targets, client: client)
+      let result = await nativePrepareBatchShare(items: targets, client: client)
       await MainActor.run {
         isPreparingBatchShare = false
-        if !contents.isEmpty {
-          batchShareItems = contents
+        if !result.files.isEmpty {
+          batchShareItems = result.files
+          if result.failed > 0 { deletionError = "已准备 \(result.files.count) 项原件；\(result.failed) 项暂不可用。" }
         }
       }
     }

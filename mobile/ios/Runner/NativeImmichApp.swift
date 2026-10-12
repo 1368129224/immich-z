@@ -450,6 +450,7 @@ final class NativeImmichClient {
           url.scheme == endpoint.scheme, url.host == endpoint.host, url.port == endpoint.port,
           url.path.hasPrefix(endpoint.path + "/") else { throw NativeAPIError.invalidServer }
     var request = URLRequest(url: url)
+    request.timeoutInterval = 300
     request.setValue("*/*", forHTTPHeaderField: "Accept")
     applyAuth(to: &request)
     let (downloadedURL, response) = try await session.download(for: request)
@@ -1006,7 +1007,10 @@ struct NativePhotosView: View {
         result.append(NativeGridItem(server: server, local: local))
       }
     }
-    return result.sorted { $0.date == $1.date ? $0.id < $1.id : $0.date < $1.date }
+    return result.sorted { lhs, rhs in
+      if lhs.date == rhs.date { return lhs.id < rhs.id }
+      return lhs.date < rhs.date
+    }
   }
 
   private var excludedLocalAssetIDsForTimeline: Set<String> {
@@ -1163,25 +1167,30 @@ struct NativePhotosView: View {
     return NativeImmichClient.formatChineseDate(group.date, includeDay: !isFirstInMonth)
   }
 
+  @ViewBuilder
+  private func newPhotosBanner(proxy: ScrollViewProxy) -> some View {
+    if model.newlyAddedCount > 0 && sourceFilter != .device {
+      Button {
+        model.acknowledgeNewAssets()
+        scrollToBottom(proxy: proxy, animated: true)
+      } label: {
+        Text("有 \(model.newlyAddedCount) 项新照片 · 查看最新")
+          .font(.caption.weight(.medium))
+          .frame(maxWidth: .infinity)
+          .padding(.vertical, 8)
+          .background(.thinMaterial, in: Capsule())
+      }
+      .padding(.horizontal)
+      .buttonStyle(.plain)
+    }
+  }
+
   var body: some View {
     NavigationView {
       ScrollViewReader { proxy in
         ScrollView {
           LazyVStack(spacing: 4) {
-            if model.newlyAddedCount > 0 && sourceFilter != .device {
-              Button {
-                model.acknowledgeNewAssets()
-                scrollToBottom(proxy: proxy, animated: true)
-              } label: {
-                Label("有 \(model.newlyAddedCount) 项新照片 · 查看最新", systemImage: "arrow.down.to.line")
-                  .font(.caption.weight(.medium))
-                  .frame(maxWidth: .infinity)
-                  .padding(.vertical, 8)
-                  .background(.thinMaterial, in: Capsule())
-              }
-              .padding(.horizontal)
-              .buttonStyle(.plain)
-            }
+            newPhotosBanner(proxy: proxy)
             if sourceFilter != .device && model.hasOlder && !model.assets.isEmpty {
               ProgressView()
                 .frame(maxWidth: .infinity)
@@ -1419,6 +1428,7 @@ struct NativePhotosView: View {
         .onChange(of: model.assets.count) { _ in
           let anchor = visibleAnchorID
           rebuildDayGroups()
+          updateSelectionAfterTimelineChange()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
           else if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
         }
@@ -1443,6 +1453,7 @@ struct NativePhotosView: View {
             await device.refreshAndWait()
             if !model.isLoading { await model.refreshLatest() }
             rebuildDayGroups()
+            updateSelectionAfterTimelineChange()
             initialRemoteLoaded = true
             await cloud.check(device.assets, client: client)
             await loadKnownMatchedServerAssets()
@@ -1593,16 +1604,21 @@ struct NativePhotosView: View {
             client: client,
             device: device,
             items: cachedDayGroups.flatMap(\.assets),
-            initialItem: item
-          ) { deletedItem, scope in
-            if scope == .all || scope == .remoteOnly {
-              if let sid = deletedItem.server?.id {
-                model.removeAssets(ids: [sid])
+            initialItem: item,
+            onDeleteItem: { deletedItem, scope in
+              if scope == .all || scope == .remoteOnly {
+                if let sid = deletedItem.server?.id { model.removeAssets(ids: [sid]) }
+                if let local = deletedItem.local,
+                   NativeSyncCacheStore.shared.serverID(for: local.id) == deletedItem.server?.id {
+                  cloud.forgetMatches(localIDs: Set([local.id]))
+                }
               }
-            }
-            device.refresh()
-            rebuildDayGroups()
-          }
+              device.refresh()
+              rebuildDayGroups()
+            },
+            onServerAssetUpdated: { model.upsert($0) },
+            onServerAssetArchived: { model.removeAssets(ids: [$0]) }
+          )
         }
       }
     }
@@ -1685,11 +1701,12 @@ struct NativePhotosView: View {
       if scope == .all || scope == .remoteOnly {
         let serverIDs = Set(items.compactMap { $0.server?.id })
         model.removeAssets(ids: serverIDs)
-        let invalidatedLocalIDs = Set(items.compactMap { item in
+        var invalidatedLocalIDs = Set<String>()
+        for item in items {
           guard let local = item.local,
-                let serverID = cloud.matchedServerIDs[local.id], serverIDs.contains(serverID) else { return nil }
-          return local.id
-        })
+                let serverID = cloud.matchedServerIDs[local.id], serverIDs.contains(serverID) else { continue }
+          invalidatedLocalIDs.insert(local.id)
+        }
         cloud.forgetMatches(localIDs: invalidatedLocalIDs)
       }
       selectedIDs.removeAll()
@@ -1698,12 +1715,14 @@ struct NativePhotosView: View {
       rebuildDayGroups()
     } catch {
       if scope == .all || scope == .remoteOnly {
-        cloud.forgetMatches(localIDs: Set(items.compactMap { item in
+        var invalidatedLocalIDs = Set<String>()
+        for item in items {
           guard let local = item.local,
                 let serverID = item.server?.id,
-                cloud.matchedServerIDs[local.id] == serverID else { return nil }
-          return local.id
-        }))
+                cloud.matchedServerIDs[local.id] == serverID else { continue }
+          invalidatedLocalIDs.insert(local.id)
+        }
+        cloud.forgetMatches(localIDs: invalidatedLocalIDs)
       }
       deletionError = "可能已有部分照片删除成功，请刷新确认。\(error.localizedDescription)"
       device.refresh()
@@ -1834,6 +1853,7 @@ struct NativePhotosView: View {
       await device.refreshAndWait()
       rebuildDayGroups()
       await cloud.check(device.assets, client: client)
+      await loadKnownMatchedServerAssets()
       if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
       isRefreshing = false
     }
@@ -2344,6 +2364,8 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var items: [NativeGridItem]
   let initialItem: NativeGridItem
   var onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil
+  var onServerAssetUpdated: ((NativeAsset) -> Void)? = nil
+  var onServerAssetArchived: ((String) -> Void)? = nil
 
   @Environment(\.dismiss) private var dismiss
   @State private var currentIndex: Int = 0
@@ -2354,7 +2376,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var isProcessingFavorite = false
   @State private var showMoreActions = false
   @State private var isPreparingShare = false
-  @State private var preparingShareTask: Task<Void, Never>?
+  @State private var shareTask: Task<Void, Never>?
   @State private var viewerMessage: String?
   @State private var dragOffset: CGSize = .zero
   @State private var shareItem: Any? = nil
@@ -2369,13 +2391,17 @@ struct NativeUnifiedGalleryViewer: View {
     device: NativeDeviceLibrary,
     items: [NativeGridItem],
     initialItem: NativeGridItem,
-    onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil
+    onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil,
+    onServerAssetUpdated: ((NativeAsset) -> Void)? = nil,
+    onServerAssetArchived: ((String) -> Void)? = nil
   ) {
     self.client = client
     self.device = device
     _items = State(initialValue: items)
     self.initialItem = initialItem
     self.onDeleteItem = onDeleteItem
+    self.onServerAssetUpdated = onServerAssetUpdated
+    self.onServerAssetArchived = onServerAssetArchived
     let index = items.firstIndex(where: { $0.id == initialItem.id }) ?? 0
     _currentIndex = State(initialValue: index)
     _isFavorite = State(initialValue: initialItem.isFavorite)
@@ -2583,6 +2609,12 @@ struct NativeUnifiedGalleryViewer: View {
       isCurrentImageZoomed = false
       if items.indices.contains(newIdx) { isFavorite = items[newIdx].isFavorite }
     }
+    .onDisappear {
+      shareTask?.cancel()
+      shareTask = nil
+      if let url = shareItem as? URL { try? FileManager.default.removeItem(at: url) }
+      shareItem = nil
+    }
     .alert("操作结果", isPresented: Binding(get: { viewerMessage != nil }, set: { if !$0 { viewerMessage = nil } })) {
       Button("好", role: .cancel) { viewerMessage = nil }
     } message: { Text(viewerMessage ?? "") }
@@ -2615,23 +2647,12 @@ struct NativeUnifiedGalleryViewer: View {
     Task {
       do {
         try await nativeDeleteGridItems([item], scope: scope, client: client, device: device)
-        if scope == .all || scope == .remoteOnly {
-          if let serverID = item.server?.id { model.removeAssets(ids: [serverID]) }
-          if let local = item.local,
-             NativeSyncCacheStore.shared.serverID(for: local.id) == item.server?.id {
-            cloud.forgetMatches(localIDs: Set([local.id]))
-          }
-        }
         await MainActor.run {
           isDeletingItem = false
           onDeleteItem?(item, scope)
           retainViewerAfterDeleting(item, scope: scope)
         }
       } catch {
-        if scope == .all || scope == .remoteOnly, let local = item.local,
-           NativeSyncCacheStore.shared.serverID(for: local.id) == item.server?.id {
-          cloud.forgetMatches(localIDs: Set([local.id]))
-        }
         await MainActor.run {
           isDeletingItem = false
           deleteErrorMessage = "删除失败：\(error.localizedDescription)"
@@ -2678,7 +2699,7 @@ struct NativeUnifiedGalleryViewer: View {
     guard let item = currentItem, let server = item.server else { return }
     do {
       try await client.updateVisibility(ids: [server.id], visibility: "archive")
-      model.removeAssets(ids: [server.id])
+      onServerAssetArchived?(server.id)
       if let local = item.local {
         items[currentIndex] = NativeGridItem(server: nil, local: local)
         isFavorite = local.isFavorite
@@ -2715,7 +2736,7 @@ struct NativeUnifiedGalleryViewer: View {
             width: server.width, height: server.height, fileSizeInByte: server.fileSizeInByte,
             latitude: server.latitude, longitude: server.longitude, isArchived: server.isArchived
           )
-          model.upsert(updated)
+          onServerAssetUpdated?(updated)
           items[currentIndex] = NativeGridItem(server: updated, local: item.local)
         }
       }
@@ -2728,7 +2749,15 @@ struct NativeUnifiedGalleryViewer: View {
     guard let item = currentItem, !isPreparingShare else { return }
     isPreparingShare = true
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    Task {
+    shareTask = Task {
+      var preparedURL: URL?
+      defer {
+        if Task.isCancelled, let preparedURL { try? FileManager.default.removeItem(at: preparedURL) }
+        if !Task.isCancelled {
+          isPreparingShare = false
+          shareTask = nil
+        }
+      }
       do {
         let shared: Any
         if let local = item.local {
@@ -2736,17 +2765,21 @@ struct NativeUnifiedGalleryViewer: View {
             throw NativeShareError.originalUnavailable
           }
           let result = try await nativeOriginalFile(for: source)
+          preparedURL = result
           shared = result
         } else if let server = item.server {
-          shared = try await client.originalFile(for: server)
+          let result = try await client.originalFile(for: server)
+          preparedURL = result
+          shared = result
         } else {
           throw NativeShareError.originalUnavailable
         }
+        guard !Task.isCancelled else { return }
         shareItem = shared
       } catch {
+        guard !Task.isCancelled else { return }
         viewerMessage = "原件暂不可分享。请检查网络、照片权限或 iCloud 原件状态后重试。\n\(error.localizedDescription)"
       }
-      isPreparingShare = false
     }
   }
 }
@@ -2764,11 +2797,16 @@ private func nativeOriginalFile(for asset: PHAsset) async throws -> URL {
   let target = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
   let options = PHAssetResourceRequestOptions()
   options.isNetworkAccessAllowed = true
-  try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-    PHAssetResourceManager.default().writeData(for: resource, toFile: target, options: options) { error in
-      if let error { continuation.resume(throwing: error) }
-      else { continuation.resume(returning: ()) }
+  do {
+    try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+      PHAssetResourceManager.default().writeData(for: resource, toFile: target, options: options) { error in
+        if let error { continuation.resume(throwing: error) }
+        else { continuation.resume(returning: ()) }
+      }
     }
+  } catch {
+    try? FileManager.default.removeItem(at: target)
+    throw error
   }
   return target
 }
@@ -3122,8 +3160,8 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   }
 
   class Coordinator: NSObject, UIScrollViewDelegate {
-    let onTap: () -> Void
-    let onZoomChanged: (Bool) -> Void
+    var onTap: () -> Void
+    var onZoomChanged: (Bool) -> Void
 
     init(onTap: @escaping () -> Void, onZoomChanged: @escaping (Bool) -> Void) {
       self.onTap = onTap

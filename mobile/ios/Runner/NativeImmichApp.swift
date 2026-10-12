@@ -708,6 +708,7 @@ struct NativeImmichRootView: View {
           self.config = nil
           restoreError = nil
         }
+        .id("\(config.serverUrl)|\(config.userId ?? "unverified")")
       } else {
         NativeLoginView(error: restoreError, onUseFlutter: onUseFlutter) { config = $0 }
       }
@@ -715,31 +716,36 @@ struct NativeImmichRootView: View {
     .task {
       guard restoring else { return }
       if let saved = NativeSessionStore.read(), saved.credential != nil {
-        // Restore the verified account's persisted matches before building the
-        // photo grid; a legacy session without an ID starts with no matches.
+        // A locally verified identity can restore its cache immediately. Never
+        // block the first frame on /users/me or discard an offline session.
         NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: saved.userId)
-        do {
-          var verified = saved
-          verified.userId = try await NativeImmichClient(config: saved).verifiedUserID()
-          NativeSyncCacheStore.shared.configure(server: verified.serverUrl, userId: verified.userId)
-          try? NativeSessionStore.save(verified)
-          config = verified
-        } catch {
-          if let apiError = error as? NativeAPIError, case .unauthorized = apiError {
-            NativeSyncCacheStore.shared.clear()
-            NativeSessionStore.clear()
+        config = saved
+        restoring = false
+        Task(priority: .utility) {
+          do {
+            let userID = try await NativeImmichClient(config: saved).verifiedUserID()
+            guard config?.credential == saved.credential else { return }
+            if saved.userId != userID {
+              NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: userID)
+              // The account identity changes the shell's view identity.
+              var verified = saved
+              verified.userId = userID
+              try? NativeSessionStore.save(verified)
+              config = verified
+            }
+          } catch {
+            guard config?.credential == saved.credential else { return }
+            if let apiError = error as? NativeAPIError, case .unauthorized = apiError {
+              NativeSyncCacheStore.shared.clear()
+              NativeSessionStore.clear()
+              config = nil
+            }
             restoreError = error.localizedDescription
-          } else {
-            // Keep credentials across offline or transient server failures.
-            restoreError = error.localizedDescription
-            // Offline restore cannot validate legacy configurations without a
-            // user identity; never inherit another account's match cache.
-            NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: saved.userId)
-            config = saved
           }
         }
+      } else {
+        restoring = false
       }
-      restoring = false
     }
   }
 }
@@ -865,7 +871,7 @@ private final class NativeTimelineModel: ObservableObject {
   private var nextBucket = 0
   private var searchFallbackEnabled = false
   private var searchCursor: String?
-  private let pageSize = 20
+  private let pageSize = 8
 
   init(client: NativeImmichClient) { self.client = client }
 
@@ -886,19 +892,18 @@ private final class NativeTimelineModel: ObservableObject {
       searchCursor = nil
       buckets = refreshedBuckets
       // Fetch the newest page while preserving the older pagination boundary.
+      var incoming = [NativeAsset]()
       for bucket in buckets.prefix(pageSize) {
-        let incoming = try await client.assets(in: bucket)
-        assets = (assets + incoming).reduce(into: [String: NativeAsset]()) { $0[$1.id] = $1 }.values.sorted { $0.date < $1.date }
+        incoming.append(contentsOf: try await client.assets(in: bucket))
       }
+      assets = (assets + incoming).reduce(into: [String: NativeAsset]()) { $0[$1.id] = $1 }.values.sorted { $0.date < $1.date }
       newlyAddedCount = assets.filter { !existingIDs.contains($0.id) }.count
       nextBucket = nativeBoundaryAfterFetchingHead(
         old: existingBuckets, next: existingSearchFallback ? 0 : existingNextBucket,
         refreshed: buckets, headSize: pageSize
       )
       hasOlder = nextBucket < buckets.count
-      if existingBuckets.isEmpty {
-        while assets.count < 100 && hasOlder { try await loadNextPage() }
-      }
+      // Older buckets load only after the user scrolls towards them.
     } catch {
       // Some compatible Immich servers or reverse proxies return a non-JSON
       // timeline response. Keep Photos usable via the standard metadata search.
@@ -1028,6 +1033,8 @@ struct NativePhotosView: View {
   @State private var sourceFilter: NativePhotosSource = .all
   @State private var cachedDayGroups: [NativeDayGroup] = []
   @State private var cachedFirstGroupDatesInMonth = Set<Date>()
+  @State private var cachedExcludedLocalIDs = Set<String>()
+  @State private var excludedLocalRefreshTask: Task<Void, Never>?
   @AppStorage("immichz_photos_excluded_local_album_ids") private var excludedLocalAlbumIDsRaw = "[]"
   @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerAlbumIDsRaw = "[]"
   @State private var excludedServerAssetIDs = Set<String>()
@@ -1050,7 +1057,8 @@ struct NativePhotosView: View {
   @State private var lastForegroundRefreshTime: Date = .distantPast
   @State private var needsForegroundRefresh = false
   @State private var didInitialPosition = false
-  @State private var initialScrollVisible = false
+  @State private var userMovedTimeline = false
+  @State private var hydrationTask: Task<Void, Never>?
   @State private var loadingOlderAnchor: String?
   @State private var showServerSettings = false
   @State private var showSyncSettings = false
@@ -1092,7 +1100,7 @@ struct NativePhotosView: View {
     let serverByID = Dictionary(model.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     let serverToLocal = Dictionary(matched.map { ($0.value, $0.key) }, uniquingKeysWith: { first, _ in first })
     let localByID = Dictionary(device.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-    let excludedLocalIDs = excludedLocalAssetIDs(for: nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw))
+    let excludedLocalIDs = cachedExcludedLocalIDs
     var seenServer = Set<String>()
     var result = [NativeGridItem]()
     for local in device.assets {
@@ -1128,12 +1136,36 @@ struct NativePhotosView: View {
     }
   }
 
-  private func excludedLocalAssetIDs(for albumIDs: Set<String>) -> Set<String> {
-    nativePhotosHiddenLocalAssetIDs(
-      in: device.albums,
-      excludedAlbumIDs: albumIDs,
-      assetsForAlbum: device.assets(in:)
-    )
+  private func refreshExcludedLocalAssetIDs() {
+    excludedLocalRefreshTask?.cancel()
+    let albumIDs = nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw)
+    guard !albumIDs.isEmpty else {
+      cachedExcludedLocalIDs = []
+      rebuildDayGroups()
+      return
+    }
+    let albums = device.albums.filter { albumIDs.contains($0.id) }
+    guard !albums.isEmpty else {
+      // Keep the previous exclusions until PhotoKit finishes loading albums.
+      return
+    }
+    excludedLocalRefreshTask = Task(priority: .utility) {
+      let ids = await Task.detached(priority: .utility) {
+        var result = Set<String>()
+        for album in albums {
+          guard !Task.isCancelled else { break }
+          guard let collection = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [album.id], options: nil).firstObject else { continue }
+          let assets = PHAsset.fetchAssets(in: collection, options: nil)
+          assets.enumerateObjects { asset, _, _ in
+            result.insert(asset.localIdentifier)
+          }
+        }
+        return result
+      }.value
+      guard !Task.isCancelled, albumIDs == nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw) else { return }
+      cachedExcludedLocalIDs = ids
+      rebuildDayGroups()
+    }
   }
 
   private var connectionAndSyncBadge: some View {
@@ -1288,17 +1320,17 @@ struct NativePhotosView: View {
           LazyVStack(spacing: 4) {
             newPhotosBanner(proxy: proxy)
             if sourceFilter != .device && model.hasOlder && !model.assets.isEmpty {
-              ProgressView()
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 16)
-                .id("older-loader")
-                .onAppear {
-                  if didInitialPosition {
-                    requestOlder(proxy: proxy)
-                  }
-                }
+              Button {
+                requestOlder()
+              } label: {
+                if loadingOlderAnchor != nil { ProgressView() }
+                else { Text("加载更早照片") }
+              }
+              .frame(maxWidth: .infinity)
+              .padding(.vertical, 16)
+              .disabled(loadingOlderAnchor != nil || model.isLoading)
             }
-            if sourceFilter != .device && model.assets.isEmpty && (model.isLoading || device.isLoading) {
+            if cachedDayGroups.isEmpty && (model.isLoading || device.isLoading) {
               VStack(spacing: 10) {
                 ProgressView()
                 Text("正在加载照片…")
@@ -1413,7 +1445,6 @@ struct NativePhotosView: View {
             }
             Color.clear.frame(height: 1).id(bottomAnchor)
           }
-          .opacity(initialScrollVisible ? 1 : 0)
   }
 
   private func timelineGestureContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
@@ -1439,7 +1470,15 @@ struct NativePhotosView: View {
         .simultaneousGesture(
           DragGesture(minimumDistance: 4, coordinateSpace: .named("photosScrollSpace"))
             .onChanged { drag in
-              guard isSelecting, !isMagnifying else { return }
+              if !isSelecting {
+                if abs(drag.translation.height) > 12 {
+                  userMovedTimeline = true
+                  pendingSourceChangeScroll = false
+                  if !didInitialPosition { didInitialPosition = true }
+                }
+                return
+              }
+              guard !isMagnifying else { return }
               if dragSelectionIntent == .undecided {
                 let intent = nativeDragSelectionIntent(for: drag.translation)
                 if intent != .undecided { dragSelectionIntent = intent }
@@ -1498,12 +1537,8 @@ struct NativePhotosView: View {
   private func timelineLifecycleContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
     content
         .onChange(of: cloud.matchedServerIDs) { _ in
-          let anchor = visibleAnchorID
           rebuildDayGroups()
-          // Don't let background match hydration override the in-flight initial
-          // scroll-to-latest sequence.
-          if didInitialPosition, !pendingSourceChangeScroll, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
-          Task { await loadKnownMatchedServerAssets() }
+          scheduleMatchedHydration()
         }
         .onChange(of: sourceFilter) { _ in
           actionMessage = nil
@@ -1512,22 +1547,18 @@ struct NativePhotosView: View {
           positionAtLatestAfterSourceChange(proxy: proxy)
         }
         .refreshable {
-          let anchor = visibleAnchorID
+          device.refresh()
           await model.refreshLatest()
-          await device.refreshAndWait()
           rebuildDayGroups()
-          await cloud.check(device.assets, client: client)
-          await loadKnownMatchedServerAssets()
-          if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+          scheduleMatchedHydration()
         }
         .onChange(of: device.assets.count) { _ in
           rebuildDayGroups()
-          Task { await cloud.check(device.assets, client: client) }
           positionInitiallyIfReady(proxy: proxy)
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: excludedLocalAlbumIDsRaw) { _ in
-          rebuildDayGroups()
+          refreshExcludedLocalAssetIDs()
           updateSelectionAfterTimelineChange()
         }
         .onChange(of: excludedServerAlbumIDsRaw) { _ in
@@ -1536,12 +1567,14 @@ struct NativePhotosView: View {
         }
         .onChange(of: device.isLoading) { loading in
           guard !loading else { return }
+          refreshExcludedLocalAssetIDs()
           rebuildDayGroups()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onAppear {
           rebuildDayGroups()
+          refreshExcludedLocalAssetIDs()
           refreshExcludedServerAssetIDs()
           if model.assets.isEmpty && !model.isLoading {
             Task {
@@ -1549,24 +1582,18 @@ struct NativePhotosView: View {
               initialRemoteLoaded = true
               rebuildDayGroups()
               positionInitiallyIfReady(proxy: proxy)
-              await cloud.check(device.assets, client: client)
-              await loadKnownMatchedServerAssets()
+              scheduleMatchedHydration()
             }
           } else {
             initialRemoteLoaded = true
-            Task {
-              await cloud.check(device.assets, client: client)
-              await loadKnownMatchedServerAssets()
-            }
+            scheduleMatchedHydration()
             positionInitiallyIfReady(proxy: proxy)
           }
         }
         .onChange(of: model.assets.count) { _ in
-          let anchor = visibleAnchorID
           rebuildDayGroups()
           updateSelectionAfterTimelineChange()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
-          else if didInitialPosition, !pendingSourceChangeScroll, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: model.isLoading) { loading in
@@ -1581,6 +1608,14 @@ struct NativePhotosView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
           needsForegroundRefresh = true
+          hydrationTask?.cancel()
+          hydrationTask = nil
+        }
+        .onDisappear {
+          hydrationTask?.cancel()
+          hydrationTask = nil
+          excludedLocalRefreshTask?.cancel()
+          excludedLocalRefreshTask = nil
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
           guard needsForegroundRefresh, !isSelecting else { return }
@@ -1588,16 +1623,13 @@ struct NativePhotosView: View {
           let now = Date()
           guard now.timeIntervalSince(lastForegroundRefreshTime) > 2 else { return }
           lastForegroundRefreshTime = now
-          Task {
-            let anchor = visibleAnchorID
-            await device.refreshAndWait()
+          Task(priority: .utility) {
+            // The existing grid stays interactive while the metadata reloads.
+            device.refresh()
             if !model.isLoading { await model.refreshLatest() }
             rebuildDayGroups()
             updateSelectionAfterTimelineChange()
-            initialRemoteLoaded = true
-            await cloud.check(device.assets, client: client)
-            await loadKnownMatchedServerAssets()
-            if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+            scheduleMatchedHydration()
           }
         }
   }
@@ -1794,17 +1826,20 @@ struct NativePhotosView: View {
     cachedDayGroups.flatMap(\.assets).filter { selectedIDs.contains($0.id) }
   }
 
-  private var visibleAnchorID: String? {
-    let viewportHeight = UIScreen.main.bounds.height
-    return itemBounds.filter { $0.value.maxY > 0 && $0.value.minY < viewportHeight }
-      .min(by: { $0.value.minY < $1.value.minY })?.key
-  }
-
   private var centerVisibleAssetID: String? {
     let viewport = UIScreen.main.bounds
     let center = CGPoint(x: viewport.midX, y: viewport.midY)
     return itemBounds.filter { $0.value.maxY > 0 && $0.value.minY < viewport.height }
       .min(by: { hypot($0.value.midX - center.x, $0.value.midY - center.y) < hypot($1.value.midX - center.x, $1.value.midY - center.y) })?.key
+  }
+
+  private func scheduleMatchedHydration() {
+    hydrationTask?.cancel()
+    hydrationTask = Task(priority: .utility) {
+      try? await Task.sleep(nanoseconds: 1_500_000_000)
+      guard !Task.isCancelled else { return }
+      await loadKnownMatchedServerAssets()
+    }
   }
 
   @MainActor private func loadKnownMatchedServerAssets() async {
@@ -1813,16 +1848,18 @@ struct NativePhotosView: View {
     guard !missing.isEmpty else { return }
     loadingMatchedServerIDs.formUnion(missing)
     for id in missing {
+      guard !Task.isCancelled else { loadingMatchedServerIDs.subtract(missing); return }
       matchedAssetDiagnostics.started()
       do {
         if let asset = try await client.serverAsset(id: id) {
+          guard !Task.isCancelled else { loadingMatchedServerIDs.remove(id); return }
           model.upsert(asset)
           matchedAssetDiagnostics.succeeded(id: id)
         } else {
           matchedAssetDiagnostics.failed(id: id, error: nil)
         }
       } catch {
-        matchedAssetDiagnostics.failed(id: id, error: error)
+        if !Task.isCancelled { matchedAssetDiagnostics.failed(id: id, error: error) }
       }
       loadingMatchedServerIDs.remove(id)
     }
@@ -2018,28 +2055,27 @@ struct NativePhotosView: View {
     }
   }
 
-  private func triggerRefresh(proxy: ScrollViewProxy) {
+  private func triggerRefresh(proxy _: ScrollViewProxy) {
     guard !isRefreshing else { return }
     isRefreshing = true
-    let anchor = visibleAnchorID
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
-    Task {
+    device.refresh()
+    Task(priority: .utility) {
       await model.refreshLatest()
-      await device.refreshAndWait()
       rebuildDayGroups()
-      await cloud.check(device.assets, client: client)
-      await loadKnownMatchedServerAssets()
-      if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+      scheduleMatchedHydration()
       isRefreshing = false
     }
   }
 
   private func positionAtLatestAfterSourceChange(proxy: ScrollViewProxy) {
     pendingSourceChangeScroll = true
-    guard hasInitialScrolled else {
-      positionInitiallyIfReady(proxy: proxy)
-      if hasInitialScrolled { pendingSourceChangeScroll = false }
-      return
+    userMovedTimeline = false
+    if !hasInitialScrolled {
+      // A new source explicitly asks for its newest asset, even if the old
+      // source had not finished loading at the time of the switch.
+      hasInitialScrolled = true
+      didInitialPosition = true
     }
     let sourceIsLoading: Bool
     switch sourceFilter {
@@ -2048,54 +2084,37 @@ struct NativePhotosView: View {
     case .all: sourceIsLoading = model.isLoading || device.isLoading
     }
     guard !sourceIsLoading else { return }
-    guard didInitialPosition else {
-      let expectedSource = sourceFilter
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-        guard pendingSourceChangeScroll, sourceFilter == expectedSource else { return }
-        positionAtLatestAfterSourceChange(proxy: proxy)
-      }
-      return
-    }
     let expectedSource = sourceFilter
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-      guard pendingSourceChangeScroll, sourceFilter == expectedSource else { return }
+      guard pendingSourceChangeScroll, !userMovedTimeline, sourceFilter == expectedSource else { return }
       withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-      // A filtered LazyVStack may need another layout pass to resolve its final
-      // lazy anchor, especially when switching between very different counts.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-        guard pendingSourceChangeScroll, sourceFilter == expectedSource else { return }
-        withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-        pendingSourceChangeScroll = false
-      }
+      pendingSourceChangeScroll = false
     }
   }
 
   private func positionInitiallyIfReady(proxy: ScrollViewProxy) {
-    guard !hasInitialScrolled, initialRemoteLoaded, !model.isLoading, !device.isLoading else { return }
-    // Do not commit the initial position while the remote/local timelines are
-    // still arriving: a subsequent layout pass would move the bottom anchor.
+    guard !hasInitialScrolled, !userMovedTimeline else { return }
+    let sourceReady: Bool
+    switch sourceFilter {
+    case .device: sourceReady = !device.isLoading && !device.assets.isEmpty
+    case .server: sourceReady = initialRemoteLoaded && !model.isLoading && !model.assets.isEmpty
+    case .all: sourceReady = !model.isLoading && !device.isLoading &&
+      (initialRemoteLoaded || !device.assets.isEmpty)
+    }
+    guard sourceReady else { return }
     scrollToBottom(proxy: proxy, animated: false)
   }
 
   private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
     if !hasInitialScrolled {
-      guard initialRemoteLoaded, !model.isLoading, !device.isLoading else { return }
+      guard !userMovedTimeline else { return }
       hasInitialScrolled = true
-      // Lazy grids need a layout pass after the final data update before the
-      // bottom anchor has its final position. Keep content hidden until then.
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+      // One layout pass positions the first loaded content. Never repeatedly
+      // snap back while the user is dragging or background pages arrive.
+      DispatchQueue.main.async {
+        guard !userMovedTimeline else { didInitialPosition = true; return }
         withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-          withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-          initialScrollVisible = true
-          pendingSourceChangeScroll = false
-          DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            // A final pass catches layout changes caused by revealing the lazy
-            // grid after the first two anchor attempts.
-            withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-            didInitialPosition = true
-          }
-        }
+        didInitialPosition = true
       }
     } else {
       DispatchQueue.main.async {
@@ -2111,21 +2130,13 @@ struct NativePhotosView: View {
     }
   }
 
-  private func requestOlder(proxy: ScrollViewProxy) {
-    guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading, didInitialPosition else { return }
-    let anchor = visibleAnchorID ?? cachedDayGroups.first?.assets.first?.id
-    loadingOlderAnchor = anchor ?? "pending"
-    Task {
+  private func requestOlder() {
+    guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading else { return }
+    loadingOlderAnchor = "pending"
+    Task(priority: .utility) {
       await model.loadOlder()
-      if let anchor {
-        await Task.yield()
-        withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) }
-      }
-      if model.error != nil { loadingOlderAnchor = nil }
-      else {
-        try? await Task.sleep(nanoseconds: 300_000_000)
-        loadingOlderAnchor = nil
-      }
+      // Do not fight the user's ongoing drag with an explicit scrollTo.
+      loadingOlderAnchor = nil
     }
   }
 
@@ -2421,15 +2432,29 @@ enum NativeThumbnailCache {
 @MainActor
 private final class NativeThumbnailRequestLimiter {
   static let shared = NativeThumbnailRequestLimiter()
-  private let maximumActive = 12
+  private let maximumActive = 6
   private var active = 0
-  private var waiters: [CheckedContinuation<Void, Never>] = []
+  private var waiters: [(UUID, CheckedContinuation<Bool, Never>)] = []
 
-  func acquire() async {
+  func acquire() async -> Bool {
+    if Task.isCancelled { return false }
     if active < maximumActive {
       active += 1
-    } else {
-      await withCheckedContinuation { waiters.append($0) }
+      return true
+    }
+    let token = UUID()
+    return await withTaskCancellationHandler {
+      await withCheckedContinuation { continuation in
+        if Task.isCancelled { continuation.resume(returning: false) }
+        else { waiters.append((token, continuation)) }
+      }
+    } onCancel: {
+      Task { @MainActor in
+        if let index = self.waiters.firstIndex(where: { $0.0 == token }) {
+          let (_, continuation) = self.waiters.remove(at: index)
+          continuation.resume(returning: false)
+        }
+      }
     }
   }
 
@@ -2437,7 +2462,8 @@ private final class NativeThumbnailRequestLimiter {
     if waiters.isEmpty {
       active = max(0, active - 1)
     } else {
-      waiters.removeFirst().resume()
+      let (_, continuation) = waiters.removeFirst()
+      continuation.resume(returning: true)
     }
   }
 }
@@ -2504,11 +2530,15 @@ struct NativeThumbnail: View {
         return
       }
       let maxDim = maxPixelDimension
+      guard await NativeThumbnailRequestLimiter.shared.acquire() else { return }
+      defer { NativeThumbnailRequestLimiter.shared.release() }
+      guard !Task.isCancelled else { return }
       if let cachedData = await NativeThumbnailDiskCache.shared.data(for: cacheKey) {
-        let decoded = await Task.detached(priority: .userInitiated) {
+        guard !Task.isCancelled else { return }
+        let decoded = await Task.detached(priority: .utility) {
           NativeThumbnailCache.downsampledImage(from: cachedData, maxPixelSize: maxDim)
         }.value
-        if let decoded {
+        if !Task.isCancelled, let decoded {
           NativeThumbnailCache.images.setObject(
             decoded,
             forKey: key,
@@ -2525,13 +2555,11 @@ struct NativeThumbnail: View {
       let fallbackURL = isLowDensity ? client.thumbnailURL(for: asset, size: "thumbnail") : client.thumbnailURL(for: asset, size: "preview")
       guard let url = preferredURL ?? fallbackURL else { return }
 
-      await NativeThumbnailRequestLimiter.shared.acquire()
-      defer { NativeThumbnailRequestLimiter.shared.release() }
       guard !Task.isCancelled else { return }
       do {
         let data = try await client.thumbnailData(for: url)
         guard !Task.isCancelled else { return }
-        let decoded = await Task.detached(priority: .userInitiated) {
+        let decoded = await Task.detached(priority: .utility) {
           NativeThumbnailCache.downsampledImage(from: data, maxPixelSize: maxDim)
         }.value
         guard !Task.isCancelled, let decoded else { return }
@@ -2547,7 +2575,7 @@ struct NativeThumbnail: View {
           do {
             let data = try await client.thumbnailData(for: fallbackURL)
             guard !Task.isCancelled else { return }
-            let decoded = await Task.detached(priority: .userInitiated) {
+            let decoded = await Task.detached(priority: .utility) {
               NativeThumbnailCache.downsampledImage(from: data, maxPixelSize: maxDim)
             }.value
             guard !Task.isCancelled, let decoded else { return }
@@ -3741,8 +3769,8 @@ struct NativeSyncSettingsSheet: View {
   var body: some View {
     NavigationView {
       Form {
-        Section(header: Text("云端状态核验"), footer: Text("此版本仅计算本机原件指纹并查询服务器是否已有匹配资产，不会上传照片。")) {
-          Toggle("开启自动核验", isOn: $syncEnabled)
+        Section(header: Text("云端状态核验"), footer: Text("核验需读取本机原件并计算 SHA-1，照片或视频较多时可能耗电发热；不再于启动或滚动时自动执行。已缓存的匹配状态仍会显示。此版本不会上传照片。")) {
+          Toggle("允许原件核验（需手动启动）", isOn: $syncEnabled)
         }
 
         Section(header: Text("相册与同步状态")) {

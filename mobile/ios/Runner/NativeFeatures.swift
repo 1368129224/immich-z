@@ -112,7 +112,6 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
 
   override init() {
     super.init()
-    refresh()
   }
 
   nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
@@ -149,8 +148,8 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
     refreshGeneration += 1
     let generation = refreshGeneration
     isLoading = true
-    Task { [weak self] in
-      let library = await Task.detached(priority: .userInitiated) {
+    Task(priority: .utility) { [weak self] in
+      let library = await Task.detached(priority: .utility) {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         let results = PHAsset.fetchAssets(with: options)
@@ -2913,6 +2912,7 @@ struct NativeTabShell: View {
   @StateObject private var matchedAssetDiagnostics = NativeMatchedAssetDiagnostics()
   @State private var selectedTab = 0
   @State private var lastTab0Tap: Date = .distantPast
+  @State private var didStartLibrary = false
 
   var body: some View {
     let tabBinding = Binding<Int>(
@@ -2942,6 +2942,16 @@ struct NativeTabShell: View {
       NativeLibraryView(client: client, device: device, matchedAssetDiagnostics: matchedAssetDiagnostics)
         .tabItem { Label("设置", systemImage: "gearshape") }
         .tag(3)
+    }
+    .onAppear {
+      guard !didStartLibrary else { return }
+      didStartLibrary = true
+      // Let the first Photos frame render before scanning the system library.
+      Task { @MainActor in
+        try? await Task.sleep(nanoseconds: 450_000_000)
+        guard !Task.isCancelled else { return }
+        device.refresh()
+      }
     }
     .background(
       TabBarDoubleTapHelper {

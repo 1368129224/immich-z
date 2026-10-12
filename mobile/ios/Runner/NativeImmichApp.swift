@@ -916,6 +916,7 @@ struct NativePhotosView: View {
   @State private var loadingMatchedServerIDs = Set<String>()
   @State private var sourceFilter: NativePhotosSource = .all
   @State private var cachedDayGroups: [NativeDayGroup] = []
+  @State private var cachedFirstGroupDatesInMonth = Set<Date>()
   @AppStorage("immichz_photos_excluded_local_album_ids") private var excludedLocalAlbumIDsRaw = "[]"
   @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerAlbumIDsRaw = "[]"
   @State private var excludedServerAssetIDs = Set<String>()
@@ -1150,24 +1151,8 @@ struct NativePhotosView: View {
     }
   }
 
-  private var firstGroupDatesInMonth: Set<Date> {
-    var seenYearMonths = Set<Int>()
-    var result = Set<Date>()
-    var calendar = Calendar.autoupdatingCurrent
-    calendar.timeZone = .autoupdatingCurrent
-    for group in cachedDayGroups {
-      let year = calendar.component(.year, from: group.date)
-      let month = calendar.component(.month, from: group.date)
-      let key = year * 100 + month
-      if seenYearMonths.insert(key).inserted {
-        result.insert(group.date)
-      }
-    }
-    return result
-  }
-
   private func formatDateBadge(for group: NativeDayGroup) -> String {
-    let isFirstInMonth = firstGroupDatesInMonth.contains(group.date)
+    let isFirstInMonth = cachedFirstGroupDatesInMonth.contains(group.date)
     return NativeImmichClient.formatChineseDate(group.date, includeDay: !isFirstInMonth)
   }
 
@@ -1328,7 +1313,10 @@ struct NativePhotosView: View {
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
           let forceUpdate = isSelecting || isDragSelecting || isMagnifying
           let now = Date()
-          guard forceUpdate || now.timeIntervalSince(lastItemBoundsUpdate) >= 0.08 else { return }
+          // Geometry preferences are emitted continuously while scrolling. Publish
+          // ordinary viewport changes at a lower rate to avoid invalidating the
+          // whole timeline several times per second; selection/zoom stays live.
+          guard forceUpdate || now.timeIntervalSince(lastItemBoundsUpdate) >= 0.25 else { return }
           guard nativeShouldRefreshPhotoFrames(
             previous: lastPublishedItemBounds,
             next: frames,
@@ -1509,6 +1497,18 @@ struct NativePhotosView: View {
             if !device.authorized && sourceFilter != .server {
               Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
             }
+            if let message = actionMessage {
+              HStack(spacing: 8) {
+                Text(message).font(.caption).lineLimit(3)
+                Spacer(minLength: 4)
+                Button { actionMessage = nil } label: {
+                  Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("关闭操作提示")
+              }
+              .padding(6)
+            }
             if let message = cloud.message {
               HStack(spacing: 8) {
                 Text(message).font(.caption).lineLimit(3)
@@ -1603,9 +1603,6 @@ struct NativePhotosView: View {
         } message: {
           Text(duplicateSaveCount > 0 ? "所选内容中有 \(duplicateSaveCount) 项已存在本机副本，继续操作可能产生重复照片。" : "将下载云端原件并保存到系统照片。")
         }
-        .alert("操作结果", isPresented: Binding(get: { actionMessage != nil }, set: { if !$0 { actionMessage = nil } })) {
-          Button("好", role: .cancel) { actionMessage = nil }
-        } message: { Text(actionMessage ?? "") }
         .alert("本机删除确认", isPresented: $showLocalDeleteWarning) {
           Button("取消", role: .cancel) {}
           Button("继续", role: .destructive) {
@@ -1929,10 +1926,16 @@ struct NativePhotosView: View {
       return
     }
     let expectedSource = sourceFilter
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
       guard pendingSourceChangeScroll, sourceFilter == expectedSource else { return }
       withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
-      pendingSourceChangeScroll = false
+      // A filtered LazyVStack may need another layout pass to resolve its final
+      // lazy anchor, especially when switching between very different counts.
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+        guard pendingSourceChangeScroll, sourceFilter == expectedSource else { return }
+        withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+        pendingSourceChangeScroll = false
+      }
     }
   }
 
@@ -2034,9 +2037,21 @@ struct NativePhotosView: View {
       let date = calendar.startOfDay(for: item.date)
       grouped[date, default: []].append(item)
     }
-    cachedDayGroups = grouped.keys.sorted().map { date in
+    let groups = grouped.keys.sorted().map { date in
       NativeDayGroup(date: date, assets: grouped[date] ?? [])
     }
+    cachedDayGroups = groups
+
+    var seenYearMonths = Set<Int>()
+    var firstDates = Set<Date>()
+    for group in groups {
+      let year = calendar.component(.year, from: group.date)
+      let month = calendar.component(.month, from: group.date)
+      if seenYearMonths.insert(year * 100 + month).inserted {
+        firstDates.insert(group.date)
+      }
+    }
+    cachedFirstGroupDatesInMonth = firstDates
   }
 
   private var allOrderedAssetIDs: [String] {

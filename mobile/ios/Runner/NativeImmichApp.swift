@@ -1809,7 +1809,7 @@ struct NativePhotosView: View {
   }
 
   private func saveSelectedToDevice() async {
-    guard device.authorized else {
+    if !device.authorized {
       await device.requestAccess()
       guard device.authorized else { actionMessage = "未获得本机照片写入权限。请在系统设置中允许访问后重试。"; return }
     }

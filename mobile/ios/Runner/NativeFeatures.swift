@@ -71,6 +71,29 @@ func nativeClampedPhotosCellSize(_ base: CGFloat, magnification: CGFloat) -> CGF
   min(320, max(72, base * max(0.35, magnification)))
 }
 
+func nativePhotoFramePreference(id: String, frame: CGRect, viewportHeight: CGFloat) -> [String: CGRect] {
+  guard frame.maxY >= -300, frame.minY <= viewportHeight + 300 else { return [:] }
+  return [id: frame]
+}
+
+func nativeShouldRefreshPhotoFrames(
+  previous: [String: CGRect],
+  next: [String: CGRect],
+  force: Bool,
+  movementThreshold: CGFloat = 12
+) -> Bool {
+  if force || Set(previous.keys) != Set(next.keys) { return true }
+  for (id, frame) in next {
+    guard let oldFrame = previous[id] else { return true }
+    if abs(frame.minY - oldFrame.minY) >= movementThreshold ||
+        abs(frame.minX - oldFrame.minX) >= movementThreshold ||
+        abs(frame.width - oldFrame.width) >= 1 || abs(frame.height - oldFrame.height) >= 1 {
+      return true
+    }
+  }
+  return false
+}
+
 func nativeDragSelectionIntent(for translation: CGSize) -> NativeDragSelectionIntent {
   let horizontal = abs(translation.width)
   let vertical = abs(translation.height)

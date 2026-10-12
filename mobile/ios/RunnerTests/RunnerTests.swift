@@ -19,6 +19,20 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(nativeClampedPhotosCellSize(300, magnification: 2), 320, accuracy: 0.001)
   }
 
+  func testPhotoFramePreferencesIgnoreTinyScrollMovementButTrackMeaningfulChanges() {
+    let original: [String: CGRect] = ["a": CGRect(x: 0, y: 0, width: 100, height: 100)]
+    let tinyMovement: [String: CGRect] = ["a": CGRect(x: 1, y: 2, width: 100, height: 100)]
+    let meaningfulMovement: [String: CGRect] = ["a": CGRect(x: 1, y: 15, width: 100, height: 100)]
+    let changedSet: [String: CGRect] = ["b": CGRect(x: 0, y: 0, width: 100, height: 100)]
+
+    XCTAssertFalse(nativeShouldRefreshPhotoFrames(previous: original, next: tinyMovement, force: false))
+    XCTAssertTrue(nativeShouldRefreshPhotoFrames(previous: original, next: meaningfulMovement, force: false))
+    XCTAssertTrue(nativeShouldRefreshPhotoFrames(previous: original, next: tinyMovement, force: true))
+    XCTAssertTrue(nativeShouldRefreshPhotoFrames(previous: original, next: changedSet, force: false))
+    XCTAssertEqual(nativePhotoFramePreference(id: "offscreen", frame: CGRect(x: 0, y: 1000, width: 100, height: 100), viewportHeight: 800), [:])
+    XCTAssertEqual(nativePhotoFramePreference(id: "visible", frame: CGRect(x: 0, y: 10, width: 100, height: 100), viewportHeight: 800).count, 1)
+  }
+
   func testPhotosSourcePredicateKeepsUnloadedVerifiedMatchInCloudFilter() {
     XCTAssertTrue(nativePhotosSourceIncludes(.server, hasLocal: true, hasServer: false, hasVerifiedMatch: true))
     XCTAssertFalse(nativePhotosSourceIncludes(.server, hasLocal: true, hasServer: false, hasVerifiedMatch: false))

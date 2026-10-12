@@ -930,6 +930,9 @@ struct NativePhotosView: View {
   @State private var dragStartLocation: CGPoint? = nil
   @State private var dragStartAssetID: String? = nil
   @State private var itemBounds: [String: CGRect] = [:]
+  @State private var lastPublishedItemBounds: [String: CGRect] = [:]
+  @State private var lastItemBoundsUpdate: Date = .distantPast
+  @State private var pendingSourceChangeScroll = false
   @State private var hasInitialScrolled = false
   @State private var initialRemoteLoaded = false
   @State private var lastForegroundRefreshTime: Date = .distantPast
@@ -976,6 +979,7 @@ struct NativePhotosView: View {
     let serverByID = Dictionary(model.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
     let serverToLocal = Dictionary(matched.map { ($0.value, $0.key) }, uniquingKeysWith: { first, _ in first })
     let localByID = Dictionary(device.assets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    let excludedLocalIDs = excludedLocalAssetIDs(for: nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw))
     var seenServer = Set<String>()
     var result = [NativeGridItem]()
     for local in device.assets {
@@ -995,14 +999,14 @@ struct NativePhotosView: View {
         if sourceFilter == .server && archivedServerIDs.contains(serverID) { continue }
       } else { item = NativeGridItem(server: nil, local: local) }
       if nativePhotosSourceIncludes(sourceFilter, hasLocal: item.local != nil, hasServer: item.server != nil, hasVerifiedMatch: matched[local.id] != nil),
-         !excludedLocalAssetIDsForTimeline.contains(local.id) {
+         !excludedLocalIDs.contains(local.id) {
         result.append(item)
       }
     }
     if sourceFilter != .device {
       for server in model.assets where !seenServer.contains(server.id) && !archivedServerIDs.contains(server.id) {
         if excludedServerAssetIDs.contains(server.id) { continue }
-        if let localID = serverToLocal[server.id], excludedLocalAssetIDsForTimeline.contains(localID) { continue }
+        if let localID = serverToLocal[server.id], excludedLocalIDs.contains(localID) { continue }
         let local = serverToLocal[server.id].flatMap { localByID[$0] }
         result.append(NativeGridItem(server: server, local: local))
       }
@@ -1013,10 +1017,10 @@ struct NativePhotosView: View {
     }
   }
 
-  private var excludedLocalAssetIDsForTimeline: Set<String> {
+  private func excludedLocalAssetIDs(for albumIDs: Set<String>) -> Set<String> {
     nativePhotosHiddenLocalAssetIDs(
       in: device.albums,
-      excludedAlbumIDs: nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw),
+      excludedAlbumIDs: albumIDs,
       assetsForAlbum: device.assets(in:)
     )
   }
@@ -1240,7 +1244,14 @@ struct NativePhotosView: View {
                           }
                           .frame(width: geo.size.width, height: geo.size.height)
                           .clipped()
-                          .preference(key: NativeItemFramePreferenceKey.self, value: [entry.id: geo.frame(in: .named("photosScrollSpace"))])
+                          .preference(
+                            key: NativeItemFramePreferenceKey.self,
+                            value: nativePhotoFramePreference(
+                              id: entry.id,
+                              frame: geo.frame(in: .named("photosScrollSpace")),
+                              viewportHeight: UIScreen.main.bounds.height
+                            )
+                          )
                         }
                       )
                       .clipped()
@@ -1315,6 +1326,16 @@ struct NativePhotosView: View {
         .coordinateSpace(name: "photosScrollSpace")
         .nativeScrollDisabled(isDragSelecting)
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
+          let forceUpdate = isSelecting || isDragSelecting || isMagnifying
+          let now = Date()
+          guard forceUpdate || now.timeIntervalSince(lastItemBoundsUpdate) >= 0.08 else { return }
+          guard nativeShouldRefreshPhotoFrames(
+            previous: lastPublishedItemBounds,
+            next: frames,
+            force: forceUpdate
+          ) else { return }
+          lastItemBoundsUpdate = now
+          lastPublishedItemBounds = frames
           itemBounds = frames
         }
         .simultaneousGesture(
@@ -1373,13 +1394,10 @@ struct NativePhotosView: View {
           Task { await loadKnownMatchedServerAssets() }
         }
         .onChange(of: sourceFilter) { _ in
-          let anchor = visibleAnchorID
-          let anchorDate = cachedDayGroups.flatMap(\.assets).first(where: { $0.id == anchor })?.date
+          actionMessage = nil
           rebuildDayGroups()
           updateSelectionAfterTimelineChange()
-          let nextAnchor = cachedDayGroups.flatMap(\.assets).first(where: { $0.id == anchor })?.id
-            ?? anchorDate.flatMap { date in cachedDayGroups.flatMap(\.assets).min(by: { abs($0.date.timeIntervalSince(date)) < abs($1.date.timeIntervalSince(date)) })?.id }
-          if let nextAnchor { withAnimation(.none) { proxy.scrollTo(nextAnchor, anchor: .top) } }
+          positionAtLatestAfterSourceChange(proxy: proxy)
         }
         .refreshable {
           let anchor = visibleAnchorID
@@ -1394,6 +1412,7 @@ struct NativePhotosView: View {
           rebuildDayGroups()
           Task { await cloud.check(device.assets, client: client) }
           positionInitiallyIfReady(proxy: proxy)
+          if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: excludedLocalAlbumIDsRaw) { _ in
           rebuildDayGroups()
@@ -1407,6 +1426,7 @@ struct NativePhotosView: View {
           guard !loading else { return }
           rebuildDayGroups()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
+          if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onAppear {
           rebuildDayGroups()
@@ -1435,8 +1455,12 @@ struct NativePhotosView: View {
           updateSelectionAfterTimelineChange()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
           else if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+          if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
-        .onChange(of: model.isLoading) { _ in positionInitiallyIfReady(proxy: proxy) }
+        .onChange(of: model.isLoading) { loading in
+          if !loading { positionInitiallyIfReady(proxy: proxy) }
+          if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .immichScrollPhotosToBottom)) { _ in
           let now = Date()
           guard now.timeIntervalSince(lastScrollToBottomTime) > 0.25 else { return }
@@ -1882,6 +1906,36 @@ struct NativePhotosView: View {
     }
   }
 
+  private func positionAtLatestAfterSourceChange(proxy: ScrollViewProxy) {
+    pendingSourceChangeScroll = true
+    guard hasInitialScrolled else {
+      positionInitiallyIfReady(proxy: proxy)
+      if hasInitialScrolled { pendingSourceChangeScroll = false }
+      return
+    }
+    let sourceIsLoading: Bool
+    switch sourceFilter {
+    case .device: sourceIsLoading = device.isLoading
+    case .server: sourceIsLoading = model.isLoading
+    case .all: sourceIsLoading = model.isLoading || device.isLoading
+    }
+    guard !sourceIsLoading else { return }
+    guard didInitialPosition else {
+      let expectedSource = sourceFilter
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+        guard pendingSourceChangeScroll, sourceFilter == expectedSource else { return }
+        positionAtLatestAfterSourceChange(proxy: proxy)
+      }
+      return
+    }
+    let expectedSource = sourceFilter
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) {
+      guard pendingSourceChangeScroll, sourceFilter == expectedSource else { return }
+      withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+      pendingSourceChangeScroll = false
+    }
+  }
+
   private func positionInitiallyIfReady(proxy: ScrollViewProxy) {
     guard !hasInitialScrolled, initialRemoteLoaded, !model.isLoading, !device.isLoading else { return }
     // Do not commit the initial position while the remote/local timelines are
@@ -1900,6 +1954,7 @@ struct NativePhotosView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
           withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
           initialScrollVisible = true
+          pendingSourceChangeScroll = false
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
             didInitialPosition = true
           }

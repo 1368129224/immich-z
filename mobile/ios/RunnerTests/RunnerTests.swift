@@ -78,6 +78,9 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(nativeRefreshedBucketBoundary(old: old, next: 25, refreshed: refreshed), 26)
     XCTAssertEqual(nativeRefreshedBucketBoundary(old: old, next: 40, refreshed: refreshed), 41)
     XCTAssertEqual(nativeRefreshedBucketBoundary(old: old, next: 0, refreshed: refreshed), 0)
+    XCTAssertEqual(nativeBoundaryAfterFetchingHead(old: old, next: 3, refreshed: refreshed, headSize: 20), 20)
+    XCTAssertEqual(nativeBoundaryAfterFetchingHead(old: old, next: 25, refreshed: refreshed, headSize: 20), 26)
+    XCTAssertEqual(nativeBoundaryAfterFetchingHead(old: [], next: 0, refreshed: refreshed, headSize: 20), 20)
   }
 
   func testPartialDeleteTracksOnlyConfirmedServerDeletions() {

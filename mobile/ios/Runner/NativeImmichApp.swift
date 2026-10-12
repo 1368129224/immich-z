@@ -668,6 +668,10 @@ func nativeRefreshedBucketBoundary(old: [NativeBucket], next: Int, refreshed: [N
   return min(next, refreshed.count)
 }
 
+func nativeBoundaryAfterFetchingHead(old: [NativeBucket], next: Int, refreshed: [NativeBucket], headSize: Int) -> Int {
+  max(min(headSize, refreshed.count), nativeRefreshedBucketBoundary(old: old, next: next, refreshed: refreshed))
+}
+
 struct NativeAsset: Identifiable {
   let id: String
   let date: Date
@@ -881,18 +885,18 @@ private final class NativeTimelineModel: ObservableObject {
       searchFallbackEnabled = false
       searchCursor = nil
       buckets = refreshedBuckets
-      nextBucket = existingSearchFallback || existingBuckets.isEmpty ? 0 :
-        nativeRefreshedBucketBoundary(old: existingBuckets, next: existingNextBucket, refreshed: buckets)
-      hasOlder = nextBucket < buckets.count
       // Fetch the newest page while preserving the older pagination boundary.
       for bucket in buckets.prefix(pageSize) {
         let incoming = try await client.assets(in: bucket)
         assets = (assets + incoming).reduce(into: [String: NativeAsset]()) { $0[$1.id] = $1 }.values.sorted { $0.date < $1.date }
       }
       newlyAddedCount = assets.filter { !existingIDs.contains($0.id) }.count
+      nextBucket = nativeBoundaryAfterFetchingHead(
+        old: existingBuckets, next: existingSearchFallback ? 0 : existingNextBucket,
+        refreshed: buckets, headSize: pageSize
+      )
+      hasOlder = nextBucket < buckets.count
       if existingBuckets.isEmpty {
-        nextBucket = min(pageSize, buckets.count)
-        hasOlder = nextBucket < buckets.count
         while assets.count < 100 && hasOlder { try await loadNextPage() }
       }
     } catch {
@@ -943,9 +947,9 @@ private final class NativeTimelineModel: ObservableObject {
         let oldBuckets = buckets
         let oldNextBucket = nextBucket
         buckets = refreshedBuckets
-        nextBucket = oldBuckets.isEmpty
-          ? min(pageSize, buckets.count)
-          : nativeRefreshedBucketBoundary(old: oldBuckets, next: oldNextBucket, refreshed: buckets)
+        nextBucket = nativeBoundaryAfterFetchingHead(
+          old: oldBuckets, next: oldNextBucket, refreshed: buckets, headSize: pageSize
+        )
         hasOlder = nextBucket < buckets.count
       }
       error = nil
@@ -2602,6 +2606,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var showMoreActions = false
   @State private var isPreparingShare = false
   @State private var shareTask: Task<Void, Never>?
+  @State private var sharePreparationID: UUID?
   @State private var viewerMessage: String?
   @State private var dragOffset: CGSize = .zero
   @State private var shareItem: Any? = nil
@@ -2759,6 +2764,7 @@ struct NativeUnifiedGalleryViewer: View {
             .disabled(isPreparingShare)
             if isPreparingShare {
               Button("取消准备") {
+                sharePreparationID = nil
                 shareTask?.cancel()
                 shareTask = nil
                 isPreparingShare = false
@@ -2844,6 +2850,7 @@ struct NativeUnifiedGalleryViewer: View {
       if items.indices.contains(newIdx) { isFavorite = items[newIdx].isFavorite }
     }
     .onDisappear {
+      sharePreparationID = nil
       shareTask?.cancel()
       shareTask = nil
       if let url = shareItem as? URL { try? FileManager.default.removeItem(at: url) }
@@ -3004,13 +3011,22 @@ struct NativeUnifiedGalleryViewer: View {
   private func triggerShare() {
     guard let item = currentItem, !isPreparingShare else { return }
     isPreparingShare = true
+    let preparationID = UUID()
+    sharePreparationID = preparationID
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
     shareTask = Task {
       var preparedURL: URL?
       defer {
-        if Task.isCancelled, let preparedURL { try? FileManager.default.removeItem(at: preparedURL) }
-        isPreparingShare = false
-        shareTask = nil
+        if Task.isCancelled || sharePreparationID != preparationID {
+          if let preparedURL { try? FileManager.default.removeItem(at: preparedURL) }
+        }
+        // A cancelled preparation may finish after the user starts another.
+        // Only the currently active task may reset the spinner or task handle.
+        if sharePreparationID == preparationID {
+          sharePreparationID = nil
+          isPreparingShare = false
+          shareTask = nil
+        }
       }
       do {
         let shared: Any
@@ -3028,10 +3044,10 @@ struct NativeUnifiedGalleryViewer: View {
         } else {
           throw NativeShareError.originalUnavailable
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, sharePreparationID == preparationID else { return }
         shareItem = shared
       } catch {
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, sharePreparationID == preparationID else { return }
         viewerMessage = "原件暂不可分享。请检查网络、照片权限或 iCloud 原件状态后重试。\n\(error.localizedDescription)"
       }
     }

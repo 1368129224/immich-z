@@ -2314,6 +2314,7 @@ private struct NativePhotosPageSettingsView: View {
 private struct NativeLibraryView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
+  @ObservedObject var matchedAssetDiagnostics: NativeMatchedAssetDiagnostics
   @AppStorage("immichz_merge_albums") private var mergeAlbums = true
   @State private var features: [String: Any] = [:]
   @State private var showDebugSheet = false
@@ -2420,7 +2421,7 @@ private struct NativeLibraryView: View {
       }
       .navigationTitle("设置")
       .sheet(isPresented: $showDebugSheet) {
-        NativePerformanceDebugView(client: client, device: device)
+        NativePerformanceDebugView(client: client, device: device, matchedAssetDiagnostics: matchedAssetDiagnostics)
       }
       .task {
         do { features = try await client.send(path: "server/features") }
@@ -2435,6 +2436,7 @@ private struct NativeLibraryView: View {
 struct NativePerformanceDebugView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
+  @ObservedObject var matchedAssetDiagnostics: NativeMatchedAssetDiagnostics
   @Environment(\.dismiss) private var dismiss
 
   @State private var isRunningBenchmarks = false
@@ -2537,6 +2539,37 @@ struct NativePerformanceDebugView: View {
             Spacer()
             Text("\(matchedCount) 项").foregroundColor(.secondary)
           }
+        }
+
+        Section {
+          HStack { Text("尝试请求"); Spacer(); Text("\(matchedAssetDiagnostics.attempted) 次") }
+          HStack { Text("成功加载"); Spacer(); Text("\(matchedAssetDiagnostics.loaded) 项") }
+          HStack { Text("正在请求"); Spacer(); Text("\(matchedAssetDiagnostics.pending) 项") }
+          HStack { Text("仍未加载"); Spacer(); Text("\(matchedAssetDiagnostics.unresolvedCount) 项") }
+          if let lastAttempt = matchedAssetDiagnostics.lastAttempt {
+            HStack { Text("最近尝试"); Spacer(); Text(lastAttempt, style: .date); Text(lastAttempt, style: .time) }
+              .font(.caption)
+          }
+          if let lastFailure = matchedAssetDiagnostics.lastFailure {
+            HStack { Text("最近失败"); Spacer(); Text(lastFailure, style: .date); Text(lastFailure, style: .time) }
+              .font(.caption)
+          }
+          if let category = matchedAssetDiagnostics.lastFailureCategory {
+            HStack { Text("最近失败原因"); Spacer(); Text(category).foregroundColor(.secondary) }
+          }
+          ForEach(matchedAssetDiagnostics.failureCounts.keys.sorted(), id: \.self) { category in
+            HStack {
+              Text(category)
+              Spacer()
+              Text("\(matchedAssetDiagnostics.failureCounts[category, default: 0]) 项").foregroundColor(.secondary)
+            }
+          }
+          Text("此处统计的是已核验匹配后，获取云端资产详情的结果；与原件指纹核验失败不同。401/403 请检查登录状态；404 请检查云端资产是否仍存在；网络或超时请检查连接并刷新照片页。不会展示照片 ID 或凭据。")
+            .font(.caption).foregroundColor(.secondary)
+        } header: {
+          Text("已匹配云端资产详情")
+        } footer: {
+          Text("仅记录当前登录会话内的请求；切换账号后重置。")
         }
 
         Section(header: Text("缓存与内存")) {
@@ -2841,6 +2874,7 @@ struct NativeTabShell: View {
   let onUseFlutter: () -> Void
   let onLogout: () -> Void
   @StateObject private var device = NativeDeviceLibrary()
+  @StateObject private var matchedAssetDiagnostics = NativeMatchedAssetDiagnostics()
   @State private var selectedTab = 0
   @State private var lastTab0Tap: Date = .distantPast
 
@@ -2860,7 +2894,7 @@ struct NativeTabShell: View {
     )
 
     TabView(selection: tabBinding) {
-      NativePhotosView(client: client, device: device, onUseFlutter: onUseFlutter, onLogout: onLogout)
+      NativePhotosView(client: client, device: device, onUseFlutter: onUseFlutter, onLogout: onLogout, matchedAssetDiagnostics: matchedAssetDiagnostics)
         .tabItem { Label("照片", systemImage: "photo.on.rectangle") }
         .tag(0)
       NativeSearchView(client: client)
@@ -2869,7 +2903,7 @@ struct NativeTabShell: View {
       NativeAlbumsView(client: client, device: device)
         .tabItem { Label("相册", systemImage: "rectangle.stack") }
         .tag(2)
-      NativeLibraryView(client: client, device: device)
+      NativeLibraryView(client: client, device: device, matchedAssetDiagnostics: matchedAssetDiagnostics)
         .tabItem { Label("设置", systemImage: "gearshape") }
         .tag(3)
     }

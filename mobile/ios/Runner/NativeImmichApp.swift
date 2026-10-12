@@ -212,6 +212,66 @@ private enum NativeAPIError: LocalizedError {
   }
 }
 
+// Session-scoped diagnostics for verified matches whose server DTO is not yet
+// available in the timeline. Never expose asset IDs or raw server responses.
+@MainActor
+final class NativeMatchedAssetDiagnostics: ObservableObject {
+  @Published private(set) var attempted = 0
+  @Published private(set) var loaded = 0
+  @Published private(set) var pending = 0
+  @Published private(set) var lastAttempt: Date?
+  @Published private(set) var lastFailure: Date?
+  @Published private(set) var lastFailureCategory: String?
+  @Published private(set) var failureCounts: [String: Int] = [:]
+  private var failedAssets: [String: String] = [:]
+
+  var unresolvedCount: Int { failedAssets.count }
+
+  func started() {
+    attempted += 1
+    pending += 1
+    lastAttempt = Date()
+  }
+
+  func succeeded(id: String) {
+    pending = max(0, pending - 1)
+    loaded += 1
+    failedAssets.removeValue(forKey: id)
+    refreshCounts()
+  }
+
+  func failed(id: String, error: Error?) {
+    pending = max(0, pending - 1)
+    let category: String
+    if let error = error as? NativeAPIError {
+      switch error {
+      case .unauthorized: category = "认证失败 (401/403)"
+      case let .http(code, _): category = "HTTP \(code)"
+      case .invalidJSON: category = "响应 JSON 无效"
+      case .invalidResponse: category = "响应格式异常"
+      case .invalidServer: category = "服务器地址无效"
+      }
+    } else if let error = error as? URLError {
+      switch error.code {
+      case .timedOut: category = "请求超时"
+      case .notConnectedToInternet, .networkConnectionLost, .cannotConnectToHost,
+           .cannotFindHost, .dnsLookupFailed: category = "网络连接失败"
+      default: category = "网络错误 (\(error.code.rawValue))"
+      }
+    } else {
+      category = error == nil ? "响应缺少有效资产信息" : "其他请求错误"
+    }
+    failedAssets[id] = category
+    lastFailure = Date()
+    lastFailureCategory = category
+    refreshCounts()
+  }
+
+  private func refreshCounts() {
+    failureCounts = Dictionary(grouping: failedAssets.values, by: { $0 }).mapValues(\.count)
+  }
+}
+
 @MainActor
 final class NativeImmichClient {
   let config: NativeServerConfig
@@ -907,11 +967,11 @@ struct NativePhotosView: View {
   @ObservedObject var device: NativeDeviceLibrary
   let onUseFlutter: () -> Void
   let onLogout: () -> Void
+  let matchedAssetDiagnostics: NativeMatchedAssetDiagnostics
   @StateObject private var model: NativeTimelineModel
   @StateObject private var cloud = NativeCloudStatus()
   @State private var columns: Int = 4
-  @State private var cellSize: CGFloat = 94
-  @State private var gestureBaseCellSize: CGFloat? = nil
+  @State private var gestureBaseColumns: Int? = nil
   @State private var gestureAnchorID: String?
   @State private var loadingMatchedServerIDs = Set<String>()
   @State private var sourceFilter: NativePhotosSource = .all
@@ -961,11 +1021,12 @@ struct NativePhotosView: View {
   @State private var lastScrollToBottomTime: Date = .distantPast
   private let bottomAnchor = "timeline-bottom-anchor"
 
-  init(client: NativeImmichClient, device: NativeDeviceLibrary, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void) {
+  init(client: NativeImmichClient, device: NativeDeviceLibrary, onUseFlutter: @escaping () -> Void, onLogout: @escaping () -> Void, matchedAssetDiagnostics: NativeMatchedAssetDiagnostics) {
     self.client = client
     self.device = device
     self.onUseFlutter = onUseFlutter
     self.onLogout = onLogout
+    self.matchedAssetDiagnostics = matchedAssetDiagnostics
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
   }
 
@@ -1217,7 +1278,7 @@ struct NativePhotosView: View {
                     .padding(.top, 4)
                 }
                 let gridSpacing: CGFloat = columns > 7 ? 1 : 2
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: cellSize, maximum: cellSize), spacing: gridSpacing)], spacing: gridSpacing) {
+                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
                   ForEach(group.assets) { entry in
                     Color.clear
                       .aspectRatio(1, contentMode: .fit)
@@ -1354,19 +1415,31 @@ struct NativePhotosView: View {
             .onChanged { value in
               guard !isSelecting else { return }
               isMagnifying = true
-              let base = gestureBaseCellSize ?? cellSize
-              if gestureBaseCellSize == nil {
-                gestureBaseCellSize = base
+              let base = gestureBaseColumns ?? columns
+              if gestureBaseColumns == nil {
+                gestureBaseColumns = base
                 gestureAnchorID = centerVisibleAssetID
               }
-              let nextSize = nativeClampedPhotosCellSize(base, magnification: value)
-              cellSize = nextSize
-              let newColumns = max(1, Int((UIScreen.main.bounds.width / nextSize).rounded()))
-              if newColumns != columns { columns = newColumns }
+              let deadzone = 0.12
+              let effectiveValue: CGFloat
+              if value > 1 {
+                guard value >= 1 + deadzone else { return }
+                effectiveValue = value - deadzone
+              } else {
+                guard value <= 1 - deadzone else { return }
+                effectiveValue = value + deadzone
+              }
+              let delta = effectiveValue >= 1
+                ? -(effectiveValue - 1) * 4
+                : (1 / max(0.08, effectiveValue) - 1) * 4
+              let target = min(15, max(2, Int((CGFloat(base) + delta).rounded())))
+              guard target != columns else { return }
+              UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+              columns = target
               if let anchor = gestureAnchorID { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .center) } }
             }
             .onEnded { _ in
-              gestureBaseCellSize = nil
+              gestureBaseColumns = nil
               gestureAnchorID = nil
               DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { isMagnifying = false }
             }
@@ -1691,16 +1764,27 @@ struct NativePhotosView: View {
 
   @MainActor private func loadKnownMatchedServerAssets() async {
     let loaded = Set(model.assets.map(\.id))
-    let missing = cloud.matchedServerIDs.values.filter { !loaded.contains($0) && !loadingMatchedServerIDs.contains($0) }
+    let missing = Set(cloud.matchedServerIDs.values).filter { !loaded.contains($0) && !loadingMatchedServerIDs.contains($0) }
     guard !missing.isEmpty else { return }
     loadingMatchedServerIDs.formUnion(missing)
     for id in missing {
+      matchedAssetDiagnostics.started()
       do {
-        if let asset = try await client.serverAsset(id: id) { model.upsert(asset) }
+        if let asset = try await client.serverAsset(id: id) {
+          model.upsert(asset)
+          matchedAssetDiagnostics.succeeded(id: id)
+        } else {
+          matchedAssetDiagnostics.failed(id: id, error: nil)
+        }
       } catch {
-        actionMessage = "已知匹配的云端资产信息暂时无法载入，状态保持未知；重试或刷新后可再次加载。"
+        matchedAssetDiagnostics.failed(id: id, error: error)
       }
       loadingMatchedServerIDs.remove(id)
+    }
+    if matchedAssetDiagnostics.unresolvedCount > 0 {
+      actionMessage = "有 \(matchedAssetDiagnostics.unresolvedCount) 项已匹配的云端资产详情暂时无法载入；可在设置的 Debug 页面查看原因，刷新后重试。"
+    } else if actionMessage?.contains("已匹配的云端资产详情暂时无法载入") == true {
+      actionMessage = nil
     }
   }
 

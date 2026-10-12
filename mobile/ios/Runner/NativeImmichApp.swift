@@ -1451,7 +1451,9 @@ struct NativePhotosView: View {
         .onChange(of: cloud.matchedServerIDs) { _ in
           let anchor = visibleAnchorID
           rebuildDayGroups()
-          if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+          // Don't let background match hydration override the in-flight initial
+          // scroll-to-latest sequence.
+          if didInitialPosition, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
           Task { await loadKnownMatchedServerAssets() }
         }
         .onChange(of: sourceFilter) { _ in
@@ -1515,7 +1517,7 @@ struct NativePhotosView: View {
           rebuildDayGroups()
           updateSelectionAfterTimelineChange()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
-          else if let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+          else if didInitialPosition, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: model.isLoading) { loading in
@@ -2043,6 +2045,9 @@ struct NativePhotosView: View {
           initialScrollVisible = true
           pendingSourceChangeScroll = false
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            // A final pass catches layout changes caused by revealing the lazy
+            // grid after the first two anchor attempts.
+            withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
             didInitialPosition = true
           }
         }

@@ -41,6 +41,21 @@ func nativeShouldKeepTimelineAtBottom(
   isBootstrapping && !userMovedTimeline && !pendingSourceChange && hasAssets
 }
 
+func nativeFormattedAppVersion(
+  shortVersion: String,
+  buildNumber: String,
+  commit: String
+) -> String {
+  if !commit.isEmpty && commit != "unknown" && shortVersion.contains(commit) {
+    return shortVersion
+  }
+  let base = buildNumber.isEmpty ? shortVersion : "\(shortVersion)+\(buildNumber)"
+  if !commit.isEmpty && commit != "unknown" && !base.contains(commit) {
+    return "\(base) (\(commit))"
+  }
+  return base
+}
+
 func nativePhotosSourceIncludes(_ source: NativePhotosSource, hasLocal: Bool, hasServer: Bool, hasVerifiedMatch: Bool) -> Bool {
   switch source {
   case .all: return hasLocal || hasServer
@@ -2421,9 +2436,13 @@ private struct NativeLibraryView: View {
   }
 
   private var appVersion: String {
-    let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.1"
+    let shortVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.2"
     let buildNumber = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
-    return buildNumber.isEmpty ? shortVersion : "\(shortVersion)+\(buildNumber)"
+    return nativeFormattedAppVersion(
+      shortVersion: shortVersion,
+      buildNumber: buildNumber,
+      commit: buildCommit
+    )
   }
 
   private func handleVersionTap() {
@@ -2506,7 +2525,7 @@ private struct NativeLibraryView: View {
         Section {
           HStack {
             Spacer()
-            Text("build \(buildCommit)  \(appVersion)")
+            Text("版本 \(appVersion)")
               .font(.footnote.monospaced())
               .foregroundColor(.secondary)
               .contentShape(Rectangle())

@@ -28,6 +28,13 @@ final class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: false))
   }
 
+  func testAppVersionIncludesCommitHash() {
+    XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2", buildNumber: "82", commit: "bc5cb40"), "0.0.2+82 (bc5cb40)")
+    XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2+bc5cb40", buildNumber: "bc5cb40", commit: "bc5cb40"), "0.0.2+bc5cb40")
+    XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2", buildNumber: "", commit: "bc5cb40"), "0.0.2 (bc5cb40)")
+    XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2", buildNumber: "82", commit: "unknown"), "0.0.2+82")
+  }
+
   func testViewerImageFitsViewportWithoutCropping() {
     let viewport = CGSize(width: 390, height: 844)
     XCTAssertEqual(nativeAspectFitImageSize(imageSize: CGSize(width: 4000, height: 3000), viewportSize: viewport), CGSize(width: 390, height: 292.5))

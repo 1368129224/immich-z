@@ -19,6 +19,20 @@ enum NativePhotosSource: String, CaseIterable, Identifiable {
   var id: String { rawValue }
 }
 
+func nativeInitialTimelineReady(
+  source: NativePhotosSource,
+  remoteLoaded: Bool,
+  remoteLoading: Bool,
+  localSnapshotLoaded: Bool,
+  localLoading: Bool
+) -> Bool {
+  switch source {
+  case .device: return localSnapshotLoaded && !localLoading
+  case .server: return remoteLoaded && !remoteLoading
+  case .all: return remoteLoaded && !remoteLoading && localSnapshotLoaded && !localLoading
+  }
+}
+
 func nativePhotosSourceIncludes(_ source: NativePhotosSource, hasLocal: Bool, hasServer: Bool, hasVerifiedMatch: Bool) -> Bool {
   switch source {
   case .all: return hasLocal || hasServer
@@ -107,6 +121,7 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
   @Published private(set) var assets: [NativeDeviceAsset] = []
   @Published private(set) var albums: [NativeDeviceAlbum] = []
   @Published private(set) var isLoading = false
+  @Published private(set) var hasLoadedInitialSnapshot = false
   private var refreshGeneration = 0
   private var isObserving = false
 
@@ -143,6 +158,7 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
       assets = []
       albums = []
       isLoading = false
+      hasLoadedInitialSnapshot = true
       return
     }
     refreshGeneration += 1
@@ -178,6 +194,7 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
       self.assets = library.0
       self.albums = library.1
       self.isLoading = false
+      self.hasLoadedInitialSnapshot = true
     }
   }
 
@@ -2003,7 +2020,10 @@ private struct NativeAlbumDetail: View {
 
   @State private var isSelecting = false
   @State private var selectedIDs: Set<String> = []
+  @AppStorage("immichz_confirm_remote_only_deletion") private var confirmRemoteOnlyDeletion = true
   @State private var showDeleteConfirmation = false
+  @State private var showRemoteOnlyDeleteConfirmation = false
+  @State private var pendingRemoteOnlyDeleteTargets: [NativeGridItem] = []
   @State private var showLocalDeleteWarning = false
   @State private var pendingDeleteScope: NativeDeleteTargetScope = .all
   @State private var deletionError: String?
@@ -2122,7 +2142,11 @@ private struct NativeAlbumDetail: View {
           Spacer()
 
           Button(role: .destructive) {
-            showDeleteConfirmation = true
+            if selectedTargets.allSatisfy({ $0.server != nil && $0.local == nil }) {
+              requestRemoteOnlyDeletion()
+            } else {
+              showDeleteConfirmation = true
+            }
           } label: {
             Image(systemName: "trash")
               .font(.system(size: 21, weight: .regular))
@@ -2149,12 +2173,20 @@ private struct NativeAlbumDetail: View {
         Button("仅删除本地照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
       }
       if selectedTargets.contains(where: { $0.server != nil }) {
-        Button("仅删除云端照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
+        Button("仅删除云端照片", role: .destructive) { requestRemoteOnlyDeletion() }
       }
       Button("取消", role: .cancel) {}
     } message: {
       Text("所选内容中本机 \(nativePhotosSelectionActionAvailability(selectedTargets).local) 项、云端 \(nativePhotosSelectionActionAvailability(selectedTargets).server) 项；不在指定来源的项目将跳过。仅删除云端而保留本机时，若自动备份开启，照片可能再次上传。请确认删除范围。")
     }
+    .alert("确认仅删除云端照片或视频", isPresented: $showRemoteOnlyDeleteConfirmation) {
+      Button("取消", role: .cancel) { pendingRemoteOnlyDeleteTargets = [] }
+      Button("仅删除云端", role: .destructive) {
+        let targets = pendingRemoteOnlyDeleteTargets
+        pendingRemoteOnlyDeleteTargets = []
+        Task { await performSelectedDeletion(targets: targets, scope: .remoteOnly) }
+      }
+    } message: { Text("将删除所选的 \(pendingRemoteOnlyDeleteTargets.count) 项云端副本；本机副本会保留。若开启自动备份，照片可能再次上传。") }
     .alert("本机删除确认", isPresented: $showLocalDeleteWarning) {
       Button("取消", role: .cancel) {}
       Button("继续删除", role: .destructive) {
@@ -2182,6 +2214,18 @@ private struct NativeAlbumDetail: View {
       !localAssetsToDisplay.contains { matched[$0.id] == server.id }
     }.map { NativeGridItem(server: $0, local: nil) }
     return items.filter { selectedIDs.contains($0.id) }
+  }
+
+  private func requestRemoteOnlyDeletion() {
+    guard !isDeleting else { return }
+    let targets = selectedTargets.filter { $0.server != nil }
+    guard !targets.isEmpty else { return }
+    if confirmRemoteOnlyDeletion {
+      pendingRemoteOnlyDeleteTargets = targets
+      showRemoteOnlyDeleteConfirmation = true
+    } else {
+      Task { await performSelectedDeletion(targets: targets, scope: .remoteOnly) }
+    }
   }
 
   private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
@@ -2353,6 +2397,7 @@ private struct NativeLibraryView: View {
   @ObservedObject var device: NativeDeviceLibrary
   @ObservedObject var matchedAssetDiagnostics: NativeMatchedAssetDiagnostics
   @AppStorage("immichz_merge_albums") private var mergeAlbums = true
+  @AppStorage("immichz_confirm_remote_only_deletion") private var confirmRemoteOnlyDeletion = true
   @State private var features: [String: Any] = [:]
   @State private var showDebugSheet = false
   @State private var versionTapCount = 0
@@ -2397,6 +2442,13 @@ private struct NativeLibraryView: View {
           NavigationLink("照片页") {
             NativePhotosPageSettingsView(client: client, device: device)
           }
+        }
+        Section {
+          Toggle("仅删除云端照片或视频时确认", isOn: $confirmRemoteOnlyDeletion)
+        } header: {
+          Text("删除设置")
+        } footer: {
+          Text("关闭后，仅删除云端副本会直接执行；删除本机照片仍需确认。双端照片仍须先选择删除范围。")
         }
         Section("快捷入口") {
           NavigationLink("收藏") { NativeFilteredView(client: client, title: "收藏", filter: ["isFavorite": ["eq": true]]) }

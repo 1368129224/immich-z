@@ -1,6 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
-
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:workmanager/workmanager.dart';
@@ -133,8 +131,7 @@ class BackgroundService {
 
   /// Registers the periodic backup task.
   ///
-  /// iOS only supports the "background fetch" frequency here, so the platform
-  /// decides when to actually run it; Android honours the 15-minute period.
+  /// iOS background fetch is opportunistic; the system decides when it runs.
   static Future<void> enable() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_kEnabled, true);
@@ -168,14 +165,6 @@ class BackgroundService {
   /// Starts a one-shot backup immediately, used by the manual "Backup now"
   /// action and by the share-intent receiver.
   static Future<void> runOnce() async {
-    if (Platform.isAndroid) {
-      await Workmanager().registerOneOffTask(
-        'immich-z-backup-once',
-        kBackupTaskName,
-        constraints: Constraints(networkType: NetworkType.connected),
-      );
-    } else {
-      await _runBackup();
-    }
+    await _runBackup();
   }
 }

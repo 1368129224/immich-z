@@ -9,7 +9,6 @@ import 'package:photo_manager/photo_manager.dart';
 class DeviceMediaService {
   /// Requests the platform permission needed to enumerate the gallery.
   ///
-  /// Android 13+ needs granular media permissions; older versions need storage.
   Future<bool> requestPermission() async {
     final result = await PhotoManager.requestPermissionExtend();
     return result.isAuth || result.hasAccess;
@@ -71,8 +70,7 @@ class DeviceMediaService {
       );
 
   /// A checksum-stable fingerprint used for server-side duplicate detection.
-  /// Prefers a content hash when the platform exposes one (Android MediaStore
-  /// `dateModified` + size + name is used as a cheaper fallback).
+  /// Returns a file identity fallback when no content hash is available.
   Future<String> checksumFor(AssetEntity asset) async {
     final file = await asset.file;
     if (file == null) return asset.id;

@@ -1,9 +1,9 @@
 name: immich_z
 description: >-
-  A feature-complete Immich client for iOS and Android, built from the public
+  An Immich client focused on native iOS, built from the public
   Immich REST API.
 publish_to: "none"
-version: 0.0.2+80
+version: 0.0.2+81
 
 environment:
   sdk: ">=3.5.0 <4.0.0"
@@ -53,11 +53,7 @@ dependencies:
 
   # ---- background work --------------------------------------------------
   workmanager: 0.9.1
-  workmanager_android: 0.9.1+1
-  workmanager_apple: 0.9.3+2
-  workmanager_platform_interface: 0.9.3
   flutter_local_notifications: ^18.0.1
-  flutter_background_service: ^5.0.5
 
   # ---- logging ----------------------------------------------------------
   logging: ^1.2.0

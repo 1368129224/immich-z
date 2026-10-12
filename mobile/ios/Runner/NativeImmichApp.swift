@@ -1053,6 +1053,7 @@ struct NativePhotosView: View {
   @State private var lastItemBoundsUpdate: Date = .distantPast
   @State private var pendingSourceChangeScroll = false
   @State private var hasInitialScrolled = false
+  @State private var isBootstrappingTimeline = true
   @State private var initialRemoteLoaded = false
   @State private var lastForegroundRefreshTime: Date = .distantPast
   @State private var needsForegroundRefresh = false
@@ -1062,7 +1063,10 @@ struct NativePhotosView: View {
   @State private var loadingOlderAnchor: String?
   @State private var showServerSettings = false
   @State private var showSyncSettings = false
+  @AppStorage("immichz_confirm_remote_only_deletion") private var confirmRemoteOnlyDeletion = true
   @State private var showDeleteConfirmation = false
+  @State private var showRemoteOnlyDeleteConfirmation = false
+  @State private var pendingRemoteOnlyDeleteItems: [NativeGridItem] = []
   @State private var showLocalDeleteWarning = false
   @State private var pendingDeleteScope: NativeDeleteTargetScope = .all
   @State private var deletionError: String?
@@ -1472,6 +1476,7 @@ struct NativePhotosView: View {
             .onChanged { drag in
               if !isSelecting {
                 if abs(drag.translation.height) > 12 {
+                  isBootstrappingTimeline = false
                   userMovedTimeline = true
                   pendingSourceChangeScroll = false
                   if !didInitialPosition { didInitialPosition = true }
@@ -1538,15 +1543,18 @@ struct NativePhotosView: View {
     content
         .onChange(of: cloud.matchedServerIDs) { _ in
           rebuildDayGroups()
+          keepBottomUntilUserScrolls(proxy: proxy)
           scheduleMatchedHydration()
         }
         .onChange(of: sourceFilter) { _ in
+          isBootstrappingTimeline = false
           actionMessage = nil
           rebuildDayGroups()
           updateSelectionAfterTimelineChange()
           positionAtLatestAfterSourceChange(proxy: proxy)
         }
         .refreshable {
+          isBootstrappingTimeline = false
           device.refresh()
           await model.refreshLatest()
           rebuildDayGroups()
@@ -1555,7 +1563,17 @@ struct NativePhotosView: View {
         .onChange(of: device.assets.count) { _ in
           rebuildDayGroups()
           positionInitiallyIfReady(proxy: proxy)
+          keepBottomUntilUserScrolls(proxy: proxy)
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
+        }
+        .onChange(of: device.hasLoadedInitialSnapshot) { _ in
+          positionInitiallyIfReady(proxy: proxy)
+        }
+        .onChange(of: cachedExcludedLocalIDs) { _ in
+          keepBottomUntilUserScrolls(proxy: proxy)
+        }
+        .onChange(of: excludedServerAssetIDs) { _ in
+          keepBottomUntilUserScrolls(proxy: proxy)
         }
         .onChange(of: excludedLocalAlbumIDsRaw) { _ in
           refreshExcludedLocalAssetIDs()
@@ -1594,6 +1612,7 @@ struct NativePhotosView: View {
           rebuildDayGroups()
           updateSelectionAfterTimelineChange()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
+          keepBottomUntilUserScrolls(proxy: proxy)
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: model.isLoading) { loading in
@@ -1603,6 +1622,7 @@ struct NativePhotosView: View {
         .onReceive(NotificationCenter.default.publisher(for: .immichScrollPhotosToBottom)) { _ in
           let now = Date()
           guard now.timeIntervalSince(lastScrollToBottomTime) > 0.25 else { return }
+          isBootstrappingTimeline = false
           lastScrollToBottomTime = now
           if hasInitialScrolled { scrollToBottom(proxy: proxy, animated: true) }
         }
@@ -1620,6 +1640,7 @@ struct NativePhotosView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
           guard needsForegroundRefresh, !isSelecting else { return }
           needsForegroundRefresh = false
+          isBootstrappingTimeline = false
           let now = Date()
           guard now.timeIntervalSince(lastForegroundRefreshTime) > 2 else { return }
           lastForegroundRefreshTime = now
@@ -1644,7 +1665,13 @@ struct NativePhotosView: View {
               batchActionButton("archivebox", label: "归档", disabled: !selectedItems.contains(where: { $0.server != nil })) { Task { await archiveSelected() } }
               batchActionButton("plus.rectangle.on.folder", label: "加入相册", disabled: !selectedItems.contains(where: { $0.server != nil || $0.local != nil })) { showAlbumTargetDialog = true }
               batchActionButton("square.and.arrow.down", label: "保存", disabled: !selectedItems.contains(where: { $0.server != nil })) { prepareSaveToDevice() }
-              batchActionButton("trash", label: "删除", disabled: selectedIDs.isEmpty || isDeleting, destructive: true) { showDeleteConfirmation = true }
+              batchActionButton("trash", label: "删除", disabled: selectedIDs.isEmpty || isDeleting, destructive: true) {
+                if selectedItems.allSatisfy({ $0.server != nil && $0.local == nil }) {
+                  requestRemoteOnlyDeletion()
+                } else {
+                  showDeleteConfirmation = true
+                }
+              }
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 10)
@@ -1741,12 +1768,20 @@ struct NativePhotosView: View {
             Button("仅删除本机副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
           }
           if selectedItems.contains(where: { $0.server != nil }) {
-            Button("仅删除云端副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
+            Button("仅删除云端副本", role: .destructive) { requestRemoteOnlyDeletion() }
           }
           Button("取消", role: .cancel) {}
         } message: {
           Text("所选内容中本机 \(nativePhotosSelectionActionAvailability(selectedItems).local) 项、云端 \(nativePhotosSelectionActionAvailability(selectedItems).server) 项；不在指定来源的项目将跳过。仅删除云端而保留本机时，若自动备份开启，照片可能再次上传。请明确选择删除范围；本机删除也可能同步至 iCloud 设备。")
         }
+        .alert("确认仅删除云端照片或视频", isPresented: $showRemoteOnlyDeleteConfirmation) {
+          Button("取消", role: .cancel) { pendingRemoteOnlyDeleteItems = [] }
+          Button("仅删除云端", role: .destructive) {
+            let items = pendingRemoteOnlyDeleteItems
+            pendingRemoteOnlyDeleteItems = []
+            Task { await performSelectedDeletion(items: items, scope: .remoteOnly) }
+          }
+        } message: { Text("将删除所选的 \(pendingRemoteOnlyDeleteItems.count) 项云端副本；本机副本会保留。若开启自动备份，照片可能再次上传。") }
         .alert("保存到本机照片", isPresented: $showSaveConfirmation) {
           Button("取消", role: .cancel) {}
           Button("继续保存") { Task { await saveSelectedToDevice() } }
@@ -1887,6 +1922,18 @@ struct NativePhotosView: View {
 
   private var selectionSpansBothSources: Bool {
     selectedItems.contains(where: { $0.local != nil }) && selectedItems.contains(where: { $0.server != nil })
+  }
+
+  private func requestRemoteOnlyDeletion() {
+    guard !isDeleting else { return }
+    let items = selectedItems.filter { $0.server != nil }
+    guard !items.isEmpty else { return }
+    if confirmRemoteOnlyDeletion {
+      pendingRemoteOnlyDeleteItems = items
+      showRemoteOnlyDeleteConfirmation = true
+    } else {
+      Task { await performSelectedDeletion(items: items, scope: .remoteOnly) }
+    }
   }
 
   private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
@@ -2057,6 +2104,7 @@ struct NativePhotosView: View {
 
   private func triggerRefresh(proxy _: ScrollViewProxy) {
     guard !isRefreshing else { return }
+    isBootstrappingTimeline = false
     isRefreshing = true
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
     device.refresh()
@@ -2094,15 +2142,24 @@ struct NativePhotosView: View {
 
   private func positionInitiallyIfReady(proxy: ScrollViewProxy) {
     guard !hasInitialScrolled, !userMovedTimeline else { return }
-    let sourceReady: Bool
-    switch sourceFilter {
-    case .device: sourceReady = !device.isLoading && !device.assets.isEmpty
-    case .server: sourceReady = initialRemoteLoaded && !model.isLoading && !model.assets.isEmpty
-    case .all: sourceReady = !model.isLoading && !device.isLoading &&
-      (initialRemoteLoaded || !device.assets.isEmpty)
-    }
-    guard sourceReady else { return }
+    guard nativeInitialTimelineReady(
+      source: sourceFilter,
+      remoteLoaded: initialRemoteLoaded,
+      remoteLoading: model.isLoading,
+      localSnapshotLoaded: device.hasLoadedInitialSnapshot,
+      localLoading: device.isLoading
+    ) else { return }
     scrollToBottom(proxy: proxy, animated: false)
+  }
+
+  private func keepBottomUntilUserScrolls(proxy: ScrollViewProxy) {
+    guard isBootstrappingTimeline, hasInitialScrolled, didInitialPosition, !userMovedTimeline, !pendingSourceChangeScroll else { return }
+    // The first page is followed by PhotoKit and match hydration. Re-anchor
+    // after SwiftUI has laid out each update, but never override a user's drag.
+    DispatchQueue.main.async {
+      guard isBootstrappingTimeline, hasInitialScrolled, didInitialPosition, !userMovedTimeline, !pendingSourceChangeScroll else { return }
+      withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+    }
   }
 
   private func scrollToBottom(proxy: ScrollViewProxy, animated: Bool) {
@@ -2132,6 +2189,7 @@ struct NativePhotosView: View {
 
   private func requestOlder() {
     guard loadingOlderAnchor == nil, model.hasOlder, !model.isLoading else { return }
+    isBootstrappingTimeline = false
     loadingOlderAnchor = "pending"
     Task(priority: .utility) {
       await model.loadOlder()
@@ -2638,7 +2696,10 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var viewerMessage: String?
   @State private var dragOffset: CGSize = .zero
   @State private var shareItem: Any? = nil
+  @AppStorage("immichz_confirm_remote_only_deletion") private var confirmRemoteOnlyDeletion = true
   @State private var showDeleteScopeDialog = false
+  @State private var showViewerRemoteDeleteConfirmation = false
+  @State private var pendingViewerRemoteDeleteItem: NativeGridItem?
   @State private var showViewerLocalDeleteWarning = false
   @State private var pendingViewerDeleteScope: NativeDeleteTargetScope = .all
   @State private var isDeletingItem = false
@@ -2777,7 +2838,7 @@ struct NativeUnifiedGalleryViewer: View {
           Spacer()
 
           // Bottom Bar
-          HStack(spacing: 24) {
+          HStack(spacing: 12) {
             // Share
             Button {
               triggerShare()
@@ -2829,18 +2890,35 @@ struct NativeUnifiedGalleryViewer: View {
             }
 
             Button {
-              showMoreActions = true
+              if currentItem?.server != nil && currentItem?.local == nil {
+                requestRemoteOnlyDeletion()
+              } else {
+                showDeleteScopeDialog = true
+              }
             } label: {
               VStack(spacing: 4) {
-                Image(systemName: "ellipsis.circle").font(.system(size: 19))
-                Text("更多").font(.caption2)
+                Image(systemName: "trash").font(.system(size: 19))
+                Text("删除").font(.caption2)
               }
               .foregroundColor(.white)
             }
             .disabled(isDeletingItem || currentItem == nil)
+
+            if currentItem?.server != nil {
+              Button {
+                showMoreActions = true
+              } label: {
+                VStack(spacing: 4) {
+                  Image(systemName: "ellipsis.circle").font(.system(size: 19))
+                  Text("更多").font(.caption2)
+                }
+                .foregroundColor(.white)
+              }
+              .disabled(isDeletingItem)
+            }
           }
           .padding(.vertical, 10)
-          .padding(.horizontal, 18)
+          .padding(.horizontal, 12)
           .background(Color.black.opacity(0.65))
           .cornerRadius(24)
           .padding(.bottom, 24)
@@ -2856,7 +2934,7 @@ struct NativeUnifiedGalleryViewer: View {
         }
       }
       if currentItem?.server != nil {
-        Button("仅删除云端", role: .destructive) { performDeleteItem(scope: .remoteOnly) }
+        Button("仅删除云端", role: .destructive) { requestRemoteOnlyDeletion() }
       }
       if currentItem?.local != nil && currentItem?.server != nil {
         Button("全部删除", role: .destructive) {
@@ -2868,6 +2946,14 @@ struct NativeUnifiedGalleryViewer: View {
     } message: {
       Text("选择要删除的副本；只删除云端时，若本机仍有原件且开启自动备份，照片可能再次上传。")
     }
+    .alert("确认仅删除云端照片或视频", isPresented: $showViewerRemoteDeleteConfirmation) {
+      Button("取消", role: .cancel) { pendingViewerRemoteDeleteItem = nil }
+      Button("仅删除云端", role: .destructive) {
+        guard let item = pendingViewerRemoteDeleteItem else { return }
+        pendingViewerRemoteDeleteItem = nil
+        performDeleteItem(scope: .remoteOnly, item: item)
+      }
+    } message: { Text("仅删除云端副本，本机副本会保留；若开启自动备份，照片可能再次上传。") }
     .alert("删除失败", isPresented: Binding(get: { deleteErrorMessage != nil }, set: { if !$0 { deleteErrorMessage = nil } })) {
       Button("确定", role: .cancel) { deleteErrorMessage = nil }
     } message: {
@@ -2892,7 +2978,6 @@ struct NativeUnifiedGalleryViewer: View {
       Button("继续删除", role: .destructive) { performDeleteItem(scope: pendingViewerDeleteScope) }
     } message: { Text("此操作会从系统照片中永久删除；若开启 iCloud Photos，删除可能传播至其他设备。") }
     .confirmationDialog("更多操作", isPresented: $showMoreActions, titleVisibility: .visible) {
-      Button("删除…", role: .destructive) { showDeleteScopeDialog = true }
       if currentItem?.server != nil { Button("归档云端副本") { Task { await archiveCurrentServerCopy() } } }
     } message: { Text("操作只影响具有对应副本的来源。") }
     .sheet(isPresented: $showInfoSheet) {
@@ -2909,8 +2994,18 @@ struct NativeUnifiedGalleryViewer: View {
     .statusBarHidden(true)
   }
 
-  private func performDeleteItem(scope: NativeDeleteTargetScope) {
-    guard let item = currentItem, !isDeletingItem else { return }
+  private func requestRemoteOnlyDeletion() {
+    guard let item = currentItem, item.server != nil, !isDeletingItem else { return }
+    if confirmRemoteOnlyDeletion {
+      pendingViewerRemoteDeleteItem = item
+      showViewerRemoteDeleteConfirmation = true
+    } else {
+      performDeleteItem(scope: .remoteOnly, item: item)
+    }
+  }
+
+  private func performDeleteItem(scope: NativeDeleteTargetScope, item requestedItem: NativeGridItem? = nil) {
+    guard let item = requestedItem ?? currentItem, !isDeletingItem else { return }
     isDeletingItem = true
     UIImpactFeedbackGenerator(style: .heavy).impactOccurred()
     Task {
@@ -3410,6 +3505,14 @@ private struct NativeLivePhotoView: UIViewRepresentable {
   }
 }
 
+// Fit the full image inside the viewer; this is the minimum zoom size.
+func nativeAspectFitImageSize(imageSize: CGSize, viewportSize: CGSize) -> CGSize {
+  guard imageSize.width > 0, imageSize.height > 0,
+        viewportSize.width > 0, viewportSize.height > 0 else { return .zero }
+  let scale = min(viewportSize.width / imageSize.width, viewportSize.height / imageSize.height)
+  return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+}
+
 // Pinch to zoom and double tap zoomable container
 private struct NativeZoomableImageView: UIViewRepresentable {
   let image: UIImage
@@ -3422,6 +3525,7 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     scrollView.delegate = context.coordinator
     scrollView.maximumZoomScale = 5.0
     scrollView.minimumZoomScale = 1.0
+    scrollView.bouncesZoom = false
     scrollView.showsVerticalScrollIndicator = false
     scrollView.showsHorizontalScrollIndicator = false
     scrollView.backgroundColor = .clear
@@ -3446,11 +3550,19 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   func updateUIView(_ uiView: UIScrollView, context: Context) {
     context.coordinator.onTap = onTap
     context.coordinator.onZoomChanged = onZoomChanged
-    if let imageView = uiView.viewWithTag(100) as? UIImageView {
+    guard let imageView = uiView.viewWithTag(100) as? UIImageView else { return }
+    let fittedSize = nativeAspectFitImageSize(imageSize: image.size, viewportSize: size)
+    guard fittedSize != .zero else { return }
+    let imageChanged = imageView.image !== image
+    let sizeChanged = imageView.bounds.size != fittedSize
+    if imageChanged || sizeChanged {
+      uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
       imageView.image = image
-      imageView.frame = CGRect(origin: .zero, size: size)
-      uiView.contentSize = size
+      imageView.frame = CGRect(origin: .zero, size: fittedSize)
+      uiView.contentSize = fittedSize
+      onZoomChanged(false)
     }
+    context.coordinator.centerImage(in: uiView)
   }
 
   func makeCoordinator() -> Coordinator {
@@ -3470,11 +3582,26 @@ private struct NativeZoomableImageView: UIViewRepresentable {
       scrollView.viewWithTag(100)
     }
 
+    func centerImage(in scrollView: UIScrollView) {
+      guard let imageView = scrollView.viewWithTag(100) as? UIImageView else { return }
+      let contentWidth = imageView.bounds.width * scrollView.zoomScale
+      let contentHeight = imageView.bounds.height * scrollView.zoomScale
+      let viewport = scrollView.bounds.size
+      scrollView.contentInset = UIEdgeInsets(
+        top: max(0, (viewport.height - contentHeight) / 2),
+        left: max(0, (viewport.width - contentWidth) / 2),
+        bottom: max(0, (viewport.height - contentHeight) / 2),
+        right: max(0, (viewport.width - contentWidth) / 2)
+      )
+    }
+
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
+      centerImage(in: scrollView)
       onZoomChanged(scrollView.zoomScale > scrollView.minimumZoomScale + 0.01)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
+      centerImage(in: scrollView)
       onZoomChanged(scale > scrollView.minimumZoomScale + 0.01)
     }
 
@@ -3484,11 +3611,11 @@ private struct NativeZoomableImageView: UIViewRepresentable {
 
     @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
       guard let scrollView = gesture.view as? UIScrollView else { return }
-      if scrollView.zoomScale > 1.0 {
-        scrollView.setZoomScale(1.0, animated: true)
-      } else {
-        let point = gesture.location(in: scrollView)
-        let side = max(80, min(scrollView.bounds.width, scrollView.bounds.height) / 2)
+      if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
+        scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
+      } else if let imageView = scrollView.viewWithTag(100) as? UIImageView {
+        let point = gesture.location(in: imageView)
+        let side = min(imageView.bounds.width, imageView.bounds.height) / 2
         let rect = CGRect(x: point.x - side / 2, y: point.y - side / 2, width: side, height: side)
         scrollView.zoom(to: rect, animated: true)
       }

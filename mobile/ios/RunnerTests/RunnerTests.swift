@@ -12,6 +12,23 @@ final class RunnerTests: XCTestCase {
     XCTAssertTrue(nativePhotosSourceIncludes(.server, hasLocal: false, hasServer: true, hasVerifiedMatch: false))
   }
 
+  func testInitialTimelineWaitsForBothSourcesBeforePositioningAll() {
+    XCTAssertFalse(nativeInitialTimelineReady(source: .all, remoteLoaded: true, remoteLoading: false, localSnapshotLoaded: false, localLoading: false))
+    XCTAssertFalse(nativeInitialTimelineReady(source: .all, remoteLoaded: false, remoteLoading: false, localSnapshotLoaded: true, localLoading: false))
+    XCTAssertFalse(nativeInitialTimelineReady(source: .all, remoteLoaded: true, remoteLoading: false, localSnapshotLoaded: true, localLoading: true))
+    XCTAssertTrue(nativeInitialTimelineReady(source: .all, remoteLoaded: true, remoteLoading: false, localSnapshotLoaded: true, localLoading: false))
+    XCTAssertTrue(nativeInitialTimelineReady(source: .device, remoteLoaded: false, remoteLoading: true, localSnapshotLoaded: true, localLoading: false))
+    XCTAssertTrue(nativeInitialTimelineReady(source: .server, remoteLoaded: true, remoteLoading: false, localSnapshotLoaded: false, localLoading: true))
+  }
+
+  func testViewerImageFitsViewportWithoutCropping() {
+    let viewport = CGSize(width: 390, height: 844)
+    XCTAssertEqual(nativeAspectFitImageSize(imageSize: CGSize(width: 4000, height: 3000), viewportSize: viewport), CGSize(width: 390, height: 292.5))
+    XCTAssertEqual(nativeAspectFitImageSize(imageSize: CGSize(width: 3000, height: 4000), viewportSize: viewport), CGSize(width: 390, height: 520))
+    XCTAssertEqual(nativeAspectFitImageSize(imageSize: CGSize(width: 1000, height: 4000), viewportSize: viewport), CGSize(width: 211, height: 844))
+    XCTAssertEqual(nativeAspectFitImageSize(imageSize: .zero, viewportSize: viewport), .zero)
+  }
+
   func testPhotosPinchCellSizeIsContinuousAndClamped() {
     XCTAssertEqual(nativeClampedPhotosCellSize(100, magnification: 1), 100, accuracy: 0.001)
     XCTAssertEqual(nativeClampedPhotosCellSize(100, magnification: 1.5), 150, accuracy: 0.001)

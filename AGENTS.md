@@ -2,7 +2,6 @@
 
 > Immich iOS client implemented natively in Swift (SwiftUI) hosted within a Flutter shell,
 > mirroring the official Immich app (`https://github.com/immich-app/immich`) against the public REST API.
-> **Note: Android development is currently suspended; all active development focuses on the native iOS client.**
 
 Remote: `https://github.com/1368129224/immich-z.git`, branch `main`.
 
@@ -15,7 +14,6 @@ Remote: `https://github.com/1368129224/immich-z.git`, branch `main`.
   - `NativeFeatures.swift`: Album list, search grid, full-screen asset viewer (`NativeAssetViewer`), and unified grid items (`NativeGridItem`).
   - `NativeCloudStatus.swift`: Asset hashing, persistent cache store (`NativeSyncCacheStore`), and server verification (`bulk-upload-check`).
   - `AppDelegate.swift`: Flutter engine hosting and native window bootstrapping.
-- **Android Status**: Android development is temporarily suspended. Do not spend effort implementing or troubleshooting Android-specific features unless explicitly requested.
 
 ---
 

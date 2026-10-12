@@ -69,12 +69,8 @@ class SecureStore {
 
   static const _kServerConfig = 'immich.server_config';
 
-  static const AndroidOptions _android = AndroidOptions(
-    encryptedSharedPreferences: true,
-  );
-
   static final provider = Provider<SecureStore>(
-    (ref) => SecureStore(const FlutterSecureStorage(aOptions: _android)),
+    (ref) => SecureStore(const FlutterSecureStorage()),
   );
 
   static const _prefsPrefix = 'secure_fallback.';

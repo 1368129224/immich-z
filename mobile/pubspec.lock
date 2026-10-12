@@ -238,38 +238,6 @@ packages:
     description: flutter
     source: sdk
     version: "0.0.0"
-  flutter_background_service:
-    dependency: "direct main"
-    description:
-      name: flutter_background_service
-      sha256: "70a1c185b1fa1a44f8f14ecd6c86f6e50366e3562f00b2fa5a54df39b3324d3d"
-      url: "https://pub.dev"
-    source: hosted
-    version: "5.1.0"
-  flutter_background_service_android:
-    dependency: transitive
-    description:
-      name: flutter_background_service_android
-      sha256: ca0793d4cd19f1e194a130918401a3d0b1076c81236f7273458ae96987944a87
-      url: "https://pub.dev"
-    source: hosted
-    version: "6.3.1"
-  flutter_background_service_ios:
-    dependency: transitive
-    description:
-      name: flutter_background_service_ios
-      sha256: "6037ffd45c4d019dab0975c7feb1d31012dd697e25edc05505a4a9b0c7dc9fba"
-      url: "https://pub.dev"
-    source: hosted
-    version: "5.0.3"
-  flutter_background_service_platform_interface:
-    dependency: transitive
-    description:
-      name: flutter_background_service_platform_interface
-      sha256: ca74aa95789a8304f4d3f57f07ba404faa86bed6e415f83e8edea6ad8b904a41
-      url: "https://pub.dev"
-    source: hosted
-    version: "5.1.2"
   flutter_cache_manager:
     dependency: transitive
     description:
@@ -1166,7 +1134,7 @@ packages:
     source: hosted
     version: "0.9.1"
   workmanager_android:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: workmanager_android
       sha256: "9d0b475e038a9f5af488f1a2726d4f636a08ecd1d1d1bcae830f1db199ca3af9"
@@ -1174,7 +1142,7 @@ packages:
     source: hosted
     version: "0.9.1+1"
   workmanager_apple:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: workmanager_apple
       sha256: "2b216428847f203443475dc1306013c6d2ee59887edaa9276f212e8f284bec32"
@@ -1182,7 +1150,7 @@ packages:
     source: hosted
     version: "0.9.3+2"
   workmanager_platform_interface:
-    dependency: "direct main"
+    dependency: transitive
     description:
       name: workmanager_platform_interface
       sha256: "5ccae1606b0973111bd9cec94e4092030c39ca4be98054f1da110ae9e9cfe957"

@@ -32,7 +32,6 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath mobile/build/ios/DerivedData \
             "MARKETING_VERSION=0.0.2+$COMMIT_HASH" \
-            "CURRENT_PROJECT_VERSION=$COMMIT_HASH" \
             "IMMICHZ_GIT_COMMIT=$COMMIT_HASH" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
@@ -43,6 +42,15 @@ jobs:
         run: |
           APP="mobile/build/ios/DerivedData/Build/Products/Release-iphoneos/Runner.app"
           test -d "$APP" || { echo "::error::$APP not found"; exit 1; }
+          COMMIT_HASH="$(git rev-parse --short HEAD)"
+          PLIST="$APP/Info.plist"
+          VERSION="0.0.2+$COMMIT_HASH"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $VERSION" \
+            "$PLIST" 2>/dev/null || \
+          /usr/libexec/PlistBuddy \
+            -c "Add :CFBundleShortVersionString string $VERSION" \
+            "$PLIST"
           mkdir -p mobile/build/ios/package/Payload
           cp -R "$APP" mobile/build/ios/package/Payload/
           (cd mobile/build/ios/package && \
@@ -137,7 +145,6 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath mobile/build/ios/SignedDerivedData \
             "MARKETING_VERSION=0.0.2+$COMMIT_HASH" \
-            "CURRENT_PROJECT_VERSION=$COMMIT_HASH" \
             "IMMICHZ_GIT_COMMIT=$COMMIT_HASH" \
             "PROVISIONING_PROFILE_SPECIFIER=$PROVISIONING_PROFILE_UUID" \
             "DEVELOPMENT_TEAM=$APPLE_TEAM_ID" \
@@ -148,6 +155,12 @@ jobs:
         run: |
           APP="mobile/build/ios/SignedDerivedData/Build/Products/Release-iphoneos/Runner.app"
           test -d "$APP"
+          COMMIT_HASH="$(git rev-parse --short HEAD)"
+          PLIST="$APP/Info.plist"
+          VERSION="0.0.2+$COMMIT_HASH"
+          /usr/libexec/PlistBuddy \
+            -c "Set :CFBundleShortVersionString $VERSION" \
+            "$PLIST" 2>/dev/null || true
           mkdir -p mobile/build/ios/signed-package/Payload
           cp -R "$APP" mobile/build/ios/signed-package/Payload/
           (cd mobile/build/ios/signed-package && \

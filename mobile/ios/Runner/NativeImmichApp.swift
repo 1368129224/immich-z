@@ -1832,11 +1832,8 @@ struct NativePhotosView: View {
     guard !ids.isEmpty else { actionMessage = "没有可加入云端相册的资产。"; return }
     do {
       let results = try await client.addAssetsToAlbum(ids: ids, albumID: albumID)
-      let failed = results.filter { ($0["success"] as? Bool) != true }.count
-      let reported = results.count
-      let succeeded = max(0, reported - failed)
-      let unreported = max(0, ids.count - reported)
-      actionMessage = "加入云端相册：成功 \(succeeded) 项，失败 \(failed) 项，未确认 \(unreported) 项。\(skipped > 0 ? "跳过本机独有项 \(skipped) 项。" : "")"
+      let summary = nativeBulkOperationSummary(requestedIDs: ids, responses: results)
+      actionMessage = "加入云端相册：成功 \(summary.succeeded) 项，失败 \(summary.failed) 项，未确认 \(summary.unconfirmed) 项。\(skipped > 0 ? "跳过本机独有项 \(skipped) 项。" : "")"
     } catch { actionMessage = "加入云端相册失败：\(error.localizedDescription)" }
   }
 

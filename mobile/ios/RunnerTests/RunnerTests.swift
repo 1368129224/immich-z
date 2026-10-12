@@ -34,6 +34,30 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(availability.merged, 1)
   }
 
+  func testBulkOperationSummaryReportsSuccessFailureAndUnconfirmedIDs() {
+    let summary = nativeBulkOperationSummary(
+      requestedIDs: ["success", "failure", "missing"],
+      responses: [
+        ["id": "success", "success": true],
+        ["id": "failure", "success": false, "errorMessage": "not in album"],
+        ["id": "unrequested", "success": true]
+      ]
+    )
+    XCTAssertEqual(summary, NativeBulkOperationSummary(succeeded: 1, failed: 1, unconfirmed: 1))
+  }
+
+  func testBulkOperationSummaryTreatsDuplicateOrMalformedResponsesAsUnconfirmed() {
+    let summary = nativeBulkOperationSummary(
+      requestedIDs: ["duplicate", "malformed", "missing"],
+      responses: [
+        ["id": "duplicate", "success": true],
+        ["id": "duplicate", "success": true],
+        ["id": "malformed", "success": "yes"]
+      ]
+    )
+    XCTAssertEqual(summary, NativeBulkOperationSummary(succeeded: 0, failed: 0, unconfirmed: 3))
+  }
+
   func testVideoFileClassificationForSaveToPhotos() {
     XCTAssertTrue(nativeIsVideoFile(URL(fileURLWithPath: "/tmp/movie.MOV")))
     XCTAssertTrue(nativeIsVideoFile(URL(fileURLWithPath: "/tmp/movie.mp4")))

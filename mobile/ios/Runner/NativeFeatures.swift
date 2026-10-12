@@ -34,6 +34,35 @@ func nativePhotosSelectionActionAvailability(_ items: [NativeGridItem]) -> (serv
   return (server, local, merged)
 }
 
+struct NativeBulkOperationSummary: Equatable {
+  let succeeded: Int
+  let failed: Int
+  let unconfirmed: Int
+}
+
+func nativeBulkOperationSummary(requestedIDs: [String], responses: [[String: Any]]) -> NativeBulkOperationSummary {
+  let requested = Set(requestedIDs)
+  var outcomes: [String: [Bool]] = [:]
+
+  for response in responses {
+    guard let id = response["id"] as? String, requested.contains(id),
+          let success = response["success"] as? Bool else { continue }
+    outcomes[id, default: []].append(success)
+  }
+
+  var succeeded = 0
+  var failed = 0
+  for id in requested {
+    guard let results = outcomes[id], results.count == 1, let success = results.first else { continue }
+    if success { succeeded += 1 } else { failed += 1 }
+  }
+  return NativeBulkOperationSummary(
+    succeeded: succeeded,
+    failed: failed,
+    unconfirmed: max(0, requested.count - succeeded - failed)
+  )
+}
+
 func nativeIsVideoFile(_ url: URL) -> Bool {
   ["mov", "mp4", "m4v", "avi", "mkv", "3gp", "webm"].contains(url.pathExtension.lowercased())
 }

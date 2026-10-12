@@ -72,6 +72,44 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(summary, NativeBulkOperationSummary(succeeded: 0, failed: 0, unconfirmed: 3))
   }
 
+  func testRefreshPreservesOldestLoadedBucketBoundary() {
+    let old = (0..<40).map { NativeBucket(id: "bucket\($0)", count: 1) }
+    let refreshed = [NativeBucket(id: "new", count: 1)] + old
+    XCTAssertEqual(nativeRefreshedBucketBoundary(old: old, next: 25, refreshed: refreshed), 26)
+    XCTAssertEqual(nativeRefreshedBucketBoundary(old: old, next: 40, refreshed: refreshed), 41)
+    XCTAssertEqual(nativeRefreshedBucketBoundary(old: old, next: 0, refreshed: refreshed), 0)
+  }
+
+  func testPartialDeleteTracksOnlyConfirmedServerDeletions() {
+    let error = NativeDeleteOperationError.partial(failures: ["本机删除失败"], deletedServerIDs: ["deleted"])
+    XCTAssertEqual(error.deletedServerIDs, ["deleted"])
+    let serverFailure = NativeDeleteOperationError.partial(failures: ["云端删除失败"], deletedServerIDs: [])
+    XCTAssertTrue(serverFailure.deletedServerIDs.isEmpty)
+  }
+
+  func testSyncCacheDoesNotCrossAccountsOrLoadLegacyUnscopedEntries() {
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = NativeSyncCacheStore(directory: directory)
+    store.configure(server: "https://photos.example/", userId: "alice")
+    store.update(matches: ["local": "alice-photo"], checked: ["local"], newChecksums: ["local": String(repeating: "A", count: 27) + "="])
+    store.configure(server: "https://photos.example/", userId: "bob")
+    XCTAssertNil(store.serverID(for: "local"))
+    XCTAssertTrue(store.checkedIDs.isEmpty)
+    store.configure(server: "https://other.example", userId: "alice")
+    XCTAssertNil(store.serverID(for: "local"))
+    store.configure(server: "https://photos.example", userId: "alice")
+    XCTAssertEqual(store.serverID(for: "local"), "alice-photo")
+    store.configure(server: "https://photos.example", userId: nil)
+    XCTAssertNil(store.serverID(for: "local"))
+    store.configure(server: "https://photos.example", userId: "bob")
+    store.update(matches: ["local": "bob-photo"], expectedIdentity: "https://photos.example|alice")
+    XCTAssertNil(store.serverID(for: "local"))
+    store.clear()
+    store.configure(server: "https://photos.example", userId: "bob")
+    XCTAssertNil(store.serverID(for: "local"))
+  }
+
   func testVideoFileClassificationForSaveToPhotos() {
     XCTAssertTrue(nativeIsVideoFile(URL(fileURLWithPath: "/tmp/movie.MOV")))
     XCTAssertTrue(nativeIsVideoFile(URL(fileURLWithPath: "/tmp/movie.mp4")))

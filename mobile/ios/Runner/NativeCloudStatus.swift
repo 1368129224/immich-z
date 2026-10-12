@@ -5,55 +5,57 @@ import Photos
 struct NativeCloudSyncCache: Codable {
   var matchedServerIDs: [String: String] = [:] // localIdentifier -> serverAssetId
   var checkedIDs: [String] = []                // localIdentifiers that were checked
-  var checksums: [String: String] = [:]        // localIdentifier -> SHA1 hex string
+  var checksums: [String: String] = [:]        // localIdentifier -> Base64 SHA-1
 }
 
 final class NativeSyncCacheStore: @unchecked Sendable {
   static let shared = NativeSyncCacheStore()
   private let lock = NSLock()
-  private let fileURL: URL
+  private let folder: URL
+  private var fileURL: URL?
+  private var accountKey: String?
   private(set) var matchedServerIDs: [String: String] = [:] // localId -> serverId
   private(set) var reverseMatches: [String: String] = [:]   // serverId -> localId
   private(set) var checkedIDs: Set<String> = []
   private(set) var checksums: [String: String] = [:]
+  var identity: String? {
+    lock.lock(); defer { lock.unlock() }
+    return accountKey
+  }
   private let saveQueue = DispatchQueue(label: "immich.sync.cache.save", qos: .utility)
 
-  init() {
-    let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-      ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+  init(directory: URL? = nil) {
+    folder = directory ?? (FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+      ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!)
     try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-    fileURL = folder.appendingPathComponent("native_cloud_sync_cache.json")
+    // The old unscoped file and Flutter backup markers cannot be trusted as
+    // account-specific evidence; re-verify originals after upgrading.
+    try? FileManager.default.removeItem(at: folder.appendingPathComponent("native_cloud_sync_cache.json"))
+  }
 
-    var isDirty = false
-    if let data = try? Data(contentsOf: fileURL),
-       let decoded = try? JSONDecoder().decode(NativeCloudSyncCache.self, from: data) {
-      // Purge any legacy bogus entries where localId == serverId
-      matchedServerIDs = decoded.matchedServerIDs.filter { $0.key != $0.value }
-      checkedIDs = Set(decoded.checkedIDs)
-      // Purge legacy 40-char hex checksums so they are re-hashed to Base64 SHA-1
-      checksums = decoded.checksums.filter { $0.value.count != 40 }
-      for (localId, serverId) in matchedServerIDs {
-        reverseMatches[serverId] = localId
-      }
-      if matchedServerIDs.count != decoded.matchedServerIDs.count || checksums.count != decoded.checksums.count {
-        isDirty = true
-      }
+  func configure(server: String, userId: String?) {
+    // An unverified legacy or offline session must not inherit any matches.
+    let canonicalServer = server.trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased().replacingOccurrences(of: "/+$", with: "", options: .regularExpression)
+    let key = userId.flatMap { $0.isEmpty ? nil : "\(canonicalServer)|\($0)" }
+    lock.lock(); defer { lock.unlock() }
+    guard key != accountKey else { return }
+    saveQueue.sync {} // Drain snapshots queued before changing account.
+    accountKey = key
+    fileURL = key.map { key in
+      let digest = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
+      return folder.appendingPathComponent("native_cloud_sync_cache_\(digest).json")
     }
-
-    // Import from Flutter backup markers in UserDefaults if present (only marks as checked, not fake match)
-    if let markersRaw = UserDefaults.standard.string(forKey: "flutter.backup_markers"),
-       let markersData = markersRaw.data(using: .utf8),
-       let ids = try? JSONSerialization.jsonObject(with: markersData) as? [String] {
-      for id in ids {
-        if checkedIDs.insert(id).inserted {
-          isDirty = true
-        }
-      }
-    }
-
-    if isDirty {
-      saveToDisk()
-    }
+    matchedServerIDs = [:]
+    reverseMatches = [:]
+    checkedIDs = []
+    checksums = [:]
+    guard let fileURL, let data = try? Data(contentsOf: fileURL),
+          let decoded = try? JSONDecoder().decode(NativeCloudSyncCache.self, from: data) else { return }
+    matchedServerIDs = decoded.matchedServerIDs.filter { $0.key != $0.value }
+    checkedIDs = Set(decoded.checkedIDs)
+    checksums = decoded.checksums.filter { $0.value.count == 28 }
+    for (localId, serverId) in matchedServerIDs { reverseMatches[serverId] = localId }
   }
 
   func isMatched(localId: String?) -> Bool {
@@ -72,8 +74,9 @@ final class NativeSyncCacheStore: @unchecked Sendable {
     return reverseMatches[serverId]
   }
 
-  func update(matches: [String: String] = [:], checked: Set<String> = [], newChecksums: [String: String] = [:]) {
+  func update(matches: [String: String] = [:], checked: Set<String> = [], newChecksums: [String: String] = [:], expectedIdentity: String? = nil) {
     lock.lock()
+    guard accountKey != nil, expectedIdentity == nil || expectedIdentity == accountKey else { lock.unlock(); return }
     var changed = false
     for (k, v) in matches {
       if let previous = matchedServerIDs[k], previous != v { reverseMatches.removeValue(forKey: previous) }
@@ -87,9 +90,7 @@ final class NativeSyncCacheStore: @unchecked Sendable {
       }
     }
     for id in checked {
-      if checkedIDs.insert(id).inserted {
-        changed = true
-      }
+      if checkedIDs.insert(id).inserted { changed = true }
     }
     for (k, v) in newChecksums {
       if checksums[k] != v {
@@ -97,11 +98,17 @@ final class NativeSyncCacheStore: @unchecked Sendable {
         changed = true
       }
     }
+    if changed { saveToDiskLocked() }
     lock.unlock()
+  }
 
-    if changed {
-      saveToDisk()
-    }
+  func invalidateChecks(localIDs: Set<String>, expectedIdentity: String? = nil) {
+    guard !localIDs.isEmpty else { return }
+    lock.lock()
+    guard expectedIdentity == nil || expectedIdentity == accountKey else { lock.unlock(); return }
+    checkedIDs.subtract(localIDs)
+    saveToDiskLocked()
+    lock.unlock()
   }
 
   func removeMatches(localIDs: Set<String>) {
@@ -112,29 +119,34 @@ final class NativeSyncCacheStore: @unchecked Sendable {
         reverseMatches.removeValue(forKey: serverID)
       }
     }
+    saveToDiskLocked()
     lock.unlock()
-    saveToDisk()
   }
 
   func clear() {
     lock.lock()
+    saveQueue.sync {} // Drain snapshots while updates are excluded.
     matchedServerIDs.removeAll()
     reverseMatches.removeAll()
     checkedIDs.removeAll()
     checksums.removeAll()
+    let oldURL = fileURL
+    fileURL = nil
+    accountKey = nil
+    if let oldURL { try? FileManager.default.removeItem(at: oldURL) }
     lock.unlock()
-    try? FileManager.default.removeItem(at: fileURL)
   }
 
-  private func saveToDisk() {
-    lock.lock()
+  // The snapshot and destination must be selected under the same lock. A
+  // previous account's async write may finish later, but can never write to
+  // the newly selected account's file.
+  private func saveToDiskLocked() {
+    guard let fileURL else { return }
     let snapshot = NativeCloudSyncCache(
       matchedServerIDs: matchedServerIDs,
       checkedIDs: Array(checkedIDs),
       checksums: checksums
     )
-    lock.unlock()
-
     saveQueue.async { [fileURL] in
       if let data = try? JSONEncoder().encode(snapshot) {
         try? data.write(to: fileURL, options: .atomic)
@@ -149,10 +161,12 @@ final class NativeSyncCacheStore: @unchecked Sendable {
 final class NativeCloudStatus: ObservableObject {
   @Published private(set) var matchedServerIDs: [String: String]
   @Published private(set) var checkedIDs: Set<String>
+  @Published private(set) var failedVerificationIDs: Set<String> = []
   @Published private(set) var message: String?
   @Published private(set) var failedCount = 0
   @Published private(set) var isRunning = false
   private var checksums: [String: String]
+  private let accountIdentity: String?
   private var running = false
   private var generation = 0
   private var failedIDs: Set<String> = []
@@ -162,6 +176,7 @@ final class NativeCloudStatus: ObservableObject {
     self.matchedServerIDs = store.matchedServerIDs
     self.checkedIDs = store.checkedIDs
     self.checksums = store.checksums
+    self.accountIdentity = store.identity
   }
 
   func forgetMatches(localIDs: Set<String>) {
@@ -173,6 +188,7 @@ final class NativeCloudStatus: ObservableObject {
   func reset() {
     generation += 1
     failedIDs = []
+    failedVerificationIDs = []
     failedCount = 0
     message = nil
     running = false
@@ -183,6 +199,7 @@ final class NativeCloudStatus: ObservableObject {
     reset()
     matchedServerIDs = [:]
     checkedIDs = []
+    failedVerificationIDs = []
     checksums = [:]
     NativeSyncCacheStore.shared.clear()
   }
@@ -202,7 +219,7 @@ final class NativeCloudStatus: ObservableObject {
       message = "同步已暂停"
       return
     }
-    guard !running else { return }
+    guard !running, accountIdentity != nil, NativeSyncCacheStore.shared.identity == accountIdentity else { return }
     let toCheck = assets.filter { matchedServerIDs[$0.id] == nil && (allowNetwork || !failedIDs.contains($0.id)) }
     guard !toCheck.isEmpty else { return }
 
@@ -219,7 +236,7 @@ final class NativeCloudStatus: ObservableObject {
     message = nil
 
     for batch in stride(from: 0, to: toCheck.count, by: 50) {
-      guard current == generation else { return }
+      guard current == generation, NativeSyncCacheStore.shared.identity == accountIdentity else { return }
       let slice = Array(toCheck[batch..<min(batch + 50, toCheck.count)])
 
       var hashes: [[String: String]] = []
@@ -242,65 +259,73 @@ final class NativeCloudStatus: ObservableObject {
             newlyComputedChecksums[id] = hash
           } else {
             failedIDs.insert(id)
+            failedVerificationIDs.insert(id)
           }
         }
       }
 
-      guard current == generation else { return }
+      guard current == generation, NativeSyncCacheStore.shared.identity == accountIdentity else { return }
+      let unreadable = Set(slice.map(\.id)).subtracting(hashes.compactMap { $0["id"] })
+      if !unreadable.isEmpty {
+        checkedIDs.subtract(unreadable)
+        NativeSyncCacheStore.shared.invalidateChecks(localIDs: unreadable, expectedIdentity: accountIdentity)
+      }
       if !newlyComputedChecksums.isEmpty {
         for (k, v) in newlyComputedChecksums { checksums[k] = v }
-        NativeSyncCacheStore.shared.update(newChecksums: newlyComputedChecksums)
+        NativeSyncCacheStore.shared.update(newChecksums: newlyComputedChecksums, expectedIdentity: accountIdentity)
       }
 
       guard !hashes.isEmpty else { continue }
 
       do {
         let response = try await client.send(path: "assets/bulk-upload-check", method: "POST", body: ["assets": hashes])
-        guard current == generation else { return }
+        guard current == generation, NativeSyncCacheStore.shared.identity == accountIdentity else { return }
         guard let results = response["results"] as? [[String: Any]] else {
+          let invalidIDs = Set(hashes.compactMap { $0["id"] })
+          failedVerificationIDs.formUnion(invalidIDs)
+          checkedIDs.subtract(invalidIDs)
+          NativeSyncCacheStore.shared.invalidateChecks(localIDs: invalidIDs, expectedIdentity: accountIdentity)
           message = "服务器的上传状态核验响应格式异常。"
           return
         }
 
         let submitted = Set(hashes.compactMap { $0["id"] })
-        var received = Set<String>()
-        var newMatches: [String: String] = [:]
-        var newChecked: Set<String> = []
-
-        var invalidResults = 0
+        var responseByID: [String: [[String: Any]]] = [:]
         for result in results {
           guard let id = result["id"] as? String, submitted.contains(id) else { continue }
-          guard received.insert(id).inserted else {
-            invalidResults += 1
-            continue
-          }
-          guard let action = result["action"] as? String else {
-            invalidResults += 1
-            continue
-          }
-          if action == "reject" {
-            guard let serverID = result["assetId"] as? String, !serverID.isEmpty else {
-              invalidResults += 1
-              continue
-            }
+          responseByID[id, default: []].append(result)
+        }
+        var newMatches: [String: String] = [:]
+        var newChecked: Set<String> = []
+        for (id, entries) in responseByID where entries.count == 1 {
+          let result = entries[0]
+          guard let action = result["action"] as? String else { continue }
+          if action == "reject", let serverID = result["assetId"] as? String, !serverID.isEmpty {
             newMatches[id] = serverID
             newChecked.insert(id)
           } else if action == "accept" {
             newChecked.insert(id)
-          } else {
-            invalidResults += 1
           }
         }
 
         for (k, v) in newMatches { matchedServerIDs[k] = v }
         checkedIDs.formUnion(newChecked)
-        NativeSyncCacheStore.shared.update(matches: newMatches, checked: newChecked)
+        failedVerificationIDs.subtract(newChecked)
+        failedIDs.subtract(newChecked)
+        NativeSyncCacheStore.shared.update(matches: newMatches, checked: newChecked, expectedIdentity: accountIdentity)
 
-        let omitted = submitted.subtracting(received).count
-        if omitted > 0 || invalidResults > 0 {
-          message = "服务器有 \(omitted + invalidResults) 项未返回有效的核验结果，状态暂时未知。"
+        let invalidIDs = submitted.subtracting(newChecked)
+        if !invalidIDs.isEmpty {
+          failedVerificationIDs.formUnion(invalidIDs)
+          checkedIDs.subtract(invalidIDs)
+          NativeSyncCacheStore.shared.invalidateChecks(localIDs: invalidIDs, expectedIdentity: accountIdentity)
+          message = "服务器有 \(invalidIDs.count) 项未返回唯一有效的核验结果，状态暂时未知。"
         }
       } catch {
+        let invalidIDs = Set(hashes.compactMap { $0["id"] })
+        failedVerificationIDs.formUnion(invalidIDs)
+        checkedIDs.subtract(invalidIDs)
+        NativeSyncCacheStore.shared.invalidateChecks(localIDs: invalidIDs, expectedIdentity: accountIdentity)
         message = "无法向服务器核验上传状态：\(error.localizedDescription)"
         return
       }

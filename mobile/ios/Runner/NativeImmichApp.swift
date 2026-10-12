@@ -26,6 +26,7 @@ struct NativeServerConfig: Codable {
   var accessToken: String?
   var apiKey: String?
   var deviceId: String?
+  var userId: String? = nil
 
   var credential: String? { accessToken ?? apiKey }
 }
@@ -318,20 +319,26 @@ final class NativeImmichClient {
     let temporary = NativeImmichClient(config: NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint))
     let result = try await temporary.send(path: "auth/login", method: "POST", body: ["email": email, "password": password])
     guard let token = result["accessToken"] as? String, !token.isEmpty else { throw NativeAPIError.invalidResponse }
-    let config = NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint, accessToken: token)
-    try await NativeImmichClient(config: config).verifySession()
+    var config = NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint, accessToken: token)
+    config.userId = try await NativeImmichClient(config: config).verifiedUserID()
     return config
   }
 
   static func login(server: String, apiKey: String) async throws -> NativeServerConfig {
     let endpoint = try await discover(server)
-    let config = NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint, apiKey: apiKey)
-    try await NativeImmichClient(config: config).verifySession()
+    var config = NativeServerConfig(serverUrl: normalize(server), apiEndpoint: endpoint, apiKey: apiKey)
+    config.userId = try await NativeImmichClient(config: config).verifiedUserID()
     return config
   }
 
+  func verifiedUserID() async throws -> String {
+    let response = try await send(path: "users/me")
+    guard let id = response["id"] as? String, !id.isEmpty else { throw NativeAPIError.invalidResponse }
+    return id
+  }
+
   func verifySession() async throws {
-    _ = try await send(path: "users/me")
+    _ = try await verifiedUserID()
   }
 
   func send(path: String, method: String = "GET", query: [URLQueryItem] = [], body: [String: Any]? = nil) async throws -> [String: Any] {
@@ -590,6 +597,15 @@ final class NativeImmichClient {
     return parseDate(value)
   }
 
+  nonisolated static func formatChineseDateTime(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "zh_CN")
+    formatter.timeZone = .autoupdatingCurrent
+    formatter.dateStyle = .long
+    formatter.timeStyle = .short
+    return formatter.string(from: date)
+  }
+
   nonisolated static func formatChineseDate(_ date: Date, includeDay: Bool = true) -> String {
     var calendar = Calendar.autoupdatingCurrent
     calendar.timeZone = .autoupdatingCurrent
@@ -643,6 +659,15 @@ struct NativeBucket: Identifiable {
   let count: Int
 }
 
+func nativeRefreshedBucketBoundary(old: [NativeBucket], next: Int, refreshed: [NativeBucket]) -> Int {
+  guard next > 0 else { return 0 }
+  let remainingID = next < old.count ? old[next].id : nil
+  let lastLoadedID = next <= old.count ? old[next - 1].id : nil
+  if let remainingID, let index = refreshed.firstIndex(where: { $0.id == remainingID }) { return index }
+  if let lastLoadedID, let index = refreshed.firstIndex(where: { $0.id == lastLoadedID }) { return index + 1 }
+  return min(next, refreshed.count)
+}
+
 struct NativeAsset: Identifiable {
   let id: String
   let date: Date
@@ -674,6 +699,7 @@ struct NativeImmichRootView: View {
         ProgressView("正在恢复登录状态…")
       } else if let config {
         NativeTabShell(client: NativeImmichClient(config: config), onUseFlutter: onUseFlutter) {
+          NativeSyncCacheStore.shared.clear()
           NativeSessionStore.clear()
           self.config = nil
           restoreError = nil
@@ -685,16 +711,26 @@ struct NativeImmichRootView: View {
     .task {
       guard restoring else { return }
       if let saved = NativeSessionStore.read(), saved.credential != nil {
+        // Restore the verified account's persisted matches before building the
+        // photo grid; a legacy session without an ID starts with no matches.
+        NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: saved.userId)
         do {
-          try await NativeImmichClient(config: saved).verifySession()
-          config = saved
+          var verified = saved
+          verified.userId = try await NativeImmichClient(config: saved).verifiedUserID()
+          NativeSyncCacheStore.shared.configure(server: verified.serverUrl, userId: verified.userId)
+          try? NativeSessionStore.save(verified)
+          config = verified
         } catch {
           if let apiError = error as? NativeAPIError, case .unauthorized = apiError {
+            NativeSyncCacheStore.shared.clear()
             NativeSessionStore.clear()
             restoreError = error.localizedDescription
           } else {
             // Keep credentials across offline or transient server failures.
             restoreError = error.localizedDescription
+            // Offline restore cannot validate legacy configurations without a
+            // user identity; never inherit another account's match cache.
+            NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: saved.userId)
             config = saved
           }
         }
@@ -802,6 +838,7 @@ private struct NativeLoginView: View {
         ? try await NativeImmichClient.login(server: server, apiKey: apiKey)
         : try await NativeImmichClient.login(server: server, email: email, password: password)
       try NativeSessionStore.save(value)
+      NativeSyncCacheStore.shared.configure(server: value.serverUrl, userId: value.userId)
       onLogin(value)
     } catch {
       loginError = error.localizedDescription
@@ -840,17 +877,23 @@ private final class NativeTimelineModel: ObservableObject {
     let existingSearchFallback = searchFallbackEnabled
     let existingSearchCursor = searchCursor
     do {
+      let refreshedBuckets = try await client.timelineBuckets()
       searchFallbackEnabled = false
       searchCursor = nil
-      buckets = try await client.timelineBuckets()
-      nextBucket = 0
-      hasOlder = !buckets.isEmpty
-      try await loadNextPage()
+      buckets = refreshedBuckets
+      nextBucket = existingSearchFallback || existingBuckets.isEmpty ? 0 :
+        nativeRefreshedBucketBoundary(old: existingBuckets, next: existingNextBucket, refreshed: buckets)
+      hasOlder = nextBucket < buckets.count
+      // Fetch the newest page while preserving the older pagination boundary.
+      for bucket in buckets.prefix(pageSize) {
+        let incoming = try await client.assets(in: bucket)
+        assets = (assets + incoming).reduce(into: [String: NativeAsset]()) { $0[$1.id] = $1 }.values.sorted { $0.date < $1.date }
+      }
       newlyAddedCount = assets.filter { !existingIDs.contains($0.id) }.count
-      assets = (existingAssets + assets).reduce(into: [String: NativeAsset]()) { $0[$1.id] = $1 }.values.sorted { $0.date < $1.date }
-      // If the first page of buckets had very few assets, load more to fill view
-      while assets.count < 100 && hasOlder {
-        try await loadNextPage()
+      if existingBuckets.isEmpty {
+        nextBucket = min(pageSize, buckets.count)
+        hasOlder = nextBucket < buckets.count
+        while assets.count < 100 && hasOlder { try await loadNextPage() }
       }
     } catch {
       // Some compatible Immich servers or reverse proxies return a non-JSON
@@ -866,6 +909,7 @@ private final class NativeTimelineModel: ObservableObject {
         nextBucket = existingNextBucket
         searchFallbackEnabled = existingSearchFallback
         searchCursor = existingSearchCursor
+        hasOlder = existingSearchFallback ? existingSearchCursor != nil : existingNextBucket < existingBuckets.count
         self.error = error.localizedDescription
       }
     }
@@ -882,8 +926,10 @@ private final class NativeTimelineModel: ObservableObject {
         newlyAddedCount = page.assets.filter { !existingIDs.contains($0.id) }.count
         var seen = Set<String>()
         assets = (page.assets + assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
-        searchCursor = page.next
-        hasOlder = page.next != nil
+        // Keep the cursor for the oldest already loaded page. Replacing it
+        // with the newest page cursor would replay pages after a refresh.
+        if existingIDs.isEmpty { searchCursor = page.next }
+        hasOlder = searchCursor != nil
       } else {
         let refreshedBuckets = try await client.timelineBuckets()
         var incoming = [NativeAsset]()
@@ -894,8 +940,12 @@ private final class NativeTimelineModel: ObservableObject {
         newlyAddedCount = incoming.filter { !existingIDs.contains($0.id) }.count
         var seen = Set<String>()
         assets = (incoming + assets).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
+        let oldBuckets = buckets
+        let oldNextBucket = nextBucket
         buckets = refreshedBuckets
-        nextBucket = min(pageSize, buckets.count)
+        nextBucket = oldBuckets.isEmpty
+          ? min(pageSize, buckets.count)
+          : nativeRefreshedBucketBoundary(old: oldBuckets, next: oldNextBucket, refreshed: buckets)
         hasOlder = nextBucket < buckets.count
       }
       error = nil
@@ -918,11 +968,8 @@ private final class NativeTimelineModel: ObservableObject {
   }
 
   func retry() async {
-    if error != nil {
-      await loadInitial()
-    } else {
-      await loadOlder()
-    }
+    if hasOlder { await loadOlder() }
+    else if error != nil { await loadInitial() }
   }
 
   private func loadSearchFallbackPage() async throws {
@@ -1050,10 +1097,8 @@ struct NativePhotosView: View {
         if let server = serverByID[serverID] {
           item = NativeGridItem(server: server, local: local)
         } else {
-          // Keep the local copy visible in All, but don't project an unhydrated
-          // server match as an actionable cloud asset until its DTO is loaded.
-          seenServer.insert(serverID)
-          if sourceFilter == .server { continue }
+          // Verified cloud membership must remain visible in the cloud filter.
+          // Without the DTO, server-side actions remain unavailable until hydration.
           item = NativeGridItem(server: nil, local: local)
         }
         seenServer.insert(serverID)
@@ -1126,11 +1171,11 @@ struct NativePhotosView: View {
   }
 
   private var unsyncedLocalCount: Int {
-    device.assets.filter { cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
+    device.assets.filter { cloud.checkedIDs.contains($0.id) && !cloud.failedVerificationIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
   private var unknownLocalCount: Int {
-    device.assets.filter { !cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
+    device.assets.filter { (!cloud.checkedIDs.contains($0.id) || cloud.failedVerificationIDs.contains($0.id)) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
   @ViewBuilder
@@ -1453,7 +1498,7 @@ struct NativePhotosView: View {
           rebuildDayGroups()
           // Don't let background match hydration override the in-flight initial
           // scroll-to-latest sequence.
-          if didInitialPosition, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+          if didInitialPosition, !pendingSourceChangeScroll, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
           Task { await loadKnownMatchedServerAssets() }
         }
         .onChange(of: sourceFilter) { _ in
@@ -1517,7 +1562,7 @@ struct NativePhotosView: View {
           rebuildDayGroups()
           updateSelectionAfterTimelineChange()
           if !hasInitialScrolled { positionInitiallyIfReady(proxy: proxy) }
-          else if didInitialPosition, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
+          else if didInitialPosition, !pendingSourceChangeScroll, let anchor { withAnimation(.none) { proxy.scrollTo(anchor, anchor: .top) } }
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: model.isLoading) { loading in
@@ -1655,22 +1700,16 @@ struct NativePhotosView: View {
         .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
           if selectionSpansBothSources {
             Button("删除所有所选副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+          }
+          if selectedItems.contains(where: { $0.local != nil }) {
             Button("仅删除本机副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
+          }
+          if selectedItems.contains(where: { $0.server != nil }) {
             Button("仅删除云端副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
-          } else if selectedHasBothCopies {
-            Button("删除本机和云端副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
-            Button("仅删除本机副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
-            Button("仅删除云端副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
-          } else {
-            Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
           }
           Button("取消", role: .cancel) {}
         } message: {
-          if selectionSpansBothSources {
-            Text(selectedHasBothCopies ? "选择的内容包含双端副本或不同来源的资产，请明确删除范围。" : "选择的内容包含本机与云端资产，请明确删除范围。")
-          } else {
-            Text("确认删除选中的照片？此操作不可撤销。")
-          }
+          Text("所选内容中本机 \(nativePhotosSelectionActionAvailability(selectedItems).local) 项、云端 \(nativePhotosSelectionActionAvailability(selectedItems).server) 项；不在指定来源的项目将跳过。仅删除云端而保留本机时，若自动备份开启，照片可能再次上传。请明确选择删除范围；本机删除也可能同步至 iCloud 设备。")
         }
         .alert("保存到本机照片", isPresented: $showSaveConfirmation) {
           Button("取消", role: .cancel) {}
@@ -1805,10 +1844,6 @@ struct NativePhotosView: View {
     .accessibilityLabel(label)
   }
 
-  private var selectedHasBothCopies: Bool {
-    selectedItems.contains { $0.server != nil && $0.local != nil }
-  }
-
   private var selectionSpansBothSources: Bool {
     selectedItems.contains(where: { $0.local != nil }) && selectedItems.contains(where: { $0.server != nil })
   }
@@ -1847,17 +1882,17 @@ struct NativePhotosView: View {
       device.refresh()
       rebuildDayGroups()
     } catch {
-      if scope == .all || scope == .remoteOnly {
-        var invalidatedLocalIDs = Set<String>()
-        for item in items {
-          guard let local = item.local,
-                let serverID = item.server?.id,
-                cloud.matchedServerIDs[local.id] == serverID else { continue }
-          invalidatedLocalIDs.insert(local.id)
-        }
-        cloud.forgetMatches(localIDs: invalidatedLocalIDs)
+      if let partial = error as? NativeDeleteOperationError {
+        let deletedIDs = partial.deletedServerIDs
+        model.removeAssets(ids: deletedIDs)
+        let invalidated = Set(items.compactMap { item -> String? in
+          guard let local = item.local, let serverID = cloud.matchedServerIDs[local.id],
+                deletedIDs.contains(serverID) else { return nil }
+          return local.id
+        })
+        cloud.forgetMatches(localIDs: invalidated)
       }
-      deletionError = "可能已有部分照片删除成功，请刷新确认。\(error.localizedDescription)"
+      deletionError = "删除未全部成功；已确认的云端删除会更新本地状态，请刷新核对。\(error.localizedDescription)"
       device.refresh()
       await model.refreshLatest()
       rebuildDayGroups()
@@ -1870,17 +1905,23 @@ struct NativePhotosView: View {
     let target = !items.allSatisfy(\.isFavorite)
     var succeeded = 0
     var failed = 0
-    let serverIDs = items.compactMap { $0.server?.id }
-    for id in serverIDs {
-      do { try await client.updateFavorites(ids: [id], isFavorite: target); succeeded += 1 }
-      catch { failed += 1 }
+    var partial = 0
+    for item in items {
+      var successfulCopies = 0
+      var failedCopies = 0
+      if let server = item.server {
+        do { try await client.updateFavorite(id: server.id, isFavorite: target); successfulCopies += 1 }
+        catch { failedCopies += 1 }
+      }
+      if let local = item.local {
+        if await device.updateFavorite(ids: [local.id], isFavorite: target) { successfulCopies += 1 }
+        else { failedCopies += 1 }
+      }
+      if failedCopies == 0 && successfulCopies > 0 { succeeded += 1 }
+      else if successfulCopies > 0 { partial += 1 }
+      else { failed += 1 }
     }
-    let localIDs = items.compactMap { $0.local?.id }
-    if !localIDs.isEmpty {
-      if await device.updateFavorite(ids: localIDs, isFavorite: target) { succeeded += localIDs.count }
-      else { failed += localIDs.count }
-    }
-    actionMessage = "收藏\(target ? "已开启" : "已关闭")：成功 \(succeeded) 项，失败 \(failed) 项。"
+    actionMessage = "收藏\(target ? "已开启" : "已关闭")：全部成功 \(succeeded) 项，部分成功 \(partial) 项，失败 \(failed) 项。"
     device.refresh()
     await model.refreshLatest()
     rebuildDayGroups()
@@ -2250,6 +2291,7 @@ struct NativePhotosView: View {
   private func cloudSymbol(for entry: NativeGridItem) -> String {
     guard let local = entry.local else { return "cloud" }
     if entry.server != nil || cloud.matchedServerIDs[local.id] != nil { return "checkmark.icloud" }
+    if cloud.failedVerificationIDs.contains(local.id) { return "exclamationmark.icloud" }
     return cloud.checkedIDs.contains(local.id) ? "icloud.slash" : "questionmark.icloud"
   }
 
@@ -2257,6 +2299,7 @@ struct NativePhotosView: View {
     let typeName = entry.isVideo ? "视频" : "照片"
     if let local = entry.local {
       if entry.server != nil || cloud.matchedServerIDs[local.id] != nil { return "已核验云端副本的\(typeName)" }
+      if cloud.failedVerificationIDs.contains(local.id) { return "核验失败、云端状态未知的本机\(typeName)" }
       return cloud.checkedIDs.contains(local.id) ? "仅本机\(typeName)" : "云端状态未知的本机\(typeName)"
     }
     return "仅云端\(typeName)"
@@ -2714,6 +2757,15 @@ struct NativeUnifiedGalleryViewer: View {
               .foregroundColor(.white)
             }
             .disabled(isPreparingShare)
+            if isPreparingShare {
+              Button("取消准备") {
+                shareTask?.cancel()
+                shareTask = nil
+                isPreparingShare = false
+              }
+              .font(.caption2)
+              .foregroundColor(.white)
+            }
 
             // Favorite
             Button {
@@ -2780,7 +2832,7 @@ struct NativeUnifiedGalleryViewer: View {
       }
       Button("取消", role: .cancel) {}
     } message: {
-      Text("选择要删除的副本。")
+      Text("选择要删除的副本；只删除云端时，若本机仍有原件且开启自动备份，照片可能再次上传。")
     }
     .alert("删除失败", isPresented: Binding(get: { deleteErrorMessage != nil }, set: { if !$0 { deleteErrorMessage = nil } })) {
       Button("确定", role: .cancel) { deleteErrorMessage = nil }
@@ -2837,6 +2889,11 @@ struct NativeUnifiedGalleryViewer: View {
       } catch {
         await MainActor.run {
           isDeletingItem = false
+          if let partial = error as? NativeDeleteOperationError,
+             let serverID = item.server?.id, partial.deletedServerIDs.contains(serverID) {
+            onDeleteItem?(item, .remoteOnly)
+            retainViewerAfterDeleting(item, scope: .remoteOnly)
+          }
           deleteErrorMessage = "删除失败：\(error.localizedDescription)"
         }
       }
@@ -2900,30 +2957,47 @@ struct NativeUnifiedGalleryViewer: View {
     Task {
       var succeeded = 0
       var failed = 0
+      var serverSucceeded = false
+      var localSucceeded = false
       if let server = item.server {
-        do { try await client.updateFavorite(id: server.id, isFavorite: newFav); succeeded += 1 }
+        do { try await client.updateFavorite(id: server.id, isFavorite: newFav); succeeded += 1; serverSucceeded = true }
         catch { failed += 1 }
       }
       if let local = item.local {
-        if await device.updateFavorite(ids: [local.id], isFavorite: newFav) { succeeded += 1 }
+        if await device.updateFavorite(ids: [local.id], isFavorite: newFav) { succeeded += 1; localSucceeded = true }
         else { failed += 1 }
       }
-      if succeeded > 0 {
-        isFavorite = newFav
-        if let server = item.server {
-          let updated = NativeAsset(
-            id: server.id, date: server.date, isImage: server.isImage, isFavorite: newFav,
-            thumbhash: server.thumbhash, livePhotoVideoId: server.livePhotoVideoId,
-            originalFileName: server.originalFileName, originalMimeType: server.originalMimeType,
-            width: server.width, height: server.height, fileSizeInByte: server.fileSizeInByte,
-            latitude: server.latitude, longitude: server.longitude, isArchived: server.isArchived
-          )
-          onServerAssetUpdated?(updated)
-          items[currentIndex] = NativeGridItem(server: updated, local: item.local)
+      // A paired asset can succeed on just one side. Never synthesize a
+      // successful server favorite when its request actually failed.
+      let serverUpdated = serverSucceeded && item.server != nil
+      let localUpdated = localSucceeded && item.local != nil
+      let updatedServer: NativeAsset? = item.server.map { server in
+        guard serverUpdated else { return server }
+        return NativeAsset(
+          id: server.id, date: server.date, isImage: server.isImage, isFavorite: newFav,
+          thumbhash: server.thumbhash, livePhotoVideoId: server.livePhotoVideoId,
+          originalFileName: server.originalFileName, originalMimeType: server.originalMimeType,
+          width: server.width, height: server.height, fileSizeInByte: server.fileSizeInByte,
+          latitude: server.latitude, longitude: server.longitude, isArchived: server.isArchived
+        )
+      }
+      let updatedLocal: NativeDeviceAsset? = item.local.map { local in
+        guard localUpdated else { return local }
+        return NativeDeviceAsset(
+          id: local.id, date: local.date, isVideo: local.isVideo,
+          isLivePhoto: local.isLivePhoto, contentVersion: local.contentVersion,
+          isFavorite: newFav
+        )
+      }
+      if serverUpdated, let updatedServer { onServerAssetUpdated?(updatedServer) }
+      if let index = items.firstIndex(where: { $0.id == item.id }) {
+        items[index] = NativeGridItem(server: updatedServer, local: updatedLocal)
+        if index == currentIndex {
+          isFavorite = updatedServer?.isFavorite == true || updatedLocal?.isFavorite == true
         }
       }
       isProcessingFavorite = false
-      viewerMessage = "收藏更新：成功 \(succeeded) 项，失败 \(failed) 项。"
+      viewerMessage = "收藏更新：云端\(item.server == nil ? "无副本" : (serverSucceeded ? "成功" : "失败"))；本机\(item.local == nil ? "无副本" : (localSucceeded ? "成功" : "失败"))。成功 \(succeeded) 份，失败 \(failed) 份。"
     }
   }
 
@@ -2935,10 +3009,8 @@ struct NativeUnifiedGalleryViewer: View {
       var preparedURL: URL?
       defer {
         if Task.isCancelled, let preparedURL { try? FileManager.default.removeItem(at: preparedURL) }
-        if !Task.isCancelled {
-          isPreparingShare = false
-          shareTask = nil
-        }
+        isPreparingShare = false
+        shareTask = nil
       }
       do {
         let shared: Any
@@ -3415,7 +3487,7 @@ private struct NativeAssetInfoSheet: View {
     NavigationView {
       List {
         Section("基本信息") {
-          InfoRow(label: "日期", value: NativeImmichClient.formatChineseDate(item.date))
+          InfoRow(label: "拍摄时间", value: NativeImmichClient.formatChineseDateTime(item.date))
           InfoRow(label: "类型", value: item.isVideo ? "视频" : "照片")
           InfoRow(label: "来源", value: item.server != nil && item.local != nil ? "本机与云端" : (item.local != nil ? "本机" : "云端"))
           InfoRow(label: "副本状态", value: item.server != nil && item.local != nil ? "双端已确认" : (item.server != nil ? "仅云端" : (NativeSyncCacheStore.shared.isMatched(localId: item.local?.id) ? "已匹配，云端信息待载入" : "本机；核验状态按下方显示")))
@@ -3643,11 +3715,11 @@ struct NativeSyncSettingsSheet: View {
   @AppStorage("backup_enabled") private var syncEnabled = true
 
   private var verifiedLocalOnlyCount: Int {
-    device.assets.filter { cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
+    device.assets.filter { cloud.checkedIDs.contains($0.id) && !cloud.failedVerificationIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
   private var unknownCount: Int {
-    device.assets.filter { !cloud.checkedIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
+    device.assets.filter { (!cloud.checkedIDs.contains($0.id) || cloud.failedVerificationIDs.contains($0.id)) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
   var body: some View {

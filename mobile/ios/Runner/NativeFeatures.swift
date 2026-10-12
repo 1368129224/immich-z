@@ -352,6 +352,8 @@ struct NativeDeviceThumbnail: View {
   let asset: NativeDeviceAsset
   var columns: Int = 3
   @State private var image: UIImage?
+  @State private var imageRequestID: PHImageRequestID?
+  @State private var requestToken = UUID()
 
   var body: some View {
     Group {
@@ -359,19 +361,23 @@ struct NativeDeviceThumbnail: View {
       else { Rectangle().fill(Color(uiColor: .secondarySystemBackground)) }
     }
     .task(id: "\(asset.id):\(asset.contentVersion):\(targetDimension)") {
+      cancelImageRequest()
+      image = nil
+      let token = requestToken
       let dim = targetDimension
       let key = NSString(string: "\(asset.id):\(asset.contentVersion):\(dim)")
       if let cached = NativeLocalThumbnailCache.images.object(forKey: key) {
         image = cached
         return
       }
-      guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [asset.id], options: nil).firstObject else { return }
+      guard !Task.isCancelled,
+            let source = PHAsset.fetchAssets(withLocalIdentifiers: [asset.id], options: nil).firstObject else { return }
       let options = PHImageRequestOptions()
       options.isNetworkAccessAllowed = true
       options.deliveryMode = .opportunistic
       options.resizeMode = .fast
       let targetSize = CGSize(width: dim, height: dim)
-      NativeLocalThumbnailCache.manager.requestImage(
+      imageRequestID = NativeLocalThumbnailCache.manager.requestImage(
         for: source,
         targetSize: targetSize,
         contentMode: .aspectFill,
@@ -380,10 +386,21 @@ struct NativeDeviceThumbnail: View {
         guard info?[PHImageCancelledKey] as? Bool != true,
               info?[PHImageErrorKey] == nil,
               let result else { return }
-        NativeLocalThumbnailCache.images.setObject(result, forKey: key, cost: Int(result.size.width * result.size.height * 4))
-        Task { @MainActor in image = result }
+        Task { @MainActor in
+          guard requestToken == token else { return }
+          NativeLocalThumbnailCache.images.setObject(result, forKey: key, cost: Int(result.size.width * result.size.height * 4))
+          image = result
+        }
       }
+      if Task.isCancelled && requestToken == token { cancelImageRequest() }
     }
+    .onDisappear { cancelImageRequest() }
+  }
+
+  private func cancelImageRequest() {
+    requestToken = UUID()
+    if let imageRequestID { NativeLocalThumbnailCache.manager.cancelImageRequest(imageRequestID) }
+    imageRequestID = nil
   }
 
   private var targetDimension: Int {
@@ -1160,10 +1177,17 @@ enum NativeDeleteTargetScope {
 }
 
 enum NativeDeleteOperationError: LocalizedError {
-  case partial([String])
+  case partial(failures: [String], deletedServerIDs: Set<String>)
+
+  var deletedServerIDs: Set<String> {
+    switch self {
+    case .partial(_, let ids): return ids
+    }
+  }
+
   var errorDescription: String? {
     switch self {
-    case .partial(let failures): return "部分删除未成功：\(failures.joined(separator: "；"))"
+    case .partial(let failures, _): return "部分删除未成功：\(failures.joined(separator: "；"))"
     }
   }
 }
@@ -1193,15 +1217,20 @@ func nativeDeleteGridItems(
   let uniqueServerIDs = Array(Set(serverIDs)).sorted()
   let uniqueLocalIDs = Array(Set(localIDs)).sorted()
   var failures = [String]()
+  var deletedServerIDs = Set<String>()
 
   if !uniqueServerIDs.isEmpty {
-    do { try await client.deleteAssets(ids: uniqueServerIDs) }
-    catch { failures.append("云端：\(error.localizedDescription)") }
+    do {
+      try await client.deleteAssets(ids: uniqueServerIDs)
+      deletedServerIDs = Set(uniqueServerIDs)
+    } catch { failures.append("云端：\(error.localizedDescription)") }
   }
-  if !uniqueLocalIDs.isEmpty, !(await device.deleteAssets(ids: uniqueLocalIDs)) {
+  // If the cloud step failed, do not proceed with local deletion. Leaving
+  // both copies intact is safer than destroying the last usable original.
+  if failures.isEmpty, !uniqueLocalIDs.isEmpty, !(await device.deleteAssets(ids: uniqueLocalIDs)) {
     failures.append("本机：照片权限不足或系统删除失败")
   }
-  if !failures.isEmpty { throw NativeDeleteOperationError.partial(failures) }
+  if !failures.isEmpty { throw NativeDeleteOperationError.partial(failures: failures, deletedServerIDs: deletedServerIDs) }
 }
 
 struct NativeGridItem: Identifiable {
@@ -2114,20 +2143,18 @@ private struct NativeAlbumDetail: View {
       NativeActivityView(activityItems: payload.content)
     }
     .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
-      if selectedHasBothCopies {
+      if selectedTargets.contains(where: { $0.local != nil }) && selectedTargets.contains(where: { $0.server != nil }) {
         Button("全部删除（本地与云端）", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+      }
+      if selectedTargets.contains(where: { $0.local != nil }) {
         Button("仅删除本地照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
+      }
+      if selectedTargets.contains(where: { $0.server != nil }) {
         Button("仅删除云端照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .remoteOnly) } }
-      } else {
-        Button("删除照片", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
       }
       Button("取消", role: .cancel) {}
     } message: {
-      if selectedHasBothCopies {
-        Text("选中的照片中包含本地和云端都存在的照片，请选择删除范围。")
-      } else {
-        Text("确认删除选中的照片？此操作不可撤销。")
-      }
+      Text("所选内容中本机 \(nativePhotosSelectionActionAvailability(selectedTargets).local) 项、云端 \(nativePhotosSelectionActionAvailability(selectedTargets).server) 项；不在指定来源的项目将跳过。仅删除云端而保留本机时，若自动备份开启，照片可能再次上传。请确认删除范围。")
     }
     .alert("本机删除确认", isPresented: $showLocalDeleteWarning) {
       Button("取消", role: .cancel) {}
@@ -2158,10 +2185,6 @@ private struct NativeAlbumDetail: View {
     return items.filter { selectedIDs.contains($0.id) }
   }
 
-  private var selectedHasBothCopies: Bool {
-    selectedTargets.contains { $0.server != nil && $0.local != nil }
-  }
-
   private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
     pendingDeleteScope = scope
     guard !isDeleting else { return }
@@ -2181,11 +2204,26 @@ private struct NativeAlbumDetail: View {
     defer { isDeleting = false }
     do {
       try await nativeDeleteGridItems(targets, scope: scope, client: client, device: device)
+      if scope != .localOnly {
+        let deletedIDs = Set(targets.compactMap { $0.server?.id })
+        NativeSyncCacheStore.shared.removeMatches(localIDs: Set(targets.compactMap { item in
+          guard let local = item.local, let serverID = NativeSyncCacheStore.shared.serverID(for: local.id),
+                deletedIDs.contains(serverID) else { return nil }
+          return local.id
+        }))
+      }
       selectedIDs.removeAll()
       isSelecting = false
       device.refresh()
       if let id = entry.server?.id { await model.load(albumId: id, reset: true) }
     } catch {
+      if let partial = error as? NativeDeleteOperationError {
+        NativeSyncCacheStore.shared.removeMatches(localIDs: Set(targets.compactMap { item in
+          guard let local = item.local, let serverID = NativeSyncCacheStore.shared.serverID(for: local.id),
+                partial.deletedServerIDs.contains(serverID) else { return nil }
+          return local.id
+        }))
+      }
       deletionError = "可能已有部分照片删除成功，请刷新确认。\(error.localizedDescription)"
       device.refresh()
       if let id = entry.server?.id { await model.load(albumId: id, reset: true) }
@@ -2598,7 +2636,7 @@ struct NativePerformanceDebugView: View {
                 ProgressView().scaleEffect(0.8)
                 Text("正在清除…")
               } else {
-                Text("清除所有本地缩略图与同步缓存")
+                Text("清除本地缩略图缓存")
               }
             }
           }
@@ -2720,12 +2758,10 @@ struct NativePerformanceDebugView: View {
       await NativeThumbnailDiskCache.shared.clearAll()
       NativeThumbnailCache.images.removeAllObjects()
       NativeLocalThumbnailCache.images.removeAllObjects()
-      NativeSyncCacheStore.shared.clear()
       await MainActor.run {
         isClearingCache = false
         updateMemoryAndDiskCache()
-        matchedCount = 0
-        alertMessage = "缩略图与同步缓存已全部清理完毕"
+        alertMessage = "本地缩略图缓存已清理；照片指纹与云端匹配关系保持不变"
         showAlert = true
         UINotificationFeedbackGenerator().notificationOccurred(.success)
       }

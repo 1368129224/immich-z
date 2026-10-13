@@ -3807,6 +3807,7 @@ private struct NativeSingleAssetPage: View {
             )
           } else if let image {
             NativeZoomableImageView(image: image, size: proxy.size, onTap: onTap, onZoomChanged: onZoomChanged)
+              .frame(width: proxy.size.width, height: proxy.size.height)
           } else {
             VStack(spacing: 10) {
               if isLoading { ProgressView().tint(.white) }
@@ -4115,7 +4116,9 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     scrollView.bouncesZoom = false
     scrollView.showsVerticalScrollIndicator = false
     scrollView.showsHorizontalScrollIndicator = false
-    scrollView.backgroundColor = .clear
+    scrollView.contentInsetAdjustmentBehavior = .never
+    scrollView.automaticallyAdjustsScrollIndicatorInsets = false
+    scrollView.backgroundColor = .black
 
     let imageView = UIImageView(image: image)
     imageView.contentMode = .scaleAspectFit
@@ -4138,7 +4141,8 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     context.coordinator.onTap = onTap
     context.coordinator.onZoomChanged = onZoomChanged
     guard let imageView = uiView.viewWithTag(100) as? UIImageView else { return }
-    let fittedSize = nativeAspectFitImageSize(imageSize: image.size, viewportSize: size)
+    let viewportSize = uiView.bounds.size == .zero ? size : uiView.bounds.size
+    let fittedSize = nativeAspectFitImageSize(imageSize: image.size, viewportSize: viewportSize)
     guard fittedSize != .zero else { return }
     let imageChanged = imageView.image !== image
     let sizeChanged = imageView.bounds.size != fittedSize
@@ -4174,12 +4178,31 @@ private struct NativeZoomableImageView: UIViewRepresentable {
       let contentWidth = imageView.bounds.width * scrollView.zoomScale
       let contentHeight = imageView.bounds.height * scrollView.zoomScale
       let viewport = scrollView.bounds.size
-      scrollView.contentInset = UIEdgeInsets(
+      let centeringInset = UIEdgeInsets(
         top: max(0, (viewport.height - contentHeight) / 2),
         left: max(0, (viewport.width - contentWidth) / 2),
         bottom: max(0, (viewport.height - contentHeight) / 2),
         right: max(0, (viewport.width - contentWidth) / 2)
       )
+      if scrollView.contentInset != centeringInset {
+        scrollView.contentInset = centeringInset
+      }
+
+      // Updating contentInset doesn't reliably move the initial contentOffset on UIKit.
+      // Clamp to the inset-defined range: for content smaller than the viewport, both
+      // limits resolve to the centered negative inset rather than the upper-left corner.
+      let minOffsetX = -centeringInset.left
+      let maxOffsetX = max(minOffsetX, contentWidth - viewport.width + centeringInset.right)
+      let minOffsetY = -centeringInset.top
+      let maxOffsetY = max(minOffsetY, contentHeight - viewport.height + centeringInset.bottom)
+      let centeredOffset = CGPoint(
+        x: min(max(scrollView.contentOffset.x, minOffsetX), maxOffsetX),
+        y: min(max(scrollView.contentOffset.y, minOffsetY), maxOffsetY)
+      )
+      if abs(scrollView.contentOffset.x - centeredOffset.x) > 0.5
+        || abs(scrollView.contentOffset.y - centeredOffset.y) > 0.5 {
+        scrollView.setContentOffset(centeredOffset, animated: false)
+      }
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {

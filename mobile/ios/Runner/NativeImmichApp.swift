@@ -2117,13 +2117,16 @@ struct NativePhotosView: View {
               let fallbackID = nativeViewerNextSelectionID(deletingID: deletedItem.id, orderedIDs: previousAssetIDs)
               if scope == .all || scope == .remoteOnly {
                 if let sid = deletedItem.server?.id { model.removeAssets(ids: [sid]) }
-                if let local = deletedItem.local,
-                   NativeSyncCacheStore.shared.serverID(for: local.id) == deletedItem.server?.id {
-                  cloud.forgetMatches(localIDs: Set([local.id]))
-                }
+              }
+              if let local = deletedItem.local,
+                 scope != .remoteOnly || cloud.matchedServerIDs[local.id] == deletedItem.server?.id {
+                cloud.forgetMatches(localIDs: Set([local.id]))
               }
               device.refresh()
               rebuildDayGroups()
+              // Removing one copy must not replace/dismiss the presented viewer.
+              // It updates its own current page to the surviving server/local copy.
+              guard scope == .all else { return }
               if let fallbackID,
                  let fallbackItem = cachedDayGroups.flatMap(\.assets).first(where: { $0.id == fallbackID }) {
                 activeViewerItem = fallbackItem
@@ -2132,7 +2135,8 @@ struct NativePhotosView: View {
               }
             },
             onServerAssetUpdated: { model.upsert($0) },
-            onServerAssetArchived: { model.removeAssets(ids: [$0]) }
+            onServerAssetArchived: { model.removeAssets(ids: [$0]) },
+            onDismissViewer: { activeViewerItem = nil }
           )
         }
   }
@@ -3153,13 +3157,22 @@ struct NativeThumbnail: View {
 
 import AVKit
 
+private final class NativeWeakControllerBox {
+  weak var value: UIViewController?
+}
+
 private struct NativeClearBackgroundView: UIViewRepresentable {
+  let onControllerReady: (UIViewController) -> Void
+
   func makeUIView(context: Context) -> UIView {
     let view = UIView()
     view.backgroundColor = .clear
     DispatchQueue.main.async {
       view.superview?.superview?.backgroundColor = .clear
-      view.findViewController()?.view.backgroundColor = .clear
+      if let controller = view.findViewController() {
+        controller.view.backgroundColor = .clear
+        onControllerReady(controller)
+      }
     }
     return view
   }
@@ -3175,6 +3188,68 @@ private extension UIView {
       return nextResponder.findViewController()
     } else {
       return nil
+    }
+  }
+}
+
+// Keep per-frame gesture updates out of the gallery's asset/page state. Moving
+// the pager (without clipping or scaling its entire UIPageViewController) is
+// cheap; only the lightweight black backdrop and chrome fade are animated.
+private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
+  let pager: Pager
+  let chrome: Chrome
+  let showsChrome: Bool
+  let isZoomed: Bool
+  let onDismiss: () -> Void
+
+  @State private var dragY: CGFloat = 0
+  @State private var locked = false
+  @State private var finishing = false
+
+  var body: some View {
+    ZStack {
+      Color.black
+        .opacity(max(0, 1 - Double(dragY / 320)))
+        .ignoresSafeArea()
+      pager
+        .offset(y: dragY)
+        .simultaneousGesture(
+          DragGesture(minimumDistance: 8)
+            .onChanged { value in
+              guard !isZoomed, !finishing else { return }
+              if !locked {
+                guard value.translation.height > 8,
+                      value.translation.height > abs(value.translation.width) * 1.25 else { return }
+                locked = true
+              }
+              dragY = max(0, value.translation.height)
+            }
+            .onEnded { value in
+              guard locked, !finishing else { return }
+              locked = false
+              if isZoomed {
+                withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) { dragY = 0 }
+                return
+              }
+              if value.translation.height > 120 || value.predictedEndTranslation.height > 300 {
+                finishing = true
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                withAnimation(.easeOut(duration: 0.22)) {
+                  dragY = UIScreen.main.bounds.height + 80
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { onDismiss() }
+              } else {
+                withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) {
+                  dragY = 0
+                }
+              }
+            }
+        )
+      if showsChrome && !finishing {
+        chrome
+          .opacity(max(0, 1 - Double(dragY / 60)))
+          .transition(.opacity)
+      }
     }
   }
 }
@@ -3200,6 +3275,7 @@ struct NativeUnifiedGalleryViewer: View {
   var onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil
   var onServerAssetUpdated: ((NativeAsset) -> Void)? = nil
   var onServerAssetArchived: ((String) -> Void)? = nil
+  var onDismissViewer: (() -> Void)? = nil
 
   @Environment(\.dismiss) private var dismiss
   @State private var currentAssetID: String
@@ -3212,9 +3288,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var shareTask: Task<Void, Never>?
   @State private var sharePreparationID: UUID?
   @State private var viewerMessage: String?
-  @State private var dragOffset: CGSize = .zero
-  @State private var isDraggingToDismiss = false
-  @State private var isDismissing = false
+  @State private var presentedController = NativeWeakControllerBox()
   @State private var shareItem: Any? = nil
   @AppStorage("immichz_confirm_remote_only_deletion") private var confirmRemoteOnlyDeletion = true
   @State private var showDeleteScopeDialog = false
@@ -3230,7 +3304,8 @@ struct NativeUnifiedGalleryViewer: View {
     initialItem: NativeGridItem,
     onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil,
     onServerAssetUpdated: ((NativeAsset) -> Void)? = nil,
-    onServerAssetArchived: ((String) -> Void)? = nil
+    onServerAssetArchived: ((String) -> Void)? = nil,
+    onDismissViewer: (() -> Void)? = nil
   ) {
     self.client = client
     self.device = device
@@ -3239,6 +3314,7 @@ struct NativeUnifiedGalleryViewer: View {
     self.onDeleteItem = onDeleteItem
     self.onServerAssetUpdated = onServerAssetUpdated
     self.onServerAssetArchived = onServerAssetArchived
+    self.onDismissViewer = onDismissViewer
     _currentAssetID = State(initialValue: initialItem.id)
     _isFavorite = State(initialValue: initialItem.isFavorite)
   }
@@ -3251,107 +3327,119 @@ struct NativeUnifiedGalleryViewer: View {
     items.first(where: { $0.id == currentAssetID })
   }
 
-  private var dragProgress: CGFloat {
-    guard dragOffset != .zero else { return 0 }
-    return min(1.0, max(0.0, abs(dragOffset.height) / 320.0))
-  }
-
-  private var backgroundOpacity: Double {
-    if isDismissing { return 0.0 }
-    return max(0.0, 1.0 - Double(dragProgress * 1.15))
-  }
-
-  private var viewerScale: CGFloat {
-    if isDismissing { return 0.72 }
-    return max(0.75, 1.0 - (abs(dragOffset.height) / 1100.0))
-  }
-
-  private var viewerCornerRadius: CGFloat {
-    guard abs(dragOffset.height) > 6 else { return 0 }
-    return min(24.0, abs(dragOffset.height) / 7.0)
-  }
-
   var body: some View {
     ZStack {
-      NativeClearBackgroundView()
-
-      Color.black
-        .opacity(backgroundOpacity)
-        .ignoresSafeArea()
-
-      if items.isEmpty {
-        Text("当前照片已删除").foregroundColor(.white)
-      } else {
-        TabView(selection: $currentAssetID) {
-          ForEach(items) { item in
-            NativeSingleAssetPage(
-              client: client,
-              device: device,
-              item: item,
-              onZoomChanged: { zoomed in
-                if item.id == currentAssetID { isCurrentImageZoomed = zoomed }
-              },
-              onTap: {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                  showChrome.toggle()
-                }
-              }
-            )
-            .tag(item.id)
-            .ignoresSafeArea()
-          }
-        }
-        .tabViewStyle(.page(indexDisplayMode: .never))
-        .ignoresSafeArea()
-        .offset(
-          x: isDismissing ? 0 : dragOffset.width * 0.35,
-          y: isDismissing ? (UIScreen.main.bounds.height + 150) : max(0, dragOffset.height)
-        )
-        .scaleEffect(viewerScale)
-        .clipShape(RoundedRectangle(cornerRadius: viewerCornerRadius, style: .continuous))
-        .simultaneousGesture(
-          DragGesture(minimumDistance: 6)
-            .onChanged { value in
-              guard !isCurrentImageZoomed, !isDismissing else { return }
-              if !isDraggingToDismiss {
-                if value.translation.height > 8 && abs(value.translation.height) > abs(value.translation.width) * 1.25 {
-                  isDraggingToDismiss = true
-                }
-              }
-              if isDraggingToDismiss {
-                dragOffset = value.translation
-              }
-            }
-            .onEnded { value in
-              guard isDraggingToDismiss, !isDismissing else {
-                isDraggingToDismiss = false
-                dragOffset = .zero
-                return
-              }
-              isDraggingToDismiss = false
-              let velocity = value.predictedEndTranslation.height - value.translation.height
-              let shouldDismiss = value.translation.height > 100 || velocity > 250
-              if shouldDismiss {
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                withAnimation(.easeOut(duration: 0.22)) {
-                  isDismissing = true
-                  dragOffset.height = UIScreen.main.bounds.height + 150
-                }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
-                  dismiss()
-                }
-              } else {
-                withAnimation(.interactiveSpring(response: 0.30, dampingFraction: 0.82)) {
-                  dragOffset = .zero
-                }
-              }
-            }
-        )
+      NativeClearBackgroundView { controller in
+        presentedController.value = controller
       }
 
-      // Top & Bottom Overlay Chrome
-      if showChrome && !isDismissing {
-        VStack {
+      if items.isEmpty {
+        Color.black.ignoresSafeArea()
+        Text("当前照片已删除").foregroundColor(.white)
+      } else {
+        NativeViewerDismissSurface(
+          pager: TabView(selection: $currentAssetID) {
+            ForEach(items) { item in
+              NativeSingleAssetPage(
+                client: client,
+                device: device,
+                item: item,
+                onZoomChanged: { zoomed in
+                  if item.id == currentAssetID { isCurrentImageZoomed = zoomed }
+                },
+                onTap: {
+                  withAnimation(.easeInOut(duration: 0.2)) {
+                    showChrome.toggle()
+                  }
+                }
+              )
+              .tag(item.id)
+              .ignoresSafeArea()
+            }
+          }
+          .tabViewStyle(.page(indexDisplayMode: .never))
+          .ignoresSafeArea(),
+          chrome: viewerChrome,
+          showsChrome: showChrome,
+          isZoomed: isCurrentImageZoomed,
+          onDismiss: {
+            // The page has already flown offscreen. Avoid a second UIKit
+            // fullScreenCover slide that made the release visibly stutter.
+            if let controller = presentedController.value,
+               controller.presentingViewController != nil {
+              controller.dismiss(animated: false) {
+                if let onDismissViewer { onDismissViewer() }
+                else { dismiss() }
+              }
+            } else if let onDismissViewer { onDismissViewer() }
+            else { dismiss() }
+          }
+        )
+      }
+    }
+    .animation(.easeInOut(duration: 0.2), value: showChrome)
+    .confirmationDialog("删除范围", isPresented: $showDeleteScopeDialog, titleVisibility: .visible) {
+      if currentItem?.local != nil {
+        Button("仅删除本地", role: .destructive) {
+          performDeleteItem(scope: .localOnly)
+        }
+      }
+      if currentItem?.server != nil {
+        Button("仅删除云端", role: .destructive) { requestRemoteOnlyDeletion() }
+      }
+      if currentItem?.local != nil && currentItem?.server != nil {
+        Button("全部删除", role: .destructive) {
+          performDeleteItem(scope: .all)
+        }
+      }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("选择要删除的副本；只删除云端时，若本机仍有原件且开启自动备份，照片可能再次上传。")
+    }
+    .alert("确认仅删除云端照片或视频", isPresented: $showViewerRemoteDeleteConfirmation) {
+      Button("取消", role: .cancel) { pendingViewerRemoteDeleteItem = nil }
+      Button("仅删除云端", role: .destructive) {
+        guard let item = pendingViewerRemoteDeleteItem else { return }
+        pendingViewerRemoteDeleteItem = nil
+        performDeleteItem(scope: .remoteOnly, item: item)
+      }
+    } message: { Text("仅删除云端副本，本机副本会保留；若开启自动备份，照片可能再次上传。") }
+    .alert("删除失败", isPresented: Binding(get: { deleteErrorMessage != nil }, set: { if !$0 { deleteErrorMessage = nil } })) {
+      Button("确定", role: .cancel) { deleteErrorMessage = nil }
+    } message: {
+      Text(deleteErrorMessage ?? "未知错误")
+    }
+    .onChange(of: currentAssetID) { newID in
+      isCurrentImageZoomed = false
+      if let item = items.first(where: { $0.id == newID }) { isFavorite = item.isFavorite }
+    }
+    .onDisappear {
+      sharePreparationID = nil
+      shareTask?.cancel()
+      shareTask = nil
+      if let url = shareItem as? URL { try? FileManager.default.removeItem(at: url) }
+      shareItem = nil
+    }
+    .alert("操作结果", isPresented: Binding(get: { viewerMessage != nil }, set: { if !$0 { viewerMessage = nil } })) {
+      Button("好", role: .cancel) { viewerMessage = nil }
+    } message: { Text(viewerMessage ?? "") }
+    .sheet(isPresented: $showInfoSheet) {
+      if let item = currentItem {
+        NativeAssetInfoSheet(client: client, device: device, item: item)
+      }
+    }
+    .sheet(item: Binding<NativeSharePayload?>(
+      get: { shareItem.map { NativeSharePayload(content: $0) } },
+      set: { if $0 == nil { shareItem = nil } }
+    )) { payload in
+      NativeActivityView(activityItems: payload.content)
+    }
+    .statusBarHidden(!showChrome)
+    .modifier(NativeGallerySystemOverlayModifier(isImmersive: !showChrome))
+  }
+
+  private var viewerChrome: some View {
+    VStack {
           // Top Bar
           HStack {
             Button {
@@ -3465,70 +3553,7 @@ struct NativeUnifiedGalleryViewer: View {
           .background(Color.black.opacity(0.65))
           .cornerRadius(24)
           .padding(.bottom, 24)
-        }
-        .opacity(isDraggingToDismiss ? max(0.0, 1.0 - Double(abs(dragOffset.height) / 45.0)) : 1.0)
-        .transition(.opacity)
-      }
     }
-    .animation(.easeInOut(duration: 0.2), value: showChrome)
-    .confirmationDialog("删除范围", isPresented: $showDeleteScopeDialog, titleVisibility: .visible) {
-      if currentItem?.local != nil {
-        Button("仅删除本地", role: .destructive) {
-          performDeleteItem(scope: .localOnly)
-        }
-      }
-      if currentItem?.server != nil {
-        Button("仅删除云端", role: .destructive) { requestRemoteOnlyDeletion() }
-      }
-      if currentItem?.local != nil && currentItem?.server != nil {
-        Button("全部删除", role: .destructive) {
-          performDeleteItem(scope: .all)
-        }
-      }
-      Button("取消", role: .cancel) {}
-    } message: {
-      Text("选择要删除的副本；只删除云端时，若本机仍有原件且开启自动备份，照片可能再次上传。")
-    }
-    .alert("确认仅删除云端照片或视频", isPresented: $showViewerRemoteDeleteConfirmation) {
-      Button("取消", role: .cancel) { pendingViewerRemoteDeleteItem = nil }
-      Button("仅删除云端", role: .destructive) {
-        guard let item = pendingViewerRemoteDeleteItem else { return }
-        pendingViewerRemoteDeleteItem = nil
-        performDeleteItem(scope: .remoteOnly, item: item)
-      }
-    } message: { Text("仅删除云端副本，本机副本会保留；若开启自动备份，照片可能再次上传。") }
-    .alert("删除失败", isPresented: Binding(get: { deleteErrorMessage != nil }, set: { if !$0 { deleteErrorMessage = nil } })) {
-      Button("确定", role: .cancel) { deleteErrorMessage = nil }
-    } message: {
-      Text(deleteErrorMessage ?? "未知错误")
-    }
-    .onChange(of: currentAssetID) { newID in
-      isCurrentImageZoomed = false
-      if let item = items.first(where: { $0.id == newID }) { isFavorite = item.isFavorite }
-    }
-    .onDisappear {
-      sharePreparationID = nil
-      shareTask?.cancel()
-      shareTask = nil
-      if let url = shareItem as? URL { try? FileManager.default.removeItem(at: url) }
-      shareItem = nil
-    }
-    .alert("操作结果", isPresented: Binding(get: { viewerMessage != nil }, set: { if !$0 { viewerMessage = nil } })) {
-      Button("好", role: .cancel) { viewerMessage = nil }
-    } message: { Text(viewerMessage ?? "") }
-    .sheet(isPresented: $showInfoSheet) {
-      if let item = currentItem {
-        NativeAssetInfoSheet(client: client, device: device, item: item)
-      }
-    }
-    .sheet(item: Binding<NativeSharePayload?>(
-      get: { shareItem.map { NativeSharePayload(content: $0) } },
-      set: { if $0 == nil { shareItem = nil } }
-    )) { payload in
-      NativeActivityView(activityItems: payload.content)
-    }
-    .statusBarHidden(!showChrome)
-    .modifier(NativeGallerySystemOverlayModifier(isImmersive: !showChrome))
   }
 
   @ViewBuilder
@@ -3571,11 +3596,15 @@ struct NativeUnifiedGalleryViewer: View {
     Task {
       do {
         try await nativeDeleteGridItems([item], scope: scope, client: client, device: device)
-        await MainActor.run {
-          isDeletingItem = false
-          onDeleteItem?(item, scope)
-          retainViewerAfterDeleting(item, scope: scope)
+        // A deleted local or server copy must not keep the old reverse match.
+        // Do this for album viewers too, which have no onDeleteItem callback.
+        if let local = item.local,
+           scope != .remoteOnly || NativeSyncCacheStore.shared.serverID(for: local.id) == item.server?.id {
+          NativeSyncCacheStore.shared.removeMatches(localIDs: Set([local.id]))
         }
+        isDeletingItem = false
+        onDeleteItem?(item, scope)
+        retainViewerAfterDeleting(item, scope: scope)
       } catch {
         await MainActor.run {
           isDeletingItem = false
@@ -3596,30 +3625,14 @@ struct NativeUnifiedGalleryViewer: View {
       if items.isEmpty { dismiss() }
       return
     }
-    switch scope {
-    case .all:
+    if let remaining = nativeViewerRemainingCopy(of: deletedItem, after: scope) {
+      items[idx] = remaining
+      currentAssetID = remaining.id
+      isFavorite = remaining.isFavorite
+      showChrome = true
+    } else {
       removeCurrentViewerItem(deletingID: deletingID)
-    case .localOnly:
-      if let server = deletedItem.server {
-        let updated = NativeGridItem(server: server, local: nil)
-        items[idx] = updated
-        currentAssetID = updated.id
-        isFavorite = updated.isFavorite
-      } else {
-        removeCurrentViewerItem(deletingID: deletingID)
-      }
-    case .remoteOnly:
-      if let local = deletedItem.local {
-        let updated = NativeGridItem(server: nil, local: local)
-        items[idx] = updated
-        currentAssetID = updated.id
-        isFavorite = updated.isFavorite
-      } else {
-        removeCurrentViewerItem(deletingID: deletingID)
-      }
     }
-    dragOffset = .zero
-    showChrome = true
   }
 
   private func removeCurrentViewerItem(deletingID: String? = nil) {
@@ -3937,7 +3950,12 @@ private struct NativeSingleAssetPage: View {
       })
     }
     .ignoresSafeArea()
-    .task {
+    .task(id: "\(item.local?.id ?? "remote"):\(item.server?.id ?? "none")") {
+      image = nil
+      livePhoto = nil
+      player?.pause()
+      player = nil
+      livePlayer = nil
       await loadAssetContent()
     }
     .onDisappear {

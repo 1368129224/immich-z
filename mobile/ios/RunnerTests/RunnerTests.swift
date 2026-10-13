@@ -162,6 +162,21 @@ final class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeShouldDismissViewerOnDeletion(itemsCountAfterDeletion: 2))
   }
 
+  func testViewerKeepsSurvivingCopyOnSamePage() {
+    let server = NativeAsset(id: "server-asset", date: Date(timeIntervalSince1970: 100),
+                             isImage: true, isFavorite: false, thumbhash: nil)
+    let local = NativeDeviceAsset(id: "local-asset", date: server.date,
+                                  isVideo: false, contentVersion: 1)
+    let merged = NativeGridItem(server: server, local: local)
+    let afterLocalDelete = nativeViewerRemainingCopy(of: merged, after: .localOnly)
+    XCTAssertEqual(afterLocalDelete?.server?.id, server.id)
+    XCTAssertNil(afterLocalDelete?.local)
+    let afterRemoteDelete = nativeViewerRemainingCopy(of: merged, after: .remoteOnly)
+    XCTAssertEqual(afterRemoteDelete?.local?.id, local.id)
+    XCTAssertNil(afterRemoteDelete?.server)
+    XCTAssertNil(nativeViewerRemainingCopy(of: merged, after: .all))
+  }
+
   func testAppVersionIncludesCommitHash() {
     XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2", buildNumber: "82", commit: "bc5cb40"), "0.0.2+82 (bc5cb40)")
     XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2+bc5cb40", buildNumber: "bc5cb40", commit: "bc5cb40"), "0.0.2+bc5cb40")

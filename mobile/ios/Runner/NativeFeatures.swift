@@ -1272,7 +1272,8 @@ struct NativeResultGrid: View {
         client: client,
         device: NativeDeviceLibrary(),
         items: merged,
-        initialItem: item
+        initialItem: item,
+        onDismissViewer: { activeViewerItem = nil }
       )
     }
   }
@@ -1410,6 +1411,15 @@ enum NativeDeleteTargetScope {
   case all
   case localOnly
   case remoteOnly
+}
+
+// A partial deletion keeps the other copy on the very same viewer page.
+func nativeViewerRemainingCopy(of item: NativeGridItem, after scope: NativeDeleteTargetScope) -> NativeGridItem? {
+  switch scope {
+  case .all: return nil
+  case .localOnly: return item.server.map { NativeGridItem(server: $0, local: nil) }
+  case .remoteOnly: return item.local.map { NativeGridItem(server: nil, local: $0) }
+  }
 }
 
 enum NativeDeleteOperationError: LocalizedError {

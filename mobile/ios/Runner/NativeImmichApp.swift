@@ -1641,80 +1641,6 @@ struct NativePhotosView: View {
     }
   }
 
-  private var cachedLaunchPreview: some View {
-    GeometryReader { viewport in
-      let cellWidth = viewport.size.width / CGFloat(max(columns, 1))
-      let rows = Int(ceil(viewport.size.height / max(cellWidth, 1))) + 1
-      let preview = Array(launchViewerItems.suffix(rows * columns))
-      if preview.isEmpty {
-        ProgressView("正在读取照片…")
-          .frame(maxWidth: .infinity, maxHeight: .infinity)
-      } else {
-        var calendar = Calendar.autoupdatingCurrent
-        calendar.timeZone = .autoupdatingCurrent
-        let grouped = Dictionary(grouping: preview) {
-          calendar.startOfDay(for: $0.date)
-        }
-        let days = grouped.keys.sorted()
-        let gridSpacing: CGFloat = columns > 7 ? 1 : 2
-        let cellHeight = (viewport.size.width
-          - CGFloat(columns - 1) * gridSpacing) / CGFloat(columns)
-        let rowCounts = days.map {
-          Int(ceil(Double(grouped[$0, default: []].count) / Double(columns)))
-        }
-        let contentHeight = CGFloat(rowCounts.reduce(0, +)) * cellHeight
-          + CGFloat(rowCounts.reduce(0) { $0 + max(0, $1 - 1) }) * gridSpacing
-          + CGFloat(max(0, days.count - 1)) * 4
-          + (columns > 6 ? CGFloat(days.count) * 20 : 0)
-        let alignment: Alignment = contentHeight > viewport.size.height
-          ? .bottom : .top
-        VStack(spacing: 4) {
-          ForEach(days, id: \.self) { day in
-            VStack(alignment: .leading, spacing: 2) {
-              if columns > 6 {
-                Text(NativeImmichClient.formatChineseDate(day))
-                  .font(.caption2.weight(.bold))
-                  .padding(.horizontal, 4)
-              }
-              LazyVGrid(
-                columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns),
-                spacing: gridSpacing
-              ) {
-                ForEach(grouped[day] ?? []) { entry in
-                  Color(uiColor: .secondarySystemBackground)
-                    .aspectRatio(1, contentMode: .fit)
-                    .overlay {
-                      if let asset = entry.server {
-                        NativeThumbnail(client: client, asset: asset, columns: columns)
-                      } else if let asset = entry.local {
-                        NativeDeviceThumbnail(asset: asset, columns: columns)
-                      }
-                    }
-                    .clipped()
-                    .overlay(alignment: .topLeading) {
-                      if columns <= 6 && entry.id == grouped[day]?.first?.id {
-                        Text(NativeImmichClient.formatChineseDate(day))
-                          .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
-                          .foregroundColor(.white)
-                          .padding(2)
-                          .background(.black.opacity(0.65))
-                          .cornerRadius(3)
-                      }
-                    }
-                    .contentShape(Rectangle())
-                    .onTapGesture { activeViewerItem = entry }
-                }
-              }
-            }
-          }
-        }
-        .fixedSize(horizontal: false, vertical: true)
-        .frame(height: viewport.size.height, alignment: alignment)
-        .clipped()
-      }
-    }
-  }
-
   private func timelineGestureContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
     content
         .coordinateSpace(name: "photosScrollSpace")
@@ -2214,7 +2140,11 @@ struct NativePhotosView: View {
                     .opacity(isInitialTimelineVisible ? 1 : 0)
                     .allowsHitTesting(isInitialTimelineVisible)
                   if !isInitialTimelineVisible {
-                    cachedLaunchPreview
+                    NativeCachedTimelinePreview(
+                      client: client, items: launchViewerItems,
+                      columns: columns,
+                      onTap: { activeViewerItem = $0 }
+                    )
                   }
                 },
                 proxy: proxy
@@ -2851,7 +2781,7 @@ struct NativePhotosView: View {
   }
 }
 
-private struct NativeDayGroup {
+struct NativeDayGroup {
   let date: Date
   let assets: [NativeGridItem]
 }

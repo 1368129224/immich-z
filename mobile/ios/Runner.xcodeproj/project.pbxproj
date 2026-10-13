@@ -11,6 +11,7 @@
 		A41000000000000000000003 /* NativeFeatures.swift in Sources */ = {isa = PBXBuildFile; fileRef = A41000000000000000000004 /* NativeFeatures.swift */; };
 		A41000000000000000000005 /* NativeCloudStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A41000000000000000000006 /* NativeCloudStatus.swift */; };
 		A41000000000000000000007 /* NativeLibrary.swift in Sources */ = {isa = PBXBuildFile; fileRef = A41000000000000000000008 /* NativeLibrary.swift */; };
+		A41000000000000000000009 /* NativeCachedTimelinePreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = A4100000000000000000000A /* NativeCachedTimelinePreview.swift */; };
 		331C808B294A63AB00263BE5 /* RunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 331C807B294A618700263BE5 /* RunnerTests.swift */; };
 		74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74858FAE1ED2DC5600515810 /* AppDelegate.swift */; };
 		97C146FE1CF9000F007C117D /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FD1CF9000F007C117D /* Assets.xcassets */; };
@@ -32,6 +33,7 @@
 		A41000000000000000000004 /* NativeFeatures.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeFeatures.swift; sourceTree = "<group>"; };
 		A41000000000000000000006 /* NativeCloudStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeCloudStatus.swift; sourceTree = "<group>"; };
 		A41000000000000000000008 /* NativeLibrary.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeLibrary.swift; sourceTree = "<group>"; };
+		A4100000000000000000000A /* NativeCachedTimelinePreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeCachedTimelinePreview.swift; sourceTree = "<group>"; };
 		331C807B294A618700263BE5 /* RunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RunnerTests.swift; sourceTree = "<group>"; };
 		331C8081294A63A400263BE5 /* RunnerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RunnerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		74858FAE1ED2DC5600515810 /* AppDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -89,6 +91,7 @@
 				A41000000000000000000004 /* NativeFeatures.swift */,
 				A41000000000000000000006 /* NativeCloudStatus.swift */,
 				A41000000000000000000008 /* NativeLibrary.swift */,
+				A4100000000000000000000A /* NativeCachedTimelinePreview.swift */,
 			);
 			path = Runner;
 			sourceTree = "<group>";
@@ -206,6 +209,7 @@
 				A41000000000000000000003 /* NativeFeatures.swift in Sources */,
 				A41000000000000000000005 /* NativeCloudStatus.swift in Sources */,
 				A41000000000000000000007 /* NativeLibrary.swift in Sources */,
+				A41000000000000000000009 /* NativeCachedTimelinePreview.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -288,7 +292,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 86;
+				CURRENT_PROJECT_VERSION = 87;
 				MARKETING_VERSION = 0.0.2;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;
@@ -466,7 +470,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 86;
+				CURRENT_PROJECT_VERSION = 87;
 				MARKETING_VERSION = 0.0.2;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;
@@ -487,7 +491,7 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
-				CURRENT_PROJECT_VERSION = 86;
+				CURRENT_PROJECT_VERSION = 87;
 				MARKETING_VERSION = 0.0.2;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;

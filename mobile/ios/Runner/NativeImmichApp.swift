@@ -3222,6 +3222,7 @@ struct NativeUnifiedGalleryViewer: View {
               }
             )
             .tag(item.id)
+            .ignoresSafeArea()
           }
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
@@ -3433,7 +3434,7 @@ struct NativeUnifiedGalleryViewer: View {
     )) { payload in
       NativeActivityView(activityItems: payload.content)
     }
-    .statusBarHidden(true)
+    .statusBarHidden(!showChrome)
     .modifier(NativeGallerySystemOverlayModifier(isImmersive: !showChrome))
   }
 
@@ -3796,6 +3797,7 @@ private struct NativeSingleAssetPage: View {
           if isLivePlaying, let livePlayer, livePhoto == nil {
             VideoPlayer(player: livePlayer)
               .frame(width: proxy.size.width, height: proxy.size.height)
+              .ignoresSafeArea()
               .allowsHitTesting(false)
           } else if let livePhoto {
             NativeZoomableLivePhotoView(
@@ -3805,9 +3807,17 @@ private struct NativeSingleAssetPage: View {
               onTap: onTap,
               onZoomChanged: onZoomChanged
             )
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .ignoresSafeArea()
           } else if let image {
-            NativeZoomableImageView(image: image, size: proxy.size, onTap: onTap, onZoomChanged: onZoomChanged)
-              .frame(width: proxy.size.width, height: proxy.size.height)
+            NativeZoomableImageView(
+              image: image,
+              size: proxy.size,
+              onTap: onTap,
+              onZoomChanged: onZoomChanged
+            )
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .ignoresSafeArea()
           } else {
             VStack(spacing: 10) {
               if isLoading { ProgressView().tint(.white) }
@@ -3833,6 +3843,7 @@ private struct NativeSingleAssetPage: View {
         startLivePlayback()
       })
     }
+    .ignoresSafeArea()
     .task {
       await loadAssetContent()
     }
@@ -3974,6 +3985,73 @@ private struct NativeSingleAssetPage: View {
   }
 }
 
+// MARK: - Native Centering Scroll View for Single Assets
+
+final class NativeCenteringScrollView: UIScrollView {
+  var contentTag: Int = 100
+  var assetSize: CGSize = .zero
+  private var lastBoundsSize: CGSize = .zero
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    updateContentSizeAndFrameIfNeeded()
+    centerContent()
+  }
+
+  func updateContentSizeAndFrameIfNeeded() {
+    guard assetSize.width > 0, assetSize.height > 0 else { return }
+    let boundsSize = bounds.size
+    guard boundsSize.width > 0, boundsSize.height > 0 else { return }
+    guard let contentView = viewWithTag(contentTag) else { return }
+
+    if boundsSize != lastBoundsSize && zoomScale <= minimumZoomScale + 0.01 {
+      lastBoundsSize = boundsSize
+      let fitted = nativeAspectFitImageSize(imageSize: assetSize, viewportSize: boundsSize)
+      if fitted != .zero {
+        setZoomScale(minimumZoomScale, animated: false)
+        contentView.frame = CGRect(origin: .zero, size: fitted)
+        contentSize = fitted
+      }
+    }
+  }
+
+  func centerContent() {
+    guard let contentView = viewWithTag(contentTag) else { return }
+    let boundsSize = bounds.size
+    guard boundsSize.width > 0, boundsSize.height > 0 else { return }
+
+    var frameToCenter = contentView.frame
+
+    if frameToCenter.size.width < boundsSize.width {
+      frameToCenter.origin.x = (boundsSize.width - frameToCenter.size.width) / 2.0
+    } else {
+      frameToCenter.origin.x = 0
+    }
+
+    if frameToCenter.size.height < boundsSize.height {
+      frameToCenter.origin.y = (boundsSize.height - frameToCenter.size.height) / 2.0
+    } else {
+      frameToCenter.origin.y = 0
+    }
+
+    contentView.frame = frameToCenter
+  }
+}
+
+// Fit the full image inside the viewer; this is the minimum zoom size.
+func nativeAspectFitImageSize(imageSize: CGSize, viewportSize: CGSize) -> CGSize {
+  guard imageSize.width > 0, imageSize.height > 0,
+        viewportSize.width > 0, viewportSize.height > 0 else { return .zero }
+  let widthRatio = viewportSize.width / imageSize.width
+  let heightRatio = viewportSize.height / imageSize.height
+  // 若长宽比与屏幕极为接近（如截图），直接对齐全屏视口，消除亚像素误差导致的黑边
+  if abs(widthRatio - heightRatio) / max(widthRatio, heightRatio) < 0.008 {
+    return viewportSize
+  }
+  let scale = min(widthRatio, heightRatio)
+  return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+}
+
 // PhotoKit owns the local Live Photo playback and zooming.
 private struct NativeZoomableLivePhotoView: UIViewRepresentable {
   let livePhoto: PHLivePhoto
@@ -3982,15 +4060,19 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
   let onTap: () -> Void
   let onZoomChanged: (Bool) -> Void
 
-  func makeUIView(context: Context) -> UIScrollView {
-    let scrollView = UIScrollView()
+  func makeUIView(context: Context) -> NativeCenteringScrollView {
+    let scrollView = NativeCenteringScrollView()
+    scrollView.contentTag = 101
+    scrollView.assetSize = livePhoto.size
     scrollView.delegate = context.coordinator
     scrollView.maximumZoomScale = 5.0
     scrollView.minimumZoomScale = 1.0
-    scrollView.bouncesZoom = false
+    scrollView.bouncesZoom = true
     scrollView.showsVerticalScrollIndicator = false
     scrollView.showsHorizontalScrollIndicator = false
-    scrollView.backgroundColor = .clear
+    scrollView.contentInsetAdjustmentBehavior = .never
+    scrollView.automaticallyAdjustsScrollIndicatorInsets = false
+    scrollView.backgroundColor = .black
 
     let photoView = PHLivePhotoView()
     photoView.contentMode = .scaleAspectFit
@@ -4010,9 +4092,11 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     return scrollView
   }
 
-  func updateUIView(_ uiView: UIScrollView, context: Context) {
+  func updateUIView(_ uiView: NativeCenteringScrollView, context: Context) {
     context.coordinator.onTap = onTap
     context.coordinator.onZoomChanged = onZoomChanged
+    uiView.contentTag = 101
+    uiView.assetSize = livePhoto.size
     guard let photoView = uiView.viewWithTag(101) as? PHLivePhotoView else { return }
     if photoView.livePhoto !== livePhoto { photoView.livePhoto = livePhoto }
     if isPlaying && !context.coordinator.wasPlaying {
@@ -4022,16 +4106,15 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     }
     context.coordinator.wasPlaying = isPlaying
 
-    let fittedSize = nativeAspectFitImageSize(imageSize: livePhoto.size, viewportSize: size)
-    guard fittedSize != .zero else { return }
-    let sizeChanged = photoView.bounds.size != fittedSize
-    if sizeChanged {
+    let viewportSize = uiView.bounds.size == .zero ? size : uiView.bounds.size
+    let fittedSize = nativeAspectFitImageSize(imageSize: livePhoto.size, viewportSize: viewportSize)
+    if fittedSize != .zero && photoView.bounds.size != fittedSize {
       uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
       photoView.frame = CGRect(origin: .zero, size: fittedSize)
       uiView.contentSize = fittedSize
       onZoomChanged(false)
     }
-    context.coordinator.centerView(in: uiView)
+    uiView.centerContent()
   }
 
   func makeCoordinator() -> Coordinator {
@@ -4052,26 +4135,13 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
       scrollView.viewWithTag(101)
     }
 
-    func centerView(in scrollView: UIScrollView) {
-      guard let view = scrollView.viewWithTag(101) else { return }
-      let contentWidth = view.bounds.width * scrollView.zoomScale
-      let contentHeight = view.bounds.height * scrollView.zoomScale
-      let viewport = scrollView.bounds.size
-      scrollView.contentInset = UIEdgeInsets(
-        top: max(0, (viewport.height - contentHeight) / 2),
-        left: max(0, (viewport.width - contentWidth) / 2),
-        bottom: max(0, (viewport.height - contentHeight) / 2),
-        right: max(0, (viewport.width - contentWidth) / 2)
-      )
-    }
-
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
-      centerView(in: scrollView)
+      (scrollView as? NativeCenteringScrollView)?.centerContent()
       onZoomChanged(scrollView.zoomScale > scrollView.minimumZoomScale + 0.01)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
-      centerView(in: scrollView)
+      (scrollView as? NativeCenteringScrollView)?.centerContent()
       onZoomChanged(scale > scrollView.minimumZoomScale + 0.01)
     }
 
@@ -4093,14 +4163,6 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
   }
 }
 
-// Fit the full image inside the viewer; this is the minimum zoom size.
-func nativeAspectFitImageSize(imageSize: CGSize, viewportSize: CGSize) -> CGSize {
-  guard imageSize.width > 0, imageSize.height > 0,
-        viewportSize.width > 0, viewportSize.height > 0 else { return .zero }
-  let scale = min(viewportSize.width / imageSize.width, viewportSize.height / imageSize.height)
-  return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
-}
-
 // Pinch to zoom and double tap zoomable container
 private struct NativeZoomableImageView: UIViewRepresentable {
   let image: UIImage
@@ -4108,12 +4170,14 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   let onTap: () -> Void
   let onZoomChanged: (Bool) -> Void
 
-  func makeUIView(context: Context) -> UIScrollView {
-    let scrollView = UIScrollView()
+  func makeUIView(context: Context) -> NativeCenteringScrollView {
+    let scrollView = NativeCenteringScrollView()
+    scrollView.contentTag = 100
+    scrollView.assetSize = image.size
     scrollView.delegate = context.coordinator
     scrollView.maximumZoomScale = 5.0
     scrollView.minimumZoomScale = 1.0
-    scrollView.bouncesZoom = false
+    scrollView.bouncesZoom = true
     scrollView.showsVerticalScrollIndicator = false
     scrollView.showsHorizontalScrollIndicator = false
     scrollView.contentInsetAdjustmentBehavior = .never
@@ -4137,23 +4201,27 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     return scrollView
   }
 
-  func updateUIView(_ uiView: UIScrollView, context: Context) {
+  func updateUIView(_ uiView: NativeCenteringScrollView, context: Context) {
     context.coordinator.onTap = onTap
     context.coordinator.onZoomChanged = onZoomChanged
+    uiView.contentTag = 100
+    uiView.assetSize = image.size
+
     guard let imageView = uiView.viewWithTag(100) as? UIImageView else { return }
+    let imageChanged = imageView.image !== image
+    if imageChanged {
+      imageView.image = image
+    }
+
     let viewportSize = uiView.bounds.size == .zero ? size : uiView.bounds.size
     let fittedSize = nativeAspectFitImageSize(imageSize: image.size, viewportSize: viewportSize)
-    guard fittedSize != .zero else { return }
-    let imageChanged = imageView.image !== image
-    let sizeChanged = imageView.bounds.size != fittedSize
-    if imageChanged || sizeChanged {
+    if fittedSize != .zero && (imageChanged || imageView.bounds.size != fittedSize) {
       uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
-      imageView.image = image
       imageView.frame = CGRect(origin: .zero, size: fittedSize)
       uiView.contentSize = fittedSize
       onZoomChanged(false)
     }
-    context.coordinator.centerImage(in: uiView)
+    uiView.centerContent()
   }
 
   func makeCoordinator() -> Coordinator {
@@ -4173,45 +4241,13 @@ private struct NativeZoomableImageView: UIViewRepresentable {
       scrollView.viewWithTag(100)
     }
 
-    func centerImage(in scrollView: UIScrollView) {
-      guard let imageView = scrollView.viewWithTag(100) as? UIImageView else { return }
-      let contentWidth = imageView.bounds.width * scrollView.zoomScale
-      let contentHeight = imageView.bounds.height * scrollView.zoomScale
-      let viewport = scrollView.bounds.size
-      let centeringInset = UIEdgeInsets(
-        top: max(0, (viewport.height - contentHeight) / 2),
-        left: max(0, (viewport.width - contentWidth) / 2),
-        bottom: max(0, (viewport.height - contentHeight) / 2),
-        right: max(0, (viewport.width - contentWidth) / 2)
-      )
-      if scrollView.contentInset != centeringInset {
-        scrollView.contentInset = centeringInset
-      }
-
-      // Updating contentInset doesn't reliably move the initial contentOffset on UIKit.
-      // Clamp to the inset-defined range: for content smaller than the viewport, both
-      // limits resolve to the centered negative inset rather than the upper-left corner.
-      let minOffsetX = -centeringInset.left
-      let maxOffsetX = max(minOffsetX, contentWidth - viewport.width + centeringInset.right)
-      let minOffsetY = -centeringInset.top
-      let maxOffsetY = max(minOffsetY, contentHeight - viewport.height + centeringInset.bottom)
-      let centeredOffset = CGPoint(
-        x: min(max(scrollView.contentOffset.x, minOffsetX), maxOffsetX),
-        y: min(max(scrollView.contentOffset.y, minOffsetY), maxOffsetY)
-      )
-      if abs(scrollView.contentOffset.x - centeredOffset.x) > 0.5
-        || abs(scrollView.contentOffset.y - centeredOffset.y) > 0.5 {
-        scrollView.setContentOffset(centeredOffset, animated: false)
-      }
-    }
-
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
-      centerImage(in: scrollView)
+      (scrollView as? NativeCenteringScrollView)?.centerContent()
       onZoomChanged(scrollView.zoomScale > scrollView.minimumZoomScale + 0.01)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
-      centerImage(in: scrollView)
+      (scrollView as? NativeCenteringScrollView)?.centerContent()
       onZoomChanged(scale > scrollView.minimumZoomScale + 0.01)
     }
 

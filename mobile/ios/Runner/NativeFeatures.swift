@@ -41,6 +41,33 @@ func nativeShouldKeepTimelineAtBottom(
   isBootstrapping && !userMovedTimeline && !pendingSourceChange && hasAssets
 }
 
+func nativeShouldIgnoreTimelineDragDuringBootstrap(
+  isBootstrapping: Bool,
+  elapsedSinceBootstrapStart: TimeInterval,
+  minimumBootstrapSettleTime: TimeInterval = 0.8
+) -> Bool {
+  isBootstrapping && elapsedSinceBootstrapStart < minimumBootstrapSettleTime
+}
+
+func nativeViewerNextSelectionID(
+  deletingID: String,
+  orderedIDs: [String]
+) -> String? {
+  guard let idx = orderedIDs.firstIndex(of: deletingID) else { return nil }
+  if idx + 1 < orderedIDs.count {
+    return orderedIDs[idx + 1]
+  } else if idx - 1 >= 0 {
+    return orderedIDs[idx - 1]
+  }
+  return nil
+}
+
+func nativeShouldDismissViewerOnDeletion(
+  itemsCountAfterDeletion: Int
+) -> Bool {
+  itemsCountAfterDeletion <= 0
+}
+
 func nativeFormattedAppVersion(
   shortVersion: String,
   buildNumber: String,

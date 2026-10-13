@@ -28,6 +28,23 @@ final class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: false))
   }
 
+  func testTimelineIgnoresDragDuringEarlyBootstrap() {
+    XCTAssertTrue(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: true, elapsedSinceBootstrapStart: 0.2))
+    XCTAssertFalse(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: true, elapsedSinceBootstrapStart: 1.0))
+    XCTAssertFalse(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: false, elapsedSinceBootstrapStart: 0.2))
+  }
+
+  func testViewerNextSelectionIDWhenDeleting() {
+    let ids = ["a", "b", "c"]
+    XCTAssertEqual(nativeViewerNextSelectionID(deletingID: "b", orderedIDs: ids), "c")
+    XCTAssertEqual(nativeViewerNextSelectionID(deletingID: "c", orderedIDs: ids), "b")
+    XCTAssertEqual(nativeViewerNextSelectionID(deletingID: "a", orderedIDs: ids), "b")
+    XCTAssertNil(nativeViewerNextSelectionID(deletingID: "single", orderedIDs: ["single"]))
+    XCTAssertNil(nativeViewerNextSelectionID(deletingID: "missing", orderedIDs: ids))
+    XCTAssertTrue(nativeShouldDismissViewerOnDeletion(itemsCountAfterDeletion: 0))
+    XCTAssertFalse(nativeShouldDismissViewerOnDeletion(itemsCountAfterDeletion: 2))
+  }
+
   func testAppVersionIncludesCommitHash() {
     XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2", buildNumber: "82", commit: "bc5cb40"), "0.0.2+82 (bc5cb40)")
     XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2+bc5cb40", buildNumber: "bc5cb40", commit: "bc5cb40"), "0.0.2+bc5cb40")

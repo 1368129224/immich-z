@@ -1062,6 +1062,7 @@ struct NativePhotosView: View {
   @State private var pendingSourceChangeScroll = false
   @State private var hasInitialScrolled = false
   @State private var isBootstrappingTimeline = true
+  @State private var timelineBootstrapStartTime = Date()
   @State private var initialRemoteLoaded = false
   @State private var lastForegroundRefreshTime: Date = .distantPast
   @State private var needsForegroundRefresh = false
@@ -1488,12 +1489,15 @@ struct NativePhotosView: View {
             .onChanged { drag in
               if !isSelecting {
                 if abs(drag.translation.height) > 12 {
-                  isBootstrappingTimeline = false
-                  userMovedTimeline = true
-                  bottomPositionTask?.cancel()
-                  bottomPositionTask = nil
-                  pendingSourceChangeScroll = false
-                  if !didInitialPosition { didInitialPosition = true }
+                  let elapsed = Date().timeIntervalSince(timelineBootstrapStartTime)
+                  if !nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: isBootstrappingTimeline, elapsedSinceBootstrapStart: elapsed) {
+                    isBootstrappingTimeline = false
+                    userMovedTimeline = true
+                    bottomPositionTask?.cancel()
+                    bottomPositionTask = nil
+                    pendingSourceChangeScroll = false
+                    if !didInitialPosition { didInitialPosition = true }
+                  }
                 }
                 return
               }
@@ -1612,6 +1616,7 @@ struct NativePhotosView: View {
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onAppear {
+          timelineBootstrapStartTime = Date()
           rebuildDayGroups()
           refreshExcludedLocalAssetIDs()
           refreshExcludedServerAssetIDs()
@@ -1852,6 +1857,8 @@ struct NativePhotosView: View {
             items: cachedDayGroups.flatMap(\.assets),
             initialItem: item,
             onDeleteItem: { deletedItem, scope in
+              let previousAssetIDs = cachedDayGroups.flatMap(\.assets).map(\.id)
+              let fallbackID = nativeViewerNextSelectionID(deletingID: deletedItem.id, orderedIDs: previousAssetIDs)
               if scope == .all || scope == .remoteOnly {
                 if let sid = deletedItem.server?.id { model.removeAssets(ids: [sid]) }
                 if let local = deletedItem.local,
@@ -1861,6 +1868,12 @@ struct NativePhotosView: View {
               }
               device.refresh()
               rebuildDayGroups()
+              if let fallbackID,
+                 let fallbackItem = cachedDayGroups.flatMap(\.assets).first(where: { $0.id == fallbackID }) {
+                activeViewerItem = fallbackItem
+              } else {
+                activeViewerItem = nil
+              }
             },
             onServerAssetUpdated: { model.upsert($0) },
             onServerAssetArchived: { model.removeAssets(ids: [$0]) }
@@ -2733,7 +2746,7 @@ struct NativeUnifiedGalleryViewer: View {
   var onServerAssetArchived: ((String) -> Void)? = nil
 
   @Environment(\.dismiss) private var dismiss
-  @State private var currentIndex: Int = 0
+  @State private var currentAssetID: String
   @State private var showChrome = true
   @State private var isCurrentImageZoomed = false
   @State private var showInfoSheet = false
@@ -2770,14 +2783,16 @@ struct NativeUnifiedGalleryViewer: View {
     self.onDeleteItem = onDeleteItem
     self.onServerAssetUpdated = onServerAssetUpdated
     self.onServerAssetArchived = onServerAssetArchived
-    let index = items.firstIndex(where: { $0.id == initialItem.id }) ?? 0
-    _currentIndex = State(initialValue: index)
+    _currentAssetID = State(initialValue: initialItem.id)
     _isFavorite = State(initialValue: initialItem.isFavorite)
   }
 
+  private var currentIndex: Int {
+    items.firstIndex(where: { $0.id == currentAssetID }) ?? 0
+  }
+
   private var currentItem: NativeGridItem? {
-    guard items.indices.contains(currentIndex) else { return nil }
-    return items[currentIndex]
+    items.first(where: { $0.id == currentAssetID })
   }
 
   var body: some View {
@@ -2787,14 +2802,14 @@ struct NativeUnifiedGalleryViewer: View {
       if items.isEmpty {
         Text("当前照片已删除").foregroundColor(.white)
       } else {
-        TabView(selection: $currentIndex) {
-          ForEach(items.indices, id: \.self) { idx in
+        TabView(selection: $currentAssetID) {
+          ForEach(items) { item in
             NativeSingleAssetPage(
               client: client,
               device: device,
-              item: items[idx],
+              item: item,
               onZoomChanged: { zoomed in
-                if idx == currentIndex { isCurrentImageZoomed = zoomed }
+                if item.id == currentAssetID { isCurrentImageZoomed = zoomed }
               },
               onTap: {
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -2802,8 +2817,7 @@ struct NativeUnifiedGalleryViewer: View {
                 }
               }
             )
-            .id(items[idx].id)
-            .tag(idx)
+            .tag(item.id)
           }
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
@@ -2985,9 +2999,9 @@ struct NativeUnifiedGalleryViewer: View {
     } message: {
       Text(deleteErrorMessage ?? "未知错误")
     }
-    .onChange(of: currentIndex) { newIdx in
+    .onChange(of: currentAssetID) { newID in
       isCurrentImageZoomed = false
-      if items.indices.contains(newIdx) { isFavorite = items[newIdx].isFavorite }
+      if let item = items.first(where: { $0.id == newID }) { isFavorite = item.isFavorite }
     }
     .onDisappear {
       sharePreparationID = nil
@@ -3077,36 +3091,57 @@ struct NativeUnifiedGalleryViewer: View {
   }
 
   private func retainViewerAfterDeleting(_ deletedItem: NativeGridItem, scope: NativeDeleteTargetScope) {
-    guard items.indices.contains(currentIndex) else { return }
+    let deletingID = deletedItem.id
+    guard let idx = items.firstIndex(where: { $0.id == deletingID }) else {
+      if items.isEmpty { dismiss() }
+      return
+    }
     switch scope {
     case .all:
-      removeCurrentViewerItem()
+      removeCurrentViewerItem(deletingID: deletingID)
     case .localOnly:
       if let server = deletedItem.server {
-        items[currentIndex] = NativeGridItem(server: server, local: nil)
+        let updated = NativeGridItem(server: server, local: nil)
+        items[idx] = updated
+        currentAssetID = updated.id
+        isFavorite = updated.isFavorite
       } else {
-        removeCurrentViewerItem()
+        removeCurrentViewerItem(deletingID: deletingID)
       }
     case .remoteOnly:
       if let local = deletedItem.local {
-        items[currentIndex] = NativeGridItem(server: nil, local: local)
+        let updated = NativeGridItem(server: nil, local: local)
+        items[idx] = updated
+        currentAssetID = updated.id
+        isFavorite = updated.isFavorite
       } else {
-        removeCurrentViewerItem()
+        removeCurrentViewerItem(deletingID: deletingID)
       }
     }
-    if items.indices.contains(currentIndex) { isFavorite = items[currentIndex].isFavorite }
     dragOffset = .zero
     showChrome = true
   }
 
-  private func removeCurrentViewerItem() {
-    guard items.indices.contains(currentIndex) else { return }
-    items.remove(at: currentIndex)
-    if items.isEmpty {
-      currentIndex = 0
-    } else {
-      currentIndex = min(currentIndex, items.count - 1)
-      isFavorite = items[currentIndex].isFavorite
+  private func removeCurrentViewerItem(deletingID: String? = nil) {
+    let targetID = deletingID ?? currentAssetID
+    guard let idx = items.firstIndex(where: { $0.id == targetID }) else {
+      if items.isEmpty { dismiss() }
+      return
+    }
+    let allIDs = items.map(\.id)
+    let nextID = nativeViewerNextSelectionID(deletingID: targetID, orderedIDs: allIDs)
+    items.remove(at: idx)
+    if nativeShouldDismissViewerOnDeletion(itemsCountAfterDeletion: items.count) {
+      dismiss()
+      return
+    }
+    if let nextID, items.contains(where: { $0.id == nextID }) {
+      currentAssetID = nextID
+    } else if let first = items.first {
+      currentAssetID = first.id
+    }
+    if let current = currentItem {
+      isFavorite = current.isFavorite
     }
   }
 
@@ -3115,11 +3150,13 @@ struct NativeUnifiedGalleryViewer: View {
     do {
       try await client.updateVisibility(ids: [server.id], visibility: "archive")
       onServerAssetArchived?(server.id)
-      if let local = item.local {
-        items[currentIndex] = NativeGridItem(server: nil, local: local)
-        isFavorite = local.isFavorite
+      if let local = item.local, let idx = items.firstIndex(where: { $0.id == item.id }) {
+        let updated = NativeGridItem(server: nil, local: local)
+        items[idx] = updated
+        currentAssetID = updated.id
+        isFavorite = updated.isFavorite
       } else {
-        removeCurrentViewerItem()
+        removeCurrentViewerItem(deletingID: item.id)
       }
       viewerMessage = "已归档云端副本；本机副本保留。"
     } catch { viewerMessage = "归档失败：\(error.localizedDescription)" }
@@ -3167,8 +3204,9 @@ struct NativeUnifiedGalleryViewer: View {
       }
       if serverUpdated, let updatedServer { onServerAssetUpdated?(updatedServer) }
       if let index = items.firstIndex(where: { $0.id == item.id }) {
-        items[index] = NativeGridItem(server: updatedServer, local: updatedLocal)
-        if index == currentIndex {
+        let updated = NativeGridItem(server: updatedServer, local: updatedLocal)
+        items[index] = updated
+        if updated.id == currentAssetID {
           isFavorite = updatedServer?.isFavorite == true || updatedLocal?.isFavorite == true
         }
       }

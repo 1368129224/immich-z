@@ -26,6 +26,7 @@ final class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: true, pendingSourceChange: false, hasAssets: true))
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: true, hasAssets: true))
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: false))
+    XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: true, positioningInProgress: true))
   }
 
   func testAlbumOrdersOldestAboveNewest() {
@@ -39,12 +40,6 @@ final class RunnerTests: XCTestCase {
       nativeSortedResultDays([older, newer], oldestFirst: false),
       [newer, older]
     )
-  }
-
-  func testTimelineIgnoresDragDuringEarlyBootstrap() {
-    XCTAssertTrue(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: true, elapsedSinceBootstrapStart: 0.2))
-    XCTAssertFalse(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: true, elapsedSinceBootstrapStart: 1.0))
-    XCTAssertFalse(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: false, elapsedSinceBootstrapStart: 0.2))
   }
 
   func testViewerNextSelectionIDWhenDeleting() {

@@ -1062,7 +1062,7 @@ struct NativePhotosView: View {
   @State private var pendingSourceChangeScroll = false
   @State private var hasInitialScrolled = false
   @State private var isBootstrappingTimeline = true
-  @State private var timelineBootstrapStartTime = Date()
+  @State private var isInitialTimelineVisible = false
   @State private var initialRemoteLoaded = false
   @State private var lastForegroundRefreshTime: Date = .distantPast
   @State private var needsForegroundRefresh = false
@@ -1246,6 +1246,7 @@ struct NativePhotosView: View {
           isSelecting = true
           selectedIDs.removeAll()
         }
+        .disabled(!isInitialTimelineVisible)
         .font(.system(size: 14, weight: .medium))
         .buttonStyle(.plain)
         .padding(.horizontal, 5)
@@ -1262,9 +1263,11 @@ struct NativePhotosView: View {
           showSyncSettings = true
         } label: {
           cloudSyncStatusIcon
+            .frame(width: 28, height: 28)
         }
         .frame(width: 36, height: 40)
         .buttonStyle(.plain)
+        .accessibilityLabel("同步状态")
       }
       .fixedSize(horizontal: true, vertical: false)
     }
@@ -1294,29 +1297,26 @@ struct NativePhotosView: View {
     }
   }
 
-  @ViewBuilder
+  private var cloudSyncBadgeName: String {
+    if model.error != nil || cloud.failedCount > 0 { return "xmark" }
+    if cloud.isRunning { return "arrow.clockwise" }
+    if unknownLocalCount > 0 { return "questionmark" }
+    if unsyncedLocalCount > 0 { return "line.diagonal" }
+    return "checkmark"
+  }
+
   private var cloudSyncStatusIcon: some View {
-    if model.error != nil || cloud.failedCount > 0 {
-      Image(systemName: "xmark.icloud")
-        .font(.system(size: 16, weight: .medium))
-        .foregroundColor(.secondary)
-    } else if cloud.isRunning {
-      Image(systemName: "arrow.clockwise.icloud")
-        .font(.system(size: 16, weight: .medium))
-        .foregroundColor(.secondary)
-    } else if unknownLocalCount > 0 {
-      Image(systemName: "questionmark.icloud")
-        .font(.system(size: 16, weight: .medium))
-        .foregroundColor(.secondary)
-    } else if unsyncedLocalCount > 0 {
-      Image(systemName: "icloud.slash")
-        .font(.system(size: 16, weight: .medium))
-        .foregroundColor(.secondary.opacity(0.6))
-    } else {
-      Image(systemName: "checkmark.icloud")
-        .font(.system(size: 16, weight: .medium))
-        .foregroundColor(.secondary)
-    }
+    Image(systemName: "icloud")
+      .font(.system(size: 18, weight: .medium))
+      .foregroundColor(.secondary)
+      .overlay(alignment: .bottomTrailing) {
+        Image(systemName: cloudSyncBadgeName)
+          .font(.system(size: 9, weight: .bold))
+          .foregroundColor(.secondary)
+          .padding(1)
+          .background(Color(uiColor: .systemBackground), in: Circle())
+          .offset(x: 5, y: 4)
+      }
   }
 
   private func formatDateBadge(for group: NativeDayGroup) -> String {
@@ -1500,16 +1500,15 @@ struct NativePhotosView: View {
           DragGesture(minimumDistance: 4, coordinateSpace: .named("photosScrollSpace"))
             .onChanged { drag in
               if !isSelecting {
+                // The loading overlay is not a user scroll of the photo grid.
+                guard isInitialTimelineVisible else { return }
                 if abs(drag.translation.height) > 12 {
-                  let elapsed = Date().timeIntervalSince(timelineBootstrapStartTime)
-                  if !nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: isBootstrappingTimeline, elapsedSinceBootstrapStart: elapsed) {
-                    isBootstrappingTimeline = false
-                    userMovedTimeline = true
-                    bottomPositionTask?.cancel()
-                    bottomPositionTask = nil
-                    pendingSourceChangeScroll = false
-                    if !didInitialPosition { didInitialPosition = true }
-                  }
+                  isBootstrappingTimeline = false
+                  userMovedTimeline = true
+                  bottomPositionTask?.cancel()
+                  bottomPositionTask = nil
+                  pendingSourceChangeScroll = false
+                  if !didInitialPosition { didInitialPosition = true }
                 }
                 return
               }
@@ -1586,9 +1585,11 @@ struct NativePhotosView: View {
           positionAtLatestAfterSourceChange(proxy: proxy)
         }
         .refreshable {
+          guard isInitialTimelineVisible else { return }
           bottomPositionTask?.cancel()
           bottomPositionTask = nil
           isBootstrappingTimeline = false
+          isInitialTimelineVisible = true
           device.refresh()
           await model.refreshLatest()
           rebuildDayGroups()
@@ -1628,7 +1629,6 @@ struct NativePhotosView: View {
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onAppear {
-          timelineBootstrapStartTime = Date()
           rebuildDayGroups()
           refreshExcludedLocalAssetIDs()
           refreshExcludedServerAssetIDs()
@@ -1685,7 +1685,14 @@ struct NativePhotosView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
           guard needsForegroundRefresh, !isSelecting else { return }
           needsForegroundRefresh = false
-          isBootstrappingTimeline = false
+          if !isInitialTimelineVisible {
+            bottomPositionTask?.cancel()
+            bottomPositionTask = nil
+            hasInitialScrolled = false
+            positionInitiallyIfReady(proxy: proxy)
+          } else {
+            isBootstrappingTimeline = false
+          }
           let now = Date()
           guard now.timeIntervalSince(lastForegroundRefreshTime) > 2 else { return }
           lastForegroundRefreshTime = now
@@ -1773,6 +1780,7 @@ struct NativePhotosView: View {
                   }
                 }
                 .buttonStyle(.plain)
+                .disabled(!isInitialTimelineVisible)
 
                 Text("\(totalDisplayCount) 项")
                   .font(.caption)
@@ -1788,7 +1796,8 @@ struct NativePhotosView: View {
                 ForEach(NativePhotosSource.allCases) { source in Text(source.rawValue).tag(source) }
               }
               .pickerStyle(.segmented)
-              .frame(maxWidth: 230)
+              // Leave room for both server and sync buttons on narrow iPhones.
+              .frame(width: min(142, UIScreen.main.bounds.width * 0.34))
               .accessibilityLabel("照片来源")
             }
           }
@@ -1899,7 +1908,17 @@ struct NativePhotosView: View {
         timelineModalContent(
           timelineChromeContent(
             timelineLifecycleContent(
-              timelineGestureContent(ScrollView { timelineGridContent(proxy: proxy) }, proxy: proxy),
+              timelineGestureContent(
+                ZStack {
+                  ScrollView { timelineGridContent(proxy: proxy) }
+                    .opacity(isInitialTimelineVisible ? 1 : 0)
+                    .allowsHitTesting(isInitialTimelineVisible)
+                  if !isInitialTimelineVisible {
+                    ProgressView("正在加载照片…")
+                  }
+                },
+                proxy: proxy
+              ),
               proxy: proxy
             ),
             proxy: proxy
@@ -2156,7 +2175,7 @@ struct NativePhotosView: View {
   }
 
   private func triggerRefresh(proxy _: ScrollViewProxy) {
-    guard !isRefreshing else { return }
+    guard isInitialTimelineVisible, !isRefreshing else { return }
     isBootstrappingTimeline = false
     isRefreshing = true
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
@@ -2188,17 +2207,23 @@ struct NativePhotosView: View {
     let expectedSource = sourceFilter
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
       guard pendingSourceChangeScroll, !userMovedTimeline, sourceFilter == expectedSource else { return }
-      if let targetAssetID = cachedDayGroups.last?.assets.last?.id {
-        withAnimation(.none) { proxy.scrollTo(targetAssetID, anchor: .bottom) }
-      }
-      withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
       pendingSourceChangeScroll = false
+      if !isInitialTimelineVisible {
+        // A source switch during cold start still needs the hidden layout
+        // settling passes before the new timeline becomes visible.
+        scrollToBottom(proxy: proxy, animated: false)
+      } else {
+        if let targetAssetID = cachedDayGroups.last?.assets.last?.id {
+          withAnimation(.none) { proxy.scrollTo(targetAssetID, anchor: .bottom) }
+        }
+        withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+      }
     }
   }
 
   private func positionInitiallyIfReady(proxy: ScrollViewProxy) {
-    guard !hasInitialScrolled, !userMovedTimeline else { return }
-    guard !cachedDayGroups.isEmpty else { return }
+    guard !hasInitialScrolled, !userMovedTimeline,
+          isBootstrappingTimeline else { return }
     guard nativeInitialTimelineReady(
       source: sourceFilter,
       remoteLoaded: initialRemoteLoaded,
@@ -2206,6 +2231,12 @@ struct NativePhotosView: View {
       localSnapshotLoaded: device.hasLoadedInitialSnapshot,
       localLoading: device.isLoading
     ) else { return }
+    if cachedDayGroups.isEmpty {
+      isInitialTimelineVisible = true
+      isBootstrappingTimeline = false
+      didInitialPosition = true
+      return
+    }
     scrollToBottom(proxy: proxy, animated: false, initial: true)
   }
 
@@ -2214,12 +2245,15 @@ struct NativePhotosView: View {
       isBootstrapping: isBootstrappingTimeline,
       userMovedTimeline: userMovedTimeline,
       pendingSourceChange: pendingSourceChangeScroll,
-      hasAssets: !cachedDayGroups.isEmpty
+      hasAssets: !cachedDayGroups.isEmpty,
+      positioningInProgress: bottomPositionTask != nil
     ) else { return }
     if !hasInitialScrolled {
       positionInitiallyIfReady(proxy: proxy)
       return
     }
+    // Asset and match publications can arrive during layout. The running
+    // task reads the latest target on each pass; do not restart it.
     scrollToBottom(proxy: proxy, animated: false, initial: true)
   }
 
@@ -2236,7 +2270,6 @@ struct NativePhotosView: View {
     bottomPositionTask?.cancel()
     bottomPositionRequest += 1
     let request = bottomPositionRequest
-    let targetAssetID = cachedDayGroups.last?.assets.last?.id
     // LazyVStack estimates heights for off-screen days. Revisit its bottom
     // after layout materializes them, rather than trusting a single scrollTo.
     bottomPositionTask = Task { @MainActor in
@@ -2244,7 +2277,7 @@ struct NativePhotosView: View {
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000) }
         guard !Task.isCancelled, request == bottomPositionRequest, !userMovedTimeline,
               !initial || (isBootstrappingTimeline && !pendingSourceChangeScroll) else { return }
-        if let targetAssetID {
+        if let targetAssetID = cachedDayGroups.last?.assets.last?.id {
           if animated && index == 0 {
             withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(targetAssetID, anchor: .bottom) }
           } else {
@@ -2258,7 +2291,13 @@ struct NativePhotosView: View {
         }
         didInitialPosition = true
       }
-      if request == bottomPositionRequest { bottomPositionTask = nil }
+      if request == bottomPositionRequest {
+        bottomPositionTask = nil
+        if !isInitialTimelineVisible {
+          isBootstrappingTimeline = false
+          isInitialTimelineVisible = true
+        }
+      }
     }
   }
 

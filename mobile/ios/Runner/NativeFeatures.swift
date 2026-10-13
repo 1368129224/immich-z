@@ -36,17 +36,11 @@ func nativeShouldKeepTimelineAtBottom(
   isBootstrapping: Bool,
   userMovedTimeline: Bool,
   pendingSourceChange: Bool,
-  hasAssets: Bool
+  hasAssets: Bool,
+  positioningInProgress: Bool = false
 ) -> Bool {
-  isBootstrapping && !userMovedTimeline && !pendingSourceChange && hasAssets
-}
-
-func nativeShouldIgnoreTimelineDragDuringBootstrap(
-  isBootstrapping: Bool,
-  elapsedSinceBootstrapStart: TimeInterval,
-  minimumBootstrapSettleTime: TimeInterval = 0.8
-) -> Bool {
-  isBootstrapping && elapsedSinceBootstrapStart < minimumBootstrapSettleTime
+  isBootstrapping && !userMovedTimeline && !pendingSourceChange &&
+    hasAssets && !positioningInProgress
 }
 
 func nativeViewerNextSelectionID(

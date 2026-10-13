@@ -328,7 +328,7 @@ final class NativeCloudStatus: ObservableObject {
       return
     }
     guard !running, accountIdentity != nil, NativeSyncCacheStore.shared.identity == accountIdentity else { return }
-    let toCheck = assets.filter { matchedServerIDs[$0.id] == nil && (allowNetwork || !failedIDs.contains($0.id)) }
+    let toCheck = assets.reversed().filter { matchedServerIDs[$0.id] == nil && (allowNetwork || !failedIDs.contains($0.id)) }
     guard !toCheck.isEmpty else { return }
 
     running = true

@@ -1212,6 +1212,7 @@ struct NativePhotosView: View {
   @State private var didInitialPosition = false
   @State private var userMovedTimeline = false
   @State private var hydrationTask: Task<Void, Never>?
+  @State private var cloudCheckTask: Task<Void, Never>?
   @State private var bottomPositionTask: Task<Void, Never>?
   @State private var bottomPositionRetryCount = 0
   @State private var bottomPositionRequest = 0
@@ -1279,6 +1280,10 @@ struct NativePhotosView: View {
     let excludedLocalIDs = cachedExcludedLocalIDs
     var seenServer = Set<String>()
     var result = [NativeGridItem]()
+
+    let unmatchedServers = model.assets.filter { serverToLocal[$0.id] == nil }
+    let serverBySec = nativeIndexAssetsBySecond(unmatchedServers)
+
     for local in device.assets where localExclusionsReady {
       let item: NativeGridItem
       if let serverID = matched[local.id] {
@@ -1293,8 +1298,14 @@ struct NativePhotosView: View {
         seenServer.insert(serverID)
         if excludedServerAssetIDs.contains(serverID) { continue }
         if sourceFilter == .server && archivedServerIDs.contains(serverID) { continue }
+      } else if let heuristicServer = nativeFindHeuristicServerMatch(local: local, serverBySecond: serverBySec, usedServerIDs: seenServer) {
+        guard serverExclusionsReady else { continue }
+        item = NativeGridItem(server: heuristicServer, local: local)
+        seenServer.insert(heuristicServer.id)
+        if excludedServerAssetIDs.contains(heuristicServer.id) { continue }
+        if sourceFilter == .server && archivedServerIDs.contains(heuristicServer.id) { continue }
       } else { item = NativeGridItem(server: nil, local: local) }
-      if nativePhotosSourceIncludes(sourceFilter, hasLocal: item.local != nil, hasServer: item.server != nil, hasVerifiedMatch: matched[local.id] != nil),
+      if nativePhotosSourceIncludes(sourceFilter, hasLocal: item.local != nil, hasServer: item.server != nil, hasVerifiedMatch: matched[local.id] != nil || item.server != nil),
          !excludedLocalIDs.contains(local.id) {
         result.append(item)
       }
@@ -1766,11 +1777,13 @@ struct NativePhotosView: View {
           if !serverExclusionsReady { refreshExcludedServerAssetIDs() }
           rebuildDayGroups()
           scheduleMatchedHydration()
+          scheduleBackgroundCloudCheck()
         }
         .onChange(of: device.assets.count) { _ in
           rebuildDayGroups()
           positionInitiallyIfReady(proxy: proxy)
           keepBottomUntilUserScrolls(proxy: proxy)
+          scheduleBackgroundCloudCheck()
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onChange(of: device.hasLoadedInitialSnapshot) { _ in
@@ -1868,6 +1881,7 @@ struct NativePhotosView: View {
         .onChange(of: isInitialTimelineVisible) { visible in
           guard visible, needsInitialBackgroundRefresh else { return }
           needsInitialBackgroundRefresh = false
+          scheduleBackgroundCloudCheck()
           Task(priority: .utility) {
             await model.refreshLatest()
             rebuildDayGroups()
@@ -1906,6 +1920,8 @@ struct NativePhotosView: View {
           bottomPositionTask = nil
           hydrationTask?.cancel()
           hydrationTask = nil
+          cloudCheckTask?.cancel()
+          cloudCheckTask = nil
           excludedLocalRefreshTask?.cancel()
           excludedLocalRefreshTask = nil
           excludedServerRefreshTask?.cancel()
@@ -1925,6 +1941,7 @@ struct NativePhotosView: View {
           let now = Date()
           guard now.timeIntervalSince(lastForegroundRefreshTime) > 2 else { return }
           lastForegroundRefreshTime = now
+          scheduleBackgroundCloudCheck()
           Task(priority: .utility) {
             // The existing grid stays interactive while the metadata reloads.
             device.refresh()
@@ -2176,6 +2193,15 @@ struct NativePhotosView: View {
       try? await Task.sleep(nanoseconds: 1_500_000_000)
       guard !Task.isCancelled else { return }
       await loadKnownMatchedServerAssets()
+    }
+  }
+
+  private func scheduleBackgroundCloudCheck() {
+    cloudCheckTask?.cancel()
+    cloudCheckTask = Task(priority: .utility) {
+      try? await Task.sleep(nanoseconds: 1_000_000_000)
+      guard !Task.isCancelled, !cloud.isRunning else { return }
+      await cloud.check(device.assets, client: client)
     }
   }
 

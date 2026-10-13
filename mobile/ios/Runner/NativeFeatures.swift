@@ -95,6 +95,42 @@ func nativePhotosSourceIncludes(_ source: NativePhotosSource, hasLocal: Bool, ha
   }
 }
 
+func nativeIndexAssetsBySecond(_ assets: [NativeAsset]) -> [Int64: [NativeAsset]] {
+  var dict: [Int64: [NativeAsset]] = [:]
+  for asset in assets {
+    let sec = Int64(asset.date.timeIntervalSince1970)
+    dict[sec, default: []].append(asset)
+  }
+  return dict
+}
+
+func nativeFindHeuristicServerMatch(
+  local: NativeDeviceAsset,
+  serverBySecond: [Int64: [NativeAsset]],
+  usedServerIDs: Set<String>
+) -> NativeAsset? {
+  let localSec = Int64(local.date.timeIntervalSince1970)
+  var candidateMatch: NativeAsset? = nil
+  var bestDiff: TimeInterval = 2.01
+
+  for s in (localSec - 2)...(localSec + 2) {
+    guard let bucket = serverBySecond[s] else { continue }
+    for candidate in bucket {
+      guard !usedServerIDs.contains(candidate.id) else { continue }
+      guard local.isVideo == !candidate.isImage else { continue }
+      let diff = abs(local.date.timeIntervalSince(candidate.date))
+      if diff <= 2.0 && diff < bestDiff {
+        if local.isLivePhoto && candidate.livePhotoVideoId == nil && candidateMatch?.livePhotoVideoId != nil {
+          continue
+        }
+        bestDiff = diff
+        candidateMatch = candidate
+      }
+    }
+  }
+  return candidateMatch
+}
+
 func nativePhotosSelectionActionAvailability(_ items: [NativeGridItem]) -> (server: Int, local: Int, merged: Int) {
   let server = items.filter { $0.server != nil }.count
   let local = items.filter { $0.local != nil }.count
@@ -974,10 +1010,16 @@ struct NativeResultGrid: View {
     var items: [NativeGridItem] = []
     items.reserveCapacity(assets.count + localAssets.count)
 
+    let unmatchedServers = assets.filter { !matched.values.contains($0.id) }
+    let serverBySec = nativeIndexAssetsBySecond(unmatchedServers)
+
     for localAsset in localAssets {
       if let serverID = matched[localAsset.id], let serverAsset = serverById[serverID] {
         items.append(NativeGridItem(server: serverAsset, local: localAsset))
         usedServerIDs.insert(serverAsset.id)
+      } else if let heuristicServer = nativeFindHeuristicServerMatch(local: localAsset, serverBySecond: serverBySec, usedServerIDs: usedServerIDs) {
+        items.append(NativeGridItem(server: heuristicServer, local: localAsset))
+        usedServerIDs.insert(heuristicServer.id)
       } else {
         items.append(NativeGridItem(server: nil, local: localAsset))
       }

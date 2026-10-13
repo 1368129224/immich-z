@@ -49,7 +49,7 @@ func nativeTimelineBottomReached(
   tolerance: CGFloat = 2
 ) -> Bool {
   guard !anchorFrame.isNull, !viewportFrame.isNull else { return false }
-  return anchorFrame.maxY >= viewportFrame.minY - tolerance &&
+  return anchorFrame.maxY >= viewportFrame.maxY - tolerance &&
     anchorFrame.maxY <= viewportFrame.maxY + tolerance
 }
 
@@ -176,11 +176,43 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
   @Published private(set) var albums: [NativeDeviceAlbum] = []
   @Published private(set) var isLoading = false
   @Published private(set) var hasLoadedInitialSnapshot = false
+  @Published private(set) var hasCompletedLiveRefresh = false
   private var refreshGeneration = 0
   private var isObserving = false
+  private let accountIdentity = NativeSyncCacheStore.shared.identity
 
   override init() {
     super.init()
+    let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+    authorized = status == .authorized || status == .limited
+    if status == .authorized,
+       let snapshot = NativePhotoSnapshotStore.shared.device(identity: accountIdentity) {
+      assets = snapshot.assets
+      albums = snapshot.albums
+      hasLoadedInitialSnapshot = true
+    } else if authorized {
+      // Limited-library selection may have changed outside the app. Query
+      // current PhotoKit permissions instead of exposing stale cached IDs.
+      // On the first launch after upgrading, get only a small recent window;
+      // the complete PhotoKit scan still runs off the first rendered frame.
+      let options = PHFetchOptions()
+      options.fetchLimit = 96
+      options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+      let results = PHAsset.fetchAssets(with: options)
+      var recent: [NativeDeviceAsset] = []
+      results.enumerateObjects { item, _, _ in
+        recent.append(NativeDeviceAsset(
+          id: item.localIdentifier,
+          date: item.creationDate ?? .distantPast,
+          isVideo: item.mediaType == .video,
+          isLivePhoto: item.mediaSubtypes.contains(.photoLive),
+          contentVersion: Int((item.modificationDate?.timeIntervalSince1970 ?? 0) * 1000),
+          isFavorite: item.isFavorite
+        ))
+      }
+      assets = Array(recent.reversed())
+      hasLoadedInitialSnapshot = true
+    }
   }
 
   nonisolated func photoLibraryDidChange(_ changeInstance: PHChange) {
@@ -209,10 +241,13 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
       isObserving = true
     }
     guard authorized else {
+      refreshGeneration += 1
       assets = []
       albums = []
+      NativePhotoSnapshotStore.shared.clearDevice(expectedIdentity: accountIdentity)
       isLoading = false
       hasLoadedInitialSnapshot = true
+      hasCompletedLiveRefresh = true
       return
     }
     refreshGeneration += 1
@@ -246,10 +281,20 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
       }.value
       guard let self, self.refreshGeneration == generation else { return }
       await MainActor.run {
+        guard self.refreshGeneration == generation else { return }
+        let currentStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard currentStatus == .authorized || currentStatus == .limited else {
+          self.refresh()
+          return
+        }
         self.assets = library.0
         self.albums = library.1
+        NativePhotoSnapshotStore.shared.saveDevice(NativeDeviceSnapshot(
+          assets: library.0, albums: library.1
+        ), expectedIdentity: self.accountIdentity)
         self.isLoading = false
         self.hasLoadedInitialSnapshot = true
+        self.hasCompletedLiveRefresh = true
       }
     }
   }
@@ -395,7 +440,7 @@ final class NativeDeviceLibrary: NSObject, ObservableObject, PHPhotoLibraryChang
   }
 }
 
-struct NativeDeviceAsset: Identifiable, Sendable {
+struct NativeDeviceAsset: Identifiable, Sendable, Codable {
   let id: String
   let date: Date
   let isVideo: Bool
@@ -404,7 +449,7 @@ struct NativeDeviceAsset: Identifiable, Sendable {
   var isFavorite: Bool = false
 }
 
-struct NativeDeviceAlbum: Identifiable, Sendable {
+struct NativeDeviceAlbum: Identifiable, Sendable, Codable {
   let id: String
   let name: String
   let count: Int
@@ -442,8 +487,15 @@ struct NativeDeviceThumbnail: View {
         image = cached
         return
       }
-      guard !Task.isCancelled,
-            let source = PHAsset.fetchAssets(withLocalIdentifiers: [asset.id], options: nil).firstObject else { return }
+      guard !Task.isCancelled else { return }
+      guard let source = PHAsset.fetchAssets(
+        withLocalIdentifiers: [asset.id], options: nil
+      ).firstObject else {
+        NativeBackgroundDiagnostics.shared.record(
+          "本机缩略图", category: "缓存照片未在系统相册中找到"
+        )
+        return
+      }
       let options = PHImageRequestOptions()
       options.isNetworkAccessAllowed = true
       options.deliveryMode = .opportunistic
@@ -455,9 +507,14 @@ struct NativeDeviceThumbnail: View {
         contentMode: .aspectFill,
         options: options
       ) { result, info in
-        guard info?[PHImageCancelledKey] as? Bool != true,
-              info?[PHImageErrorKey] == nil,
-              let result else { return }
+        guard info?[PHImageCancelledKey] as? Bool != true else { return }
+        if let error = info?[PHImageErrorKey] as? Error {
+          Task { @MainActor in
+            NativeBackgroundDiagnostics.shared.record("本机缩略图", error: error)
+          }
+          return
+        }
+        guard let result else { return }
         Task { @MainActor in
           guard requestToken == token else { return }
           NativeLocalThumbnailCache.images.setObject(result, forKey: key, cost: Int(result.size.width * result.size.height * 4))
@@ -2622,6 +2679,9 @@ private struct NativeLibraryView: View {
             }
           }
         }
+        Section("调试") {
+          Button("后台诊断与错误记录") { showDebugSheet = true }
+        }
         Section {
           HStack {
             Spacer()
@@ -2639,11 +2699,18 @@ private struct NativeLibraryView: View {
       }
       .navigationTitle("设置")
       .sheet(isPresented: $showDebugSheet) {
-        NativePerformanceDebugView(client: client, device: device, matchedAssetDiagnostics: matchedAssetDiagnostics)
+        NativePerformanceDebugView(
+          client: client, device: device,
+          matchedAssetDiagnostics: matchedAssetDiagnostics,
+          backgroundDiagnostics: .shared
+        )
       }
       .task {
         do { features = try await client.send(path: "server/features") }
-        catch { features = [:] }
+        catch {
+          features = [:]
+          NativeBackgroundDiagnostics.shared.record("读取服务器功能", error: error)
+        }
       }
     }.navigationViewStyle(.stack)
   }
@@ -2655,6 +2722,7 @@ struct NativePerformanceDebugView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
   @ObservedObject var matchedAssetDiagnostics: NativeMatchedAssetDiagnostics
+  @ObservedObject var backgroundDiagnostics: NativeBackgroundDiagnostics
   @Environment(\.dismiss) private var dismiss
 
   @State private var isRunningBenchmarks = false
@@ -2760,6 +2828,27 @@ struct NativePerformanceDebugView: View {
         }
 
         Section {
+          if backgroundDiagnostics.entries.isEmpty {
+            Text("暂无后台错误").foregroundColor(.secondary)
+          }
+          ForEach(backgroundDiagnostics.entries) { event in
+            VStack(alignment: .leading, spacing: 4) {
+              HStack {
+                Text(event.operation).font(.subheadline.weight(.medium))
+                Spacer()
+                Text(event.date, style: .relative)
+                  .font(.caption).foregroundColor(.secondary)
+              }
+              Text(event.category).font(.caption).foregroundColor(.secondary)
+            }
+          }
+          Text("仅保存错误类别、操作名称及时间；不记录照片 ID、服务器响应或登录凭据。")
+            .font(.caption).foregroundColor(.secondary)
+        } header: {
+          Text("后台错误记录")
+        }
+
+        Section {
           HStack { Text("尝试请求"); Spacer(); Text("\(matchedAssetDiagnostics.attempted) 次") }
           HStack { Text("成功加载"); Spacer(); Text("\(matchedAssetDiagnostics.loaded) 项") }
           HStack { Text("正在请求"); Spacer(); Text("\(matchedAssetDiagnostics.pending) 项") }
@@ -2846,6 +2935,7 @@ struct NativePerformanceDebugView: View {
         Alert(title: Text("提示"), message: Text(alertMessage ?? ""), dismissButton: .default(Text("好")))
       }
       .task {
+        backgroundDiagnostics.configureForCurrentAccount()
         await runDiagnostics()
       }
     }

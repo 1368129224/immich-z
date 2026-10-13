@@ -223,6 +223,77 @@ private enum NativeAPIError: LocalizedError {
   }
 }
 
+struct NativeBackgroundDiagnostic: Identifiable, Codable {
+  let id: UUID
+  let date: Date
+  let operation: String
+  let category: String
+}
+
+// Only sanitized categories are persisted. Never store server responses,
+// credentials, asset identifiers, or raw localized error descriptions.
+@MainActor
+final class NativeBackgroundDiagnostics: ObservableObject {
+  static let shared = NativeBackgroundDiagnostics()
+  @Published private(set) var entries: [NativeBackgroundDiagnostic] = []
+  private var identity: String?
+
+  private init() { configureForCurrentAccount() }
+
+  func configureForCurrentAccount() {
+    let current = NativeSyncCacheStore.shared.identity
+    guard current != identity else { return }
+    identity = current
+    entries = NativePhotoSnapshotStore.shared.diagnostics(identity: current)
+  }
+
+  func record(_ operation: String, category: String) {
+    configureForCurrentAccount()
+    if entries.contains(where: {
+      $0.operation == operation && $0.category == category &&
+        Date().timeIntervalSince($0.date) < 60
+    }) { return }
+    entries.insert(NativeBackgroundDiagnostic(
+      id: UUID(), date: Date(), operation: operation, category: category
+    ), at: 0)
+    if entries.count > 30 { entries = Array(entries.prefix(30)) }
+    if identity != nil {
+      NativePhotoSnapshotStore.shared.saveDiagnostics(
+        entries, expectedIdentity: identity
+      )
+    }
+  }
+
+  func record(_ operation: String, error: Error) {
+    let category: String
+    if let api = error as? NativeAPIError {
+      switch api {
+      case .unauthorized: category = "身份认证失败"
+      case let .http(code, _): category = "HTTP \(code)"
+      case .invalidJSON: category = "服务器响应格式错误"
+      case .invalidResponse: category = "服务器响应异常"
+      case .invalidServer: category = "服务器地址无效"
+      }
+    } else if let urlError = error as? URLError {
+      switch urlError.code {
+      case .timedOut: category = "网络超时"
+      case .notConnectedToInternet, .cannotConnectToHost,
+           .cannotFindHost, .networkConnectionLost, .dnsLookupFailed:
+        category = "网络连接失败"
+      default: category = "网络错误 \(urlError.code.rawValue)"
+      }
+    } else {
+      category = "后台请求失败"
+    }
+    record(operation, category: category)
+  }
+
+  func clear() {
+    entries = []
+    identity = nil
+  }
+}
+
 // Session-scoped diagnostics for verified matches whose server DTO is not yet
 // available in the timeline. Never expose asset IDs or raw server responses.
 @MainActor
@@ -664,7 +735,7 @@ private extension Array {
   subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }
 
-struct NativeBucket: Identifiable {
+struct NativeBucket: Identifiable, Codable {
   let id: String
   let count: Int
 }
@@ -682,7 +753,7 @@ func nativeBoundaryAfterFetchingHead(old: [NativeBucket], next: Int, refreshed: 
   max(min(headSize, refreshed.count), nativeRefreshedBucketBoundary(old: old, next: next, refreshed: refreshed))
 }
 
-struct NativeAsset: Identifiable {
+struct NativeAsset: Identifiable, Codable {
   let id: String
   let date: Date
   let isImage: Bool
@@ -701,17 +772,28 @@ struct NativeAsset: Identifiable {
 
 // MARK: - SwiftUI app and login
 
+@MainActor
 struct NativeImmichRootView: View {
   @State private var config: NativeServerConfig?
-  @State private var restoring = true
   @State private var restoreError: String?
+
+  init() {
+    let saved = NativeSessionStore.read()
+    if let saved, saved.credential != nil {
+      NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: saved.userId)
+      NativeBackgroundDiagnostics.shared.configureForCurrentAccount()
+      _config = State(initialValue: saved)
+    } else {
+      _config = State(initialValue: nil)
+    }
+  }
 
   var body: some View {
     Group {
-      if restoring {
-        ProgressView("正在恢复登录状态…")
-      } else if let config {
+      if let config {
         NativeTabShell(client: NativeImmichClient(config: config)) {
+          NativeBackgroundDiagnostics.shared.clear()
+          NativePhotoSnapshotStore.shared.clearCurrentAccount()
           NativeSyncCacheStore.shared.clear()
           NativeSessionStore.clear()
           self.config = nil
@@ -723,37 +805,26 @@ struct NativeImmichRootView: View {
       }
     }
     .task {
-      guard restoring else { return }
-      if let saved = NativeSessionStore.read(), saved.credential != nil {
-        // A locally verified identity can restore its cache immediately. Never
-        // block the first frame on /users/me or discard an offline session.
-        NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: saved.userId)
-        config = saved
-        restoring = false
-        Task(priority: .utility) {
-          do {
-            let userID = try await NativeImmichClient(config: saved).verifiedUserID()
-            guard config?.credential == saved.credential else { return }
-            if saved.userId != userID {
-              NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: userID)
-              // The account identity changes the shell's view identity.
-              var verified = saved
-              verified.userId = userID
-              try? NativeSessionStore.save(verified)
-              config = verified
-            }
-          } catch {
-            guard config?.credential == saved.credential else { return }
-            if let apiError = error as? NativeAPIError, case .unauthorized = apiError {
-              NativeSyncCacheStore.shared.clear()
-              NativeSessionStore.clear()
-              config = nil
-            }
-            restoreError = error.localizedDescription
-          }
+      guard let saved = config, saved.credential != nil else { return }
+      // Restore the verified cache before the first frame. Session validation
+      // runs independently and never blocks the cached photo timeline.
+      do {
+        let userID = try await NativeImmichClient(config: saved).verifiedUserID()
+        guard config?.credential == saved.credential else { return }
+        if saved.userId != userID {
+          NativeSyncCacheStore.shared.configure(server: saved.serverUrl, userId: userID)
+          NativeBackgroundDiagnostics.shared.configureForCurrentAccount()
+          var verified = saved
+          verified.userId = userID
+          try? NativeSessionStore.save(verified)
+          config = verified
         }
-      } else {
-        restoring = false
+      } catch {
+        guard config?.credential == saved.credential else { return }
+        NativeBackgroundDiagnostics.shared.record("验证登录状态", error: error)
+        // Authentication and connectivity errors must not delete offline
+        // metadata. Only an explicit Logout clears the account's cache.
+        restoreError = error.localizedDescription
       }
     }
   }
@@ -858,6 +929,7 @@ private struct NativeLoginView: View {
         : try await NativeImmichClient.login(server: server, email: email, password: password)
       try NativeSessionStore.save(value)
       NativeSyncCacheStore.shared.configure(server: value.serverUrl, userId: value.userId)
+      NativeBackgroundDiagnostics.shared.configureForCurrentAccount()
       onLogin(value)
     } catch {
       loginError = error.localizedDescription
@@ -874,15 +946,48 @@ private final class NativeTimelineModel: ObservableObject {
   @Published private(set) var hasOlder = true
   @Published private(set) var newlyAddedCount = 0
   @Published var error: String?
+  private(set) var hasCachedSnapshot = false
 
   private let client: NativeImmichClient
+  private let accountIdentity: String?
   private var buckets: [NativeBucket] = []
   private var nextBucket = 0
   private var searchFallbackEnabled = false
   private var searchCursor: String?
+  private var pendingSnapshotSave: Task<Void, Never>?
   private let pageSize = 8
 
-  init(client: NativeImmichClient) { self.client = client }
+  init(client: NativeImmichClient) {
+    self.client = client
+    accountIdentity = NativeSyncCacheStore.shared.identity
+    if let snapshot = NativePhotoSnapshotStore.shared.timeline(identity: accountIdentity) {
+      hasCachedSnapshot = true
+      assets = snapshot.assets.sorted { $0.date < $1.date }
+      buckets = snapshot.buckets
+      nextBucket = min(snapshot.nextBucket, snapshot.buckets.count)
+      searchFallbackEnabled = snapshot.searchFallbackEnabled
+      searchCursor = snapshot.searchCursor
+      hasOlder = snapshot.hasOlder
+    }
+  }
+
+  private func persistSnapshot() {
+    NativePhotoSnapshotStore.shared.saveTimeline(NativeTimelineSnapshot(
+      assets: assets, buckets: buckets, nextBucket: nextBucket,
+      searchFallbackEnabled: searchFallbackEnabled,
+      searchCursor: searchCursor, hasOlder: hasOlder
+    ), expectedIdentity: accountIdentity)
+  }
+
+  private func scheduleSnapshotSave() {
+    pendingSnapshotSave?.cancel()
+    pendingSnapshotSave = Task { @MainActor [weak self] in
+      try? await Task.sleep(nanoseconds: 500_000_000)
+      guard !Task.isCancelled else { return }
+      self?.persistSnapshot()
+      self?.pendingSnapshotSave = nil
+    }
+  }
 
   func loadInitial() async {
     guard !isLoading else { return }
@@ -912,10 +1017,12 @@ private final class NativeTimelineModel: ObservableObject {
         refreshed: buckets, headSize: pageSize
       )
       hasOlder = nextBucket < buckets.count
+      persistSnapshot()
       // Older buckets load only after the user scrolls towards them.
     } catch {
       // Some compatible Immich servers or reverse proxies return a non-JSON
       // timeline response. Keep Photos usable via the standard metadata search.
+      NativeBackgroundDiagnostics.shared.record("时间线接口", error: error)
       do {
         searchFallbackEnabled = true
         searchCursor = nil
@@ -929,6 +1036,7 @@ private final class NativeTimelineModel: ObservableObject {
         searchCursor = existingSearchCursor
         hasOlder = existingSearchFallback ? existingSearchCursor != nil : existingNextBucket < existingBuckets.count
         self.error = error.localizedDescription
+        NativeBackgroundDiagnostics.shared.record("时间线初次加载", error: error)
       }
     }
   }
@@ -967,8 +1075,27 @@ private final class NativeTimelineModel: ObservableObject {
         hasOlder = nextBucket < buckets.count
       }
       error = nil
+      persistSnapshot()
     } catch {
-      // Keep the already loaded timeline visible if foreground refresh fails.
+      NativeBackgroundDiagnostics.shared.record("时间线接口", error: error)
+      if !searchFallbackEnabled {
+        let previousCursor = searchCursor
+        let existingIDs = Set(assets.map(\.id))
+        searchFallbackEnabled = true
+        searchCursor = nil
+        do {
+          try await loadSearchFallbackPage()
+          newlyAddedCount = assets.filter { !existingIDs.contains($0.id) }.count
+          return
+        } catch {
+          searchFallbackEnabled = false
+          searchCursor = previousCursor
+          self.error = error.localizedDescription
+          NativeBackgroundDiagnostics.shared.record("时间线后台刷新", error: error)
+          return
+        }
+      }
+      // Keep the cached timeline visible when both API paths are unavailable.
       self.error = error.localizedDescription
     }
   }
@@ -982,7 +1109,10 @@ private final class NativeTimelineModel: ObservableObject {
       error = nil
       if searchFallbackEnabled { try await loadSearchFallbackPage() }
       else { try await loadNextPage() }
-    } catch { self.error = error.localizedDescription }
+    } catch {
+      self.error = error.localizedDescription
+      NativeBackgroundDiagnostics.shared.record("加载更早照片", error: error)
+    }
   }
 
   func retry() async {
@@ -997,6 +1127,7 @@ private final class NativeTimelineModel: ObservableObject {
     searchCursor = page.next
     hasOlder = page.next != nil
     error = nil
+    persistSnapshot()
   }
 
   private func loadNextPage() async throws {
@@ -1012,16 +1143,19 @@ private final class NativeTimelineModel: ObservableObject {
     hasOlder = nextBucket < buckets.count
     var seen = Set<String>()
     assets = (assets + result).filter { seen.insert($0.id).inserted }.sorted { $0.date < $1.date }
+    persistSnapshot()
   }
 
   func removeAssets(ids: Set<String>) {
     assets.removeAll { ids.contains($0.id) }
+    persistSnapshot()
   }
 
   func upsert(_ asset: NativeAsset) {
     assets.removeAll { $0.id == asset.id }
     assets.append(asset)
     assets.sort { $0.date < $1.date }
+    scheduleSnapshotSave()
   }
 
   func acknowledgeNewAssets() { newlyAddedCount = 0 }
@@ -1032,6 +1166,7 @@ struct NativePhotosView: View {
   @ObservedObject var device: NativeDeviceLibrary
   let onLogout: () -> Void
   let matchedAssetDiagnostics: NativeMatchedAssetDiagnostics
+  private let accountIdentity: String?
   @StateObject private var model: NativeTimelineModel
   @StateObject private var cloud = NativeCloudStatus()
   @State private var columns: Int = 4
@@ -1040,9 +1175,14 @@ struct NativePhotosView: View {
   @State private var loadingMatchedServerIDs = Set<String>()
   @State private var sourceFilter: NativePhotosSource = .all
   @State private var cachedDayGroups: [NativeDayGroup] = []
+  @State private var launchPreviewItems: [NativeGridItem]?
   @State private var cachedFirstGroupDatesInMonth = Set<Date>()
   @State private var cachedExcludedLocalIDs = Set<String>()
+  @State private var localExclusionsReady = true
+  @State private var serverExclusionsReady = true
   @State private var excludedLocalRefreshTask: Task<Void, Never>?
+  @State private var excludedServerRefreshTask: Task<Void, Never>?
+  @State private var excludedServerRefreshGeneration = 0
   @AppStorage("immichz_photos_excluded_local_album_ids") private var excludedLocalAlbumIDsRaw = "[]"
   @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerAlbumIDsRaw = "[]"
   @State private var excludedServerAssetIDs = Set<String>()
@@ -1065,6 +1205,7 @@ struct NativePhotosView: View {
   @State private var hasInitialScrolled = false
   @State private var isBootstrappingTimeline = true
   @State private var isInitialTimelineVisible = false
+  @State private var needsInitialBackgroundRefresh = false
   @State private var initialRemoteLoaded = false
   @State private var lastForegroundRefreshTime: Date = .distantPast
   @State private var needsForegroundRefresh = false
@@ -1103,6 +1244,24 @@ struct NativePhotosView: View {
     self.device = device
     self.onLogout = onLogout
     self.matchedAssetDiagnostics = matchedAssetDiagnostics
+    accountIdentity = NativeSyncCacheStore.shared.identity
+    let snapshot = NativePhotoSnapshotStore.shared.exclusions(identity: accountIdentity)
+    let localAlbums = nativePhotosExcludedAlbumIDs(from:
+      UserDefaults.standard.string(forKey: "immichz_photos_excluded_local_album_ids") ?? "[]"
+    )
+    let serverAlbums = nativePhotosExcludedAlbumIDs(from:
+      UserDefaults.standard.string(forKey: "immichz_photos_excluded_server_album_ids") ?? "[]"
+    )
+    let localReady = localAlbums.isEmpty || snapshot?.localAlbumIDs == localAlbums
+    let serverReady = serverAlbums.isEmpty || snapshot?.serverAlbumIDs == serverAlbums
+    _cachedExcludedLocalIDs = State(initialValue:
+      localAlbums.isEmpty ? [] : (localReady ? snapshot?.localAssetIDs ?? [] : [])
+    )
+    _excludedServerAssetIDs = State(initialValue:
+      serverAlbums.isEmpty ? [] : (serverReady ? snapshot?.serverAssetIDs ?? [] : [])
+    )
+    _localExclusionsReady = State(initialValue: localReady)
+    _serverExclusionsReady = State(initialValue: serverReady)
     _model = StateObject(wrappedValue: NativeTimelineModel(client: client))
   }
 
@@ -1120,9 +1279,10 @@ struct NativePhotosView: View {
     let excludedLocalIDs = cachedExcludedLocalIDs
     var seenServer = Set<String>()
     var result = [NativeGridItem]()
-    for local in device.assets {
+    for local in device.assets where localExclusionsReady {
       let item: NativeGridItem
       if let serverID = matched[local.id] {
+        guard serverExclusionsReady else { continue }
         if let server = serverByID[serverID] {
           item = NativeGridItem(server: server, local: local)
         } else {
@@ -1139,9 +1299,10 @@ struct NativePhotosView: View {
         result.append(item)
       }
     }
-    if sourceFilter != .device {
+    if sourceFilter != .device && serverExclusionsReady {
       for server in model.assets where !seenServer.contains(server.id) && !archivedServerIDs.contains(server.id) {
         if excludedServerAssetIDs.contains(server.id) { continue }
+        if !localExclusionsReady && serverToLocal[server.id] != nil { continue }
         if let localID = serverToLocal[server.id], excludedLocalIDs.contains(localID) { continue }
         let local = serverToLocal[server.id].flatMap { localByID[$0] }
         result.append(NativeGridItem(server: server, local: local))
@@ -1153,17 +1314,38 @@ struct NativePhotosView: View {
     }
   }
 
+  private func saveExcludedSnapshotIfReady() {
+    guard localExclusionsReady, serverExclusionsReady else { return }
+    NativePhotoSnapshotStore.shared.saveExclusions(
+      NativeTimelineExclusionsSnapshot(
+        localAlbumIDs: nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw),
+        serverAlbumIDs: nativePhotosExcludedAlbumIDs(from: excludedServerAlbumIDsRaw),
+        localAssetIDs: cachedExcludedLocalIDs,
+        serverAssetIDs: excludedServerAssetIDs
+      ), expectedIdentity: accountIdentity
+    )
+  }
+
   private func refreshExcludedLocalAssetIDs() {
     excludedLocalRefreshTask?.cancel()
     let albumIDs = nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw)
     guard !albumIDs.isEmpty else {
       cachedExcludedLocalIDs = []
+      localExclusionsReady = true
+      saveExcludedSnapshotIfReady()
       rebuildDayGroups()
       return
     }
     let albums = device.albums.filter { albumIDs.contains($0.id) }
     guard !albums.isEmpty else {
-      // Keep the previous exclusions until PhotoKit finishes loading albums.
+      // Wait for the full album scan, then resolve deleted/inaccessible albums
+      // as empty rather than hiding every local photo indefinitely.
+      if device.hasCompletedLiveRefresh && !device.isLoading {
+        cachedExcludedLocalIDs = []
+        localExclusionsReady = true
+        saveExcludedSnapshotIfReady()
+        rebuildDayGroups()
+      }
       return
     }
     excludedLocalRefreshTask = Task(priority: .utility) {
@@ -1179,8 +1361,11 @@ struct NativePhotosView: View {
         }
         return result
       }.value
-      guard !Task.isCancelled, albumIDs == nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw) else { return }
+      guard !Task.isCancelled, accountIdentity == NativeSyncCacheStore.shared.identity,
+            albumIDs == nativePhotosExcludedAlbumIDs(from: excludedLocalAlbumIDsRaw) else { return }
       cachedExcludedLocalIDs = ids
+      localExclusionsReady = true
+      saveExcludedSnapshotIfReady()
       rebuildDayGroups()
     }
   }
@@ -1314,27 +1499,8 @@ struct NativePhotosView: View {
     return NativeImmichClient.formatChineseDate(group.date, includeDay: !isFirstInMonth)
   }
 
-  @ViewBuilder
-  private func newPhotosBanner(proxy: ScrollViewProxy) -> some View {
-    if model.newlyAddedCount > 0 && sourceFilter != .device {
-      Button {
-        model.acknowledgeNewAssets()
-        scrollToBottom(proxy: proxy, animated: true)
-      } label: {
-        Text("有 \(model.newlyAddedCount) 项新照片 · 查看最新")
-          .font(.caption.weight(.medium))
-          .frame(maxWidth: .infinity)
-          .padding(.vertical, 8)
-          .background(.thinMaterial, in: Capsule())
-      }
-      .padding(.horizontal)
-      .buttonStyle(.plain)
-    }
-  }
-
   private func timelineGridContent(proxy: ScrollViewProxy) -> some View {
           LazyVStack(spacing: 4) {
-            newPhotosBanner(proxy: proxy)
             if sourceFilter != .device && model.hasOlder && !model.assets.isEmpty {
               Button {
                 requestOlder()
@@ -1346,21 +1512,12 @@ struct NativePhotosView: View {
               .padding(.vertical, 16)
               .disabled(loadingOlderAnchor != nil || model.isLoading)
             }
-            if cachedDayGroups.isEmpty && (model.isLoading || device.isLoading) {
-              VStack(spacing: 10) {
-                ProgressView()
-                Text("正在加载照片…")
-                  .font(.caption).foregroundColor(.secondary)
-              }
-              .frame(maxWidth: .infinity, minHeight: 240)
-            }
-            if !model.isLoading && !device.isLoading && model.error == nil &&
-                cachedDayGroups.isEmpty && (sourceFilter == .device ? (!device.authorized || device.assets.isEmpty) : (model.assets.isEmpty && device.assets.isEmpty)) {
+            if cachedDayGroups.isEmpty {
               VStack(spacing: 8) {
                 Image(systemName: "photo.on.rectangle.angled")
                   .font(.largeTitle).foregroundColor(.secondary)
-                Text("暂无照片").font(.headline)
-                Text(sourceFilter == .device && !device.authorized ? "请授予照片访问权限，查看本机照片。" : "当前来源中没有可显示的照片。")
+                Text("暂无缓存照片").font(.headline)
+                Text(sourceFilter == .device && !device.authorized ? "请授予照片访问权限，查看本机照片。" : "有照片后会自动显示在这里。")
                   .font(.caption).foregroundColor(.secondary)
               }
               .frame(maxWidth: .infinity, minHeight: 220)
@@ -1470,6 +1627,94 @@ struct NativePhotosView: View {
           }
   }
 
+  private var launchViewerItems: [NativeGridItem] {
+    let candidates = launchPreviewItems.flatMap { $0.isEmpty ? nil : $0 }
+      ?? filteredTimelineAssets
+    return candidates.filter { item in
+        nativePhotosSourceIncludes(
+          sourceFilter, hasLocal: item.local != nil,
+          hasServer: item.server != nil,
+          hasVerifiedMatch: item.local.flatMap {
+            cloud.matchedServerIDs[$0.id]
+          } != nil
+        )
+    }
+  }
+
+  private var cachedLaunchPreview: some View {
+    GeometryReader { viewport in
+      let cellWidth = viewport.size.width / CGFloat(max(columns, 1))
+      let rows = Int(ceil(viewport.size.height / max(cellWidth, 1))) + 1
+      let preview = Array(launchViewerItems.suffix(rows * columns))
+      if preview.isEmpty {
+        ProgressView("正在读取照片…")
+          .frame(maxWidth: .infinity, maxHeight: .infinity)
+      } else {
+        var calendar = Calendar.autoupdatingCurrent
+        calendar.timeZone = .autoupdatingCurrent
+        let grouped = Dictionary(grouping: preview) {
+          calendar.startOfDay(for: $0.date)
+        }
+        let days = grouped.keys.sorted()
+        let gridSpacing: CGFloat = columns > 7 ? 1 : 2
+        let cellHeight = (viewport.size.width
+          - CGFloat(columns - 1) * gridSpacing) / CGFloat(columns)
+        let rowCounts = days.map {
+          Int(ceil(Double(grouped[$0, default: []].count) / Double(columns)))
+        }
+        let contentHeight = CGFloat(rowCounts.reduce(0, +)) * cellHeight
+          + CGFloat(rowCounts.reduce(0) { $0 + max(0, $1 - 1) }) * gridSpacing
+          + CGFloat(max(0, days.count - 1)) * 4
+          + (columns > 6 ? CGFloat(days.count) * 20 : 0)
+        let alignment: Alignment = contentHeight > viewport.size.height
+          ? .bottom : .top
+        VStack(spacing: 4) {
+          ForEach(days, id: \.self) { day in
+            VStack(alignment: .leading, spacing: 2) {
+              if columns > 6 {
+                Text(NativeImmichClient.formatChineseDate(day))
+                  .font(.caption2.weight(.bold))
+                  .padding(.horizontal, 4)
+              }
+              LazyVGrid(
+                columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns),
+                spacing: gridSpacing
+              ) {
+                ForEach(grouped[day] ?? []) { entry in
+                  Color(uiColor: .secondarySystemBackground)
+                    .aspectRatio(1, contentMode: .fit)
+                    .overlay {
+                      if let asset = entry.server {
+                        NativeThumbnail(client: client, asset: asset, columns: columns)
+                      } else if let asset = entry.local {
+                        NativeDeviceThumbnail(asset: asset, columns: columns)
+                      }
+                    }
+                    .clipped()
+                    .overlay(alignment: .topLeading) {
+                      if columns <= 6 && entry.id == grouped[day]?.first?.id {
+                        Text(NativeImmichClient.formatChineseDate(day))
+                          .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
+                          .foregroundColor(.white)
+                          .padding(2)
+                          .background(.black.opacity(0.65))
+                          .cornerRadius(3)
+                      }
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture { activeViewerItem = entry }
+                }
+              }
+            }
+          }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .frame(height: viewport.size.height, alignment: alignment)
+        .clipped()
+      }
+    }
+  }
+
   private func timelineGestureContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
     content
         .coordinateSpace(name: "photosScrollSpace")
@@ -1535,7 +1780,7 @@ struct NativePhotosView: View {
         .simultaneousGesture(
           MagnificationGesture()
             .onChanged { value in
-              guard !isSelecting else { return }
+              guard !isSelecting, isInitialTimelineVisible else { return }
               isMagnifying = true
               let base = gestureBaseColumns ?? columns
               if gestureBaseColumns == nil {
@@ -1592,6 +1837,7 @@ struct NativePhotosView: View {
           isInitialTimelineVisible = true
           device.refresh()
           await model.refreshLatest()
+          if !serverExclusionsReady { refreshExcludedServerAssetIDs() }
           rebuildDayGroups()
           scheduleMatchedHydration()
         }
@@ -1606,19 +1852,48 @@ struct NativePhotosView: View {
           positionInitiallyIfReady(proxy: proxy)
           keepBottomUntilUserScrolls(proxy: proxy)
         }
+        .onChange(of: device.hasCompletedLiveRefresh) { completed in
+          if completed && !localExclusionsReady {
+            refreshExcludedLocalAssetIDs()
+          }
+        }
         .onChange(of: cachedExcludedLocalIDs) { _ in
           keepBottomUntilUserScrolls(proxy: proxy)
         }
         .onChange(of: excludedServerAssetIDs) { _ in
           keepBottomUntilUserScrolls(proxy: proxy)
         }
-        .onChange(of: excludedLocalAlbumIDsRaw) { _ in
+        .onChange(of: excludedLocalAlbumIDsRaw) { raw in
+          localExclusionsReady = nativePhotosExcludedAlbumIDs(from: raw).isEmpty
           refreshExcludedLocalAssetIDs()
           updateSelectionAfterTimelineChange()
         }
-        .onChange(of: excludedServerAlbumIDsRaw) { _ in
+        .onChange(of: excludedServerAlbumIDsRaw) { raw in
+          serverExclusionsReady = nativePhotosExcludedAlbumIDs(from: raw).isEmpty
           refreshExcludedServerAssetIDs()
           updateSelectionAfterTimelineChange()
+        }
+        .onChange(of: localExclusionsReady) { _ in
+          rebuildDayGroups()
+          if !isInitialTimelineVisible {
+            launchPreviewItems = Array(filteredTimelineAssets.suffix(120))
+            if !cachedDayGroups.isEmpty && device.hasLoadedInitialSnapshot {
+              initialRemoteLoaded = true
+              needsInitialBackgroundRefresh = true
+            }
+            positionInitiallyIfReady(proxy: proxy)
+          }
+        }
+        .onChange(of: serverExclusionsReady) { _ in
+          rebuildDayGroups()
+          if !isInitialTimelineVisible {
+            launchPreviewItems = Array(filteredTimelineAssets.suffix(120))
+            if !cachedDayGroups.isEmpty && model.hasCachedSnapshot {
+              initialRemoteLoaded = true
+              needsInitialBackgroundRefresh = true
+            }
+            positionInitiallyIfReady(proxy: proxy)
+          }
         }
         .onChange(of: device.isLoading) { loading in
           guard !loading else { return }
@@ -1629,10 +1904,26 @@ struct NativePhotosView: View {
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
         .onAppear {
+          if launchPreviewItems == nil {
+            launchPreviewItems = Array(filteredTimelineAssets.suffix(120))
+          }
           rebuildDayGroups()
           refreshExcludedLocalAssetIDs()
           refreshExcludedServerAssetIDs()
-          if model.assets.isEmpty && !model.isLoading {
+          if isInitialTimelineVisible {
+            Task(priority: .utility) {
+              await model.refreshLatest()
+              rebuildDayGroups()
+              scheduleMatchedHydration()
+            }
+          } else if !cachedDayGroups.isEmpty &&
+              (model.hasCachedSnapshot || device.hasLoadedInitialSnapshot) {
+            // Show the cached timeline before network metadata can change its
+            // layout. The refresh starts only after the first grid is visible.
+            initialRemoteLoaded = true
+            needsInitialBackgroundRefresh = true
+            positionInitiallyIfReady(proxy: proxy)
+          } else if !model.isLoading {
             Task {
               await model.loadInitial()
               initialRemoteLoaded = true
@@ -1648,6 +1939,15 @@ struct NativePhotosView: View {
             keepBottomUntilUserScrolls(proxy: proxy)
           }
         }
+        .onChange(of: isInitialTimelineVisible) { visible in
+          guard visible, needsInitialBackgroundRefresh else { return }
+          needsInitialBackgroundRefresh = false
+          Task(priority: .utility) {
+            await model.refreshLatest()
+            rebuildDayGroups()
+            scheduleMatchedHydration()
+          }
+        }
         .onChange(of: model.assets.count) { _ in
           rebuildDayGroups()
           updateSelectionAfterTimelineChange()
@@ -1657,6 +1957,7 @@ struct NativePhotosView: View {
         }
         .onChange(of: model.isLoading) { loading in
           if !loading {
+            if !serverExclusionsReady { refreshExcludedServerAssetIDs() }
             rebuildDayGroups()
             positionInitiallyIfReady(proxy: proxy)
             keepBottomUntilUserScrolls(proxy: proxy)
@@ -1681,6 +1982,8 @@ struct NativePhotosView: View {
           hydrationTask = nil
           excludedLocalRefreshTask?.cancel()
           excludedLocalRefreshTask = nil
+          excludedServerRefreshTask?.cancel()
+          excludedServerRefreshTask = nil
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
           guard needsForegroundRefresh, !isSelecting else { return }
@@ -1700,6 +2003,7 @@ struct NativePhotosView: View {
             // The existing grid stays interactive while the metadata reloads.
             device.refresh()
             if !model.isLoading { await model.refreshLatest() }
+            if !serverExclusionsReady { refreshExcludedServerAssetIDs() }
             rebuildDayGroups()
             updateSelectionAfterTimelineChange()
             scheduleMatchedHydration()
@@ -1743,18 +2047,6 @@ struct NativePhotosView: View {
                 .accessibilityLabel("关闭操作提示")
               }
               .padding(6)
-            }
-            if let message = cloud.message {
-              HStack(spacing: 8) {
-                Text(message).font(.caption).lineLimit(3)
-                Spacer(minLength: 4)
-                Button("重试核验") { Task { await cloud.retry(device.assets, client: client) } }
-                  .font(.caption).fixedSize()
-              }
-              .padding(6)
-            }
-            if let message = model.error {
-              HStack { Text(message).font(.caption).lineLimit(2); Button("重试") { Task { await model.retry() } } }.padding(6)
             }
           }
         }
@@ -1873,7 +2165,9 @@ struct NativePhotosView: View {
           NativeUnifiedGalleryViewer(
             client: client,
             device: device,
-            items: cachedDayGroups.flatMap(\.assets),
+            items: isInitialTimelineVisible
+              ? cachedDayGroups.flatMap(\.assets)
+              : launchViewerItems,
             initialItem: item,
             onDeleteItem: { deletedItem, scope in
               let previousAssetIDs = cachedDayGroups.flatMap(\.assets).map(\.id)
@@ -1920,7 +2214,7 @@ struct NativePhotosView: View {
                     .opacity(isInitialTimelineVisible ? 1 : 0)
                     .allowsHitTesting(isInitialTimelineVisible)
                   if !isInitialTimelineVisible {
-                    ProgressView("正在加载照片…")
+                    cachedLaunchPreview
                   }
                 },
                 proxy: proxy
@@ -1970,16 +2264,17 @@ struct NativePhotosView: View {
           matchedAssetDiagnostics.succeeded(id: id)
         } else {
           matchedAssetDiagnostics.failed(id: id, error: nil)
+          NativeBackgroundDiagnostics.shared.record(
+            "云端照片详情", category: "服务器未返回资产"
+          )
         }
       } catch {
-        if !Task.isCancelled { matchedAssetDiagnostics.failed(id: id, error: error) }
+        if !Task.isCancelled {
+          matchedAssetDiagnostics.failed(id: id, error: error)
+          NativeBackgroundDiagnostics.shared.record("云端照片详情", error: error)
+        }
       }
       loadingMatchedServerIDs.remove(id)
-    }
-    if matchedAssetDiagnostics.unresolvedCount > 0 {
-      actionMessage = "有 \(matchedAssetDiagnostics.unresolvedCount) 项已匹配的云端资产详情暂时无法载入；可在设置的 Debug 页面查看原因，刷新后重试。"
-    } else if actionMessage?.contains("已匹配的云端资产详情暂时无法载入") == true {
-      actionMessage = nil
     }
   }
 
@@ -2234,11 +2529,16 @@ struct NativePhotosView: View {
     guard nativeInitialTimelineReady(
       source: sourceFilter,
       remoteLoaded: initialRemoteLoaded,
-      remoteLoading: model.isLoading,
+      // A cached local or remote snapshot can be displayed while either
+      // source refreshes in the background; only uncached scans gate layout.
+      remoteLoading: model.isLoading &&
+        !model.hasCachedSnapshot && !device.hasLoadedInitialSnapshot,
       localSnapshotLoaded: device.hasLoadedInitialSnapshot,
-      localLoading: device.isLoading
+      localLoading: device.isLoading && !device.hasLoadedInitialSnapshot
     ) else { return }
-    if cachedDayGroups.isEmpty {
+    if cachedDayGroups.isEmpty ||
+        (cachedDayGroups.count == 1 && totalDisplayCount <= columns) {
+      // A single row cannot fill the viewport; there is no bottom offset.
       isInitialTimelineVisible = true
       isBootstrappingTimeline = false
       didInitialPosition = true
@@ -2362,27 +2662,42 @@ struct NativePhotosView: View {
   }
 
   private func refreshExcludedServerAssetIDs() {
+    excludedServerRefreshTask?.cancel()
+    excludedServerRefreshGeneration += 1
+    let generation = excludedServerRefreshGeneration
     let albumIDs = nativePhotosExcludedAlbumIDs(from: excludedServerAlbumIDsRaw)
     guard !albumIDs.isEmpty else {
       excludedServerAssetIDs = []
+      serverExclusionsReady = true
+      saveExcludedSnapshotIfReady()
       rebuildDayGroups()
       updateSelectionAfterTimelineChange()
       return
     }
-    Task {
+    excludedServerRefreshTask = Task {
       var excludedIDs = Set<String>()
+      var didLoad = true
       do {
         for albumID in albumIDs {
           try Task.checkCancellation()
           excludedIDs.formUnion(try await client.assetIDs(inServerAlbum: albumID))
         }
       } catch {
+        guard !Task.isCancelled else { return }
         // Keep known exclusions rather than showing albums after a transient API error.
+        didLoad = false
         excludedIDs = excludedServerAssetIDs
+        NativeBackgroundDiagnostics.shared.record("读取排除的云端相册", error: error)
       }
-      guard albumIDs == nativePhotosExcludedAlbumIDs(from: excludedServerAlbumIDsRaw) else { return }
+      guard !Task.isCancelled, generation == excludedServerRefreshGeneration,
+            accountIdentity == NativeSyncCacheStore.shared.identity,
+            albumIDs == nativePhotosExcludedAlbumIDs(from: excludedServerAlbumIDsRaw) else { return }
       await MainActor.run {
         excludedServerAssetIDs = excludedIDs
+        if didLoad {
+          serverExclusionsReady = true
+          saveExcludedSnapshotIfReady()
+        }
         rebuildDayGroups()
         updateSelectionAfterTimelineChange()
       }
@@ -2732,6 +3047,19 @@ struct NativeThumbhashBackground: View {
   }
 }
 
+func nativeThumbnailCacheAccountKey(
+  server: String, userId: String?, credential: String
+) -> String {
+  if let userId, !userId.isEmpty {
+    let canonicalServer = server.trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased().replacingOccurrences(
+        of: "/+$", with: "", options: .regularExpression
+      )
+    return "\(canonicalServer)|\(userId)"
+  }
+  return "\(server):\(credential)"
+}
+
 struct NativeThumbnail: View {
   let client: NativeImmichClient
   let asset: NativeAsset
@@ -2751,10 +3079,18 @@ struct NativeThumbnail: View {
     .task(id: "\(client.config.serverUrl):\(asset.id):\(isLowDensity ? "p" : "t")") {
       image = nil
       let credential = client.config.accessToken ?? client.config.apiKey ?? ""
-      let accountDigest = SHA256.hash(data: Data("\(client.config.serverUrl):\(credential)".utf8))
+      let legacyIdentity = "\(client.config.serverUrl):\(credential)"
+      let stableIdentity = nativeThumbnailCacheAccountKey(
+        server: client.config.serverUrl, userId: client.config.userId,
+        credential: credential
+      )
+      let accountDigest = SHA256.hash(data: Data(stableIdentity.utf8))
+        .map { String(format: "%02x", $0) }.joined()
+      let legacyDigest = SHA256.hash(data: Data(legacyIdentity.utf8))
         .map { String(format: "%02x", $0) }.joined()
       let sizeTag = isLowDensity ? "preview" : "thumbnail"
       let cacheKey = "\(accountDigest):\(asset.id):\(sizeTag)"
+      let legacyKey = "\(legacyDigest):\(asset.id):\(sizeTag)"
       let key = NSString(string: cacheKey)
       if let cached = NativeThumbnailCache.images.object(forKey: key) {
         image = cached
@@ -2764,7 +3100,14 @@ struct NativeThumbnail: View {
       guard await NativeThumbnailRequestLimiter.shared.acquire() else { return }
       defer { NativeThumbnailRequestLimiter.shared.release() }
       guard !Task.isCancelled else { return }
-      if let cachedData = await NativeThumbnailDiskCache.shared.data(for: cacheKey) {
+      var cachedData = await NativeThumbnailDiskCache.shared.data(for: cacheKey)
+      if cachedData == nil, cacheKey != legacyKey {
+        cachedData = await NativeThumbnailDiskCache.shared.data(for: legacyKey)
+        if let cachedData, !Task.isCancelled {
+          await NativeThumbnailDiskCache.shared.store(cachedData, for: cacheKey)
+        }
+      }
+      if let cachedData {
         guard !Task.isCancelled else { return }
         let decoded = await Task.detached(priority: .utility) {
           NativeThumbnailCache.downsampledImage(from: cachedData, maxPixelSize: maxDim)
@@ -2817,9 +3160,17 @@ struct NativeThumbnail: View {
               cost: Int(decoded.size.width * decoded.size.height * 4)
             )
             image = decoded
-          } catch { image = nil }
+          } catch {
+            image = nil
+            if !Task.isCancelled {
+              NativeBackgroundDiagnostics.shared.record("云端缩略图", error: error)
+            }
+          }
         } else {
           image = nil
+          if !Task.isCancelled {
+            NativeBackgroundDiagnostics.shared.record("云端缩略图", error: error)
+          }
         }
       }
     }

@@ -1,4 +1,5 @@
 @testable import Runner
+import CryptoKit
 import UIKit
 import XCTest
 
@@ -27,6 +28,10 @@ final class RunnerTests: XCTestCase {
       viewportFrame: viewport
     ))
     XCTAssertFalse(nativeTimelineBottomReached(
+      anchorFrame: CGRect(x: 0, y: 300, width: 390, height: 1),
+      viewportFrame: viewport
+    ))
+    XCTAssertFalse(nativeTimelineBottomReached(
       anchorFrame: CGRect(x: 0, y: 1_299, width: 390, height: 1),
       viewportFrame: viewport
     ))
@@ -40,6 +45,97 @@ final class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: true, hasAssets: true))
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: false))
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: true, positioningInProgress: true))
+  }
+
+  func testThumbnailCacheIdentitySurvivesTokenRotation() {
+    let first = nativeThumbnailCacheAccountKey(
+      server: "https://photos.example/", userId: "alice",
+      credential: "old-token"
+    )
+    let rotated = nativeThumbnailCacheAccountKey(
+      server: "https://photos.example", userId: "alice",
+      credential: "new-token"
+    )
+    let other = nativeThumbnailCacheAccountKey(
+      server: "https://photos.example", userId: "bob",
+      credential: "new-token"
+    )
+    XCTAssertEqual(first, rotated)
+    XCTAssertNotEqual(first, other)
+    XCTAssertNotEqual(
+      nativeThumbnailCacheAccountKey(
+        server: "https://photos.example", userId: nil,
+        credential: "old-token"
+      ),
+      nativeThumbnailCacheAccountKey(
+        server: "https://photos.example", userId: nil,
+        credential: "new-token"
+      )
+    )
+  }
+
+  func testAccountScopedPhotoSnapshotsRoundTrip() throws {
+    let folder = FileManager.default.temporaryDirectory
+      .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(
+      at: folder, withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: folder) }
+    let identity = "https://example.com|alice"
+    let hash = SHA256.hash(data: Data(identity.utf8))
+      .map { String(format: "%02x", $0) }.joined()
+    let asset = NativeAsset(
+      id: "server-asset", date: Date(timeIntervalSince1970: 100),
+      isImage: true, isFavorite: false, thumbhash: "hash"
+    )
+    let timeline = NativeTimelineSnapshot(
+      assets: [asset], buckets: [NativeBucket(id: "day", count: 1)],
+      nextBucket: 1, searchFallbackEnabled: false,
+      searchCursor: nil, hasOlder: false
+    )
+    let local = NativeDeviceAsset(
+      id: "local-asset", date: asset.date, isVideo: false,
+      contentVersion: 10
+    )
+    let device = NativeDeviceSnapshot(assets: [local], albums: [])
+    let exclusions = NativeTimelineExclusionsSnapshot(
+      localAlbumIDs: ["excluded-local"],
+      serverAlbumIDs: ["excluded-server"],
+      localAssetIDs: ["hidden-local"],
+      serverAssetIDs: ["hidden-server"]
+    )
+    try JSONEncoder().encode(timeline).write(
+      to: folder.appendingPathComponent(
+        "native_timeline_snapshot_\(hash).json"
+      )
+    )
+    try JSONEncoder().encode(device).write(
+      to: folder.appendingPathComponent(
+        "native_device_snapshot_\(hash).json"
+      )
+    )
+    try JSONEncoder().encode(exclusions).write(
+      to: folder.appendingPathComponent(
+        "native_exclusions_snapshot_\(hash).json"
+      )
+    )
+    let event = NativeBackgroundDiagnostic(
+      id: UUID(), date: Date(), operation: "时间线", category: "网络超时"
+    )
+    try JSONEncoder().encode([event]).write(
+      to: folder.appendingPathComponent(
+        "native_diagnostics_snapshot_\(hash).json"
+      )
+    )
+    let store = NativePhotoSnapshotStore(directory: folder)
+    XCTAssertEqual(store.timeline(identity: identity)?.assets.first?.id, asset.id)
+    XCTAssertEqual(store.device(identity: identity)?.assets.first?.id, local.id)
+    XCTAssertEqual(store.exclusions(identity: identity)?.localAssetIDs, ["hidden-local"])
+    XCTAssertEqual(store.diagnostics(identity: identity).first?.category, "网络超时")
+    XCTAssertNil(store.timeline(identity: "https://example.com|bob"))
+    XCTAssertNil(store.device(identity: "https://example.com|bob"))
+    XCTAssertNil(store.exclusions(identity: "https://example.com|bob"))
+    XCTAssertTrue(store.diagnostics(identity: "https://example.com|bob").isEmpty)
   }
 
   func testAlbumOrdersOldestAboveNewest() {

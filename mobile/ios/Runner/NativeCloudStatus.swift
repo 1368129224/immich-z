@@ -155,6 +155,114 @@ final class NativeSyncCacheStore: @unchecked Sendable {
   }
 }
 
+// Account-scoped metadata snapshots. Thumbnails have their own disk cache;
+// neither credentials nor original photo data are written here.
+struct NativeTimelineSnapshot: Codable {
+  let assets: [NativeAsset]
+  let buckets: [NativeBucket]
+  let nextBucket: Int
+  let searchFallbackEnabled: Bool
+  let searchCursor: String?
+  let hasOlder: Bool
+}
+
+struct NativeDeviceSnapshot: Codable {
+  let assets: [NativeDeviceAsset]
+  let albums: [NativeDeviceAlbum]
+}
+
+struct NativeTimelineExclusionsSnapshot: Codable {
+  let localAlbumIDs: Set<String>
+  let serverAlbumIDs: Set<String>
+  let localAssetIDs: Set<String>
+  let serverAssetIDs: Set<String>
+}
+
+final class NativePhotoSnapshotStore: @unchecked Sendable {
+  static let shared = NativePhotoSnapshotStore()
+  private let folder: URL
+  private let queue = DispatchQueue(label: "immich.photo.snapshots", qos: .utility)
+
+  init(directory: URL? = nil) {
+    folder = directory ?? FileManager.default.urls(
+      for: .applicationSupportDirectory, in: .userDomainMask
+    )[0]
+    try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+  }
+
+  private func url(_ kind: String, identity: String) -> URL {
+    let hash = SHA256.hash(data: Data(identity.utf8))
+      .map { String(format: "%02x", $0) }.joined()
+    return folder.appendingPathComponent("native_\(kind)_snapshot_\(hash).json")
+  }
+
+  func timeline(identity: String? = NativeSyncCacheStore.shared.identity) -> NativeTimelineSnapshot? {
+    read("timeline", identity: identity)
+  }
+
+  func device(identity: String? = NativeSyncCacheStore.shared.identity) -> NativeDeviceSnapshot? {
+    read("device", identity: identity)
+  }
+
+  private func read<T: Decodable>(_ kind: String, identity: String?) -> T? {
+    guard let identity else { return nil }
+    return queue.sync {
+      guard let data = try? Data(contentsOf: url(kind, identity: identity)) else { return nil }
+      return try? JSONDecoder().decode(T.self, from: data)
+    }
+  }
+
+  func saveTimeline(_ snapshot: NativeTimelineSnapshot, expectedIdentity: String?) {
+    save(snapshot, kind: "timeline", identity: expectedIdentity)
+  }
+
+  func saveDevice(_ snapshot: NativeDeviceSnapshot, expectedIdentity: String?) {
+    save(snapshot, kind: "device", identity: expectedIdentity)
+  }
+
+  func exclusions(identity: String? = NativeSyncCacheStore.shared.identity) -> NativeTimelineExclusionsSnapshot? {
+    read("exclusions", identity: identity)
+  }
+
+  func saveExclusions(_ snapshot: NativeTimelineExclusionsSnapshot, expectedIdentity: String?) {
+    save(snapshot, kind: "exclusions", identity: expectedIdentity)
+  }
+
+  func diagnostics(identity: String? = NativeSyncCacheStore.shared.identity) -> [NativeBackgroundDiagnostic] {
+    read("diagnostics", identity: identity) ?? []
+  }
+
+  func saveDiagnostics(_ entries: [NativeBackgroundDiagnostic], expectedIdentity: String?) {
+    save(entries, kind: "diagnostics", identity: expectedIdentity)
+  }
+
+  private func save<T: Encodable>(_ snapshot: T, kind: String, identity: String?) {
+    guard let identity, NativeSyncCacheStore.shared.identity == identity else { return }
+    queue.async { [self] in
+      guard NativeSyncCacheStore.shared.identity == identity,
+            let data = try? JSONEncoder().encode(snapshot) else { return }
+      try? data.write(to: url(kind, identity: identity), options: .atomic)
+    }
+  }
+
+  func clearDevice(expectedIdentity: String?) {
+    guard let identity = expectedIdentity,
+          NativeSyncCacheStore.shared.identity == identity else { return }
+    queue.sync {
+      try? FileManager.default.removeItem(at: url("device", identity: identity))
+    }
+  }
+
+  func clearCurrentAccount() {
+    guard let identity = NativeSyncCacheStore.shared.identity else { return }
+    queue.sync {
+      for kind in ["timeline", "device", "exclusions", "diagnostics"] {
+        try? FileManager.default.removeItem(at: url(kind, identity: identity))
+      }
+    }
+  }
+}
+
 // The server confirms an uploaded copy only when its SHA1 matches the actual
 // PhotoKit original resource. Unreadable or cloud-only originals stay unknown.
 @MainActor
@@ -231,6 +339,11 @@ final class NativeCloudStatus: ObservableObject {
         running = false
         isRunning = false
         failedCount = failedIDs.count
+        if failedCount > 0 {
+          NativeBackgroundDiagnostics.shared.record(
+            "读取照片原件", category: "无法读取 \(failedCount) 项原件"
+          )
+        }
       }
     }
     message = nil
@@ -286,6 +399,9 @@ final class NativeCloudStatus: ObservableObject {
           checkedIDs.subtract(invalidIDs)
           NativeSyncCacheStore.shared.invalidateChecks(localIDs: invalidIDs, expectedIdentity: accountIdentity)
           message = "服务器的上传状态核验响应格式异常。"
+          NativeBackgroundDiagnostics.shared.record(
+            "上传状态核验", category: "服务器响应格式异常"
+          )
           return
         }
 
@@ -320,6 +436,9 @@ final class NativeCloudStatus: ObservableObject {
           checkedIDs.subtract(invalidIDs)
           NativeSyncCacheStore.shared.invalidateChecks(localIDs: invalidIDs, expectedIdentity: accountIdentity)
           message = "服务器有 \(invalidIDs.count) 项未返回唯一有效的核验结果，状态暂时未知。"
+          NativeBackgroundDiagnostics.shared.record(
+            "上传状态核验", category: "核验结果缺失（\(invalidIDs.count) 项）"
+          )
         }
       } catch {
         let invalidIDs = Set(hashes.compactMap { $0["id"] })
@@ -327,6 +446,7 @@ final class NativeCloudStatus: ObservableObject {
         checkedIDs.subtract(invalidIDs)
         NativeSyncCacheStore.shared.invalidateChecks(localIDs: invalidIDs, expectedIdentity: accountIdentity)
         message = "无法向服务器核验上传状态：\(error.localizedDescription)"
+        NativeBackgroundDiagnostics.shared.record("上传状态核验", error: error)
         return
       }
     }

@@ -3153,6 +3153,32 @@ struct NativeThumbnail: View {
 
 import AVKit
 
+private struct NativeClearBackgroundView: UIViewRepresentable {
+  func makeUIView(context: Context) -> UIView {
+    let view = UIView()
+    view.backgroundColor = .clear
+    DispatchQueue.main.async {
+      view.superview?.superview?.backgroundColor = .clear
+      view.findViewController()?.view.backgroundColor = .clear
+    }
+    return view
+  }
+
+  func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+private extension UIView {
+  func findViewController() -> UIViewController? {
+    if let nextResponder = self.next as? UIViewController {
+      return nextResponder
+    } else if let nextResponder = self.next as? UIView {
+      return nextResponder.findViewController()
+    } else {
+      return nil
+    }
+  }
+}
+
 private struct NativeGallerySystemOverlayModifier: ViewModifier {
   let isImmersive: Bool
 
@@ -3187,13 +3213,13 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var sharePreparationID: UUID?
   @State private var viewerMessage: String?
   @State private var dragOffset: CGSize = .zero
+  @State private var isDraggingToDismiss = false
+  @State private var isDismissing = false
   @State private var shareItem: Any? = nil
   @AppStorage("immichz_confirm_remote_only_deletion") private var confirmRemoteOnlyDeletion = true
   @State private var showDeleteScopeDialog = false
   @State private var showViewerRemoteDeleteConfirmation = false
   @State private var pendingViewerRemoteDeleteItem: NativeGridItem?
-  @State private var showViewerLocalDeleteWarning = false
-  @State private var pendingViewerDeleteScope: NativeDeleteTargetScope = .all
   @State private var isDeletingItem = false
   @State private var deleteErrorMessage: String? = nil
 
@@ -3225,9 +3251,33 @@ struct NativeUnifiedGalleryViewer: View {
     items.first(where: { $0.id == currentAssetID })
   }
 
+  private var dragProgress: CGFloat {
+    guard dragOffset != .zero else { return 0 }
+    return min(1.0, max(0.0, abs(dragOffset.height) / 320.0))
+  }
+
+  private var backgroundOpacity: Double {
+    if isDismissing { return 0.0 }
+    return max(0.0, 1.0 - Double(dragProgress * 1.15))
+  }
+
+  private var viewerScale: CGFloat {
+    if isDismissing { return 0.72 }
+    return max(0.75, 1.0 - (abs(dragOffset.height) / 1100.0))
+  }
+
+  private var viewerCornerRadius: CGFloat {
+    guard abs(dragOffset.height) > 6 else { return 0 }
+    return min(24.0, abs(dragOffset.height) / 7.0)
+  }
+
   var body: some View {
     ZStack {
-      Color.black.ignoresSafeArea()
+      NativeClearBackgroundView()
+
+      Color.black
+        .opacity(backgroundOpacity)
+        .ignoresSafeArea()
 
       if items.isEmpty {
         Text("当前照片已删除").foregroundColor(.white)
@@ -3253,25 +3303,45 @@ struct NativeUnifiedGalleryViewer: View {
         }
         .tabViewStyle(.page(indexDisplayMode: .never))
         .ignoresSafeArea()
-        .offset(y: max(0, dragOffset.height))
-        .scaleEffect(dragOffset.height > 0 ? max(0.8, 1.0 - (dragOffset.height / 1000.0)) : 1.0)
-        .opacity(dragOffset.height > 0 ? max(0.4, 1.0 - Double(dragOffset.height / 500.0)) : 1.0)
+        .offset(
+          x: isDismissing ? 0 : dragOffset.width * 0.35,
+          y: isDismissing ? (UIScreen.main.bounds.height + 150) : max(0, dragOffset.height)
+        )
+        .scaleEffect(viewerScale)
+        .clipShape(RoundedRectangle(cornerRadius: viewerCornerRadius, style: .continuous))
         .simultaneousGesture(
-          DragGesture()
+          DragGesture(minimumDistance: 6)
             .onChanged { value in
-              guard !isCurrentImageZoomed else { return }
-              // Close by swiping down only when the image is at its base zoom.
-              if value.translation.height > 10 && abs(value.translation.height) > abs(value.translation.width) {
+              guard !isCurrentImageZoomed, !isDismissing else { return }
+              if !isDraggingToDismiss {
+                if value.translation.height > 8 && abs(value.translation.height) > abs(value.translation.width) * 1.25 {
+                  isDraggingToDismiss = true
+                }
+              }
+              if isDraggingToDismiss {
                 dragOffset = value.translation
               }
             }
             .onEnded { value in
-              guard !isCurrentImageZoomed else { dragOffset = .zero; return }
-              if dragOffset.height > 120 {
-                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                dismiss()
+              guard isDraggingToDismiss, !isDismissing else {
+                isDraggingToDismiss = false
+                dragOffset = .zero
+                return
+              }
+              isDraggingToDismiss = false
+              let velocity = value.predictedEndTranslation.height - value.translation.height
+              let shouldDismiss = value.translation.height > 100 || velocity > 250
+              if shouldDismiss {
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                withAnimation(.easeOut(duration: 0.22)) {
+                  isDismissing = true
+                  dragOffset.height = UIScreen.main.bounds.height + 150
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) {
+                  dismiss()
+                }
               } else {
-                withAnimation(.interactiveSpring()) {
+                withAnimation(.interactiveSpring(response: 0.30, dampingFraction: 0.82)) {
                   dragOffset = .zero
                 }
               }
@@ -3280,7 +3350,7 @@ struct NativeUnifiedGalleryViewer: View {
       }
 
       // Top & Bottom Overlay Chrome
-      if showChrome {
+      if showChrome && !isDismissing {
         VStack {
           // Top Bar
           HStack {
@@ -3380,6 +3450,8 @@ struct NativeUnifiedGalleryViewer: View {
               action: {
                 if currentItem?.server != nil && currentItem?.local == nil {
                   requestRemoteOnlyDeletion()
+                } else if currentItem?.local != nil && currentItem?.server == nil {
+                  performDeleteItem(scope: .localOnly)
                 } else {
                   showDeleteScopeDialog = true
                 }
@@ -3394,6 +3466,7 @@ struct NativeUnifiedGalleryViewer: View {
           .cornerRadius(24)
           .padding(.bottom, 24)
         }
+        .opacity(isDraggingToDismiss ? max(0.0, 1.0 - Double(abs(dragOffset.height) / 45.0)) : 1.0)
         .transition(.opacity)
       }
     }
@@ -3401,8 +3474,7 @@ struct NativeUnifiedGalleryViewer: View {
     .confirmationDialog("删除范围", isPresented: $showDeleteScopeDialog, titleVisibility: .visible) {
       if currentItem?.local != nil {
         Button("仅删除本地", role: .destructive) {
-          pendingViewerDeleteScope = .localOnly
-          showViewerLocalDeleteWarning = true
+          performDeleteItem(scope: .localOnly)
         }
       }
       if currentItem?.server != nil {
@@ -3410,8 +3482,7 @@ struct NativeUnifiedGalleryViewer: View {
       }
       if currentItem?.local != nil && currentItem?.server != nil {
         Button("全部删除", role: .destructive) {
-          pendingViewerDeleteScope = .all
-          showViewerLocalDeleteWarning = true
+          performDeleteItem(scope: .all)
         }
       }
       Button("取消", role: .cancel) {}
@@ -3445,10 +3516,6 @@ struct NativeUnifiedGalleryViewer: View {
     .alert("操作结果", isPresented: Binding(get: { viewerMessage != nil }, set: { if !$0 { viewerMessage = nil } })) {
       Button("好", role: .cancel) { viewerMessage = nil }
     } message: { Text(viewerMessage ?? "") }
-    .alert("确认删除本机照片", isPresented: $showViewerLocalDeleteWarning) {
-      Button("取消", role: .cancel) {}
-      Button("继续删除", role: .destructive) { performDeleteItem(scope: pendingViewerDeleteScope) }
-    } message: { Text("此操作会从系统照片中永久删除；若开启 iCloud Photos，删除可能传播至其他设备。") }
     .sheet(isPresented: $showInfoSheet) {
       if let item = currentItem {
         NativeAssetInfoSheet(client: client, device: device, item: item)

@@ -822,11 +822,17 @@ private final class NativeResultsModel: ObservableObject {
   }
 }
 
+func nativeSortedResultDays(_ days: [Date], oldestFirst: Bool) -> [Date] {
+  days.sorted { oldestFirst ? $0 < $1 : $0 > $1 }
+}
+
 struct NativeResultGrid: View {
   let client: NativeImmichClient
   let assets: [NativeAsset]
   var localAssets: [NativeDeviceAsset] = []
   let hasOlder: Bool
+  var startsAtLatest = false
+  var initialPositionReady = true
   var isSelectingBinding: Binding<Bool>? = nil
   var selectedIDsBinding: Binding<Set<String>>? = nil
   let loadMore: () -> Void
@@ -848,6 +854,10 @@ struct NativeResultGrid: View {
   @State private var itemBounds: [String: CGRect] = [:]
 
   @State private var activeViewerItem: NativeGridItem?
+  @State private var userMovedGrid = false
+  @State private var bottomPositionTask: Task<Void, Never>?
+
+  private let bottomAnchor = "result-grid-bottom"
 
   private var isSelecting: Bool {
     isSelectingBinding?.wrappedValue ?? internalIsSelecting
@@ -878,6 +888,8 @@ struct NativeResultGrid: View {
     assets: [NativeAsset],
     localAssets: [NativeDeviceAsset] = [],
     hasOlder: Bool,
+    startsAtLatest: Bool = false,
+    initialPositionReady: Bool = true,
     isSelecting: Binding<Bool>? = nil,
     selectedIDs: Binding<Set<String>>? = nil,
     loadMore: @escaping () -> Void
@@ -886,6 +898,8 @@ struct NativeResultGrid: View {
     self.assets = assets
     self.localAssets = localAssets
     self.hasOlder = hasOlder
+    self.startsAtLatest = startsAtLatest
+    self.initialPositionReady = initialPositionReady
     self.isSelectingBinding = isSelecting
     self.selectedIDsBinding = selectedIDs
     self.loadMore = loadMore
@@ -924,9 +938,17 @@ struct NativeResultGrid: View {
   }
 
   var body: some View {
-    ScrollView {
-      LazyVStack(spacing: 4) {
-        ForEach(mergedGroups.keys.sorted(by: >), id: \.self) { day in
+    ScrollViewReader { scrollProxy in
+      ScrollView {
+        LazyVStack(spacing: 4) {
+          if startsAtLatest && hasOlder && !assets.isEmpty {
+            Button("加载更早照片", action: loadMore)
+              .frame(maxWidth: .infinity).padding(16)
+          }
+          ForEach(
+            nativeSortedResultDays(Array(mergedGroups.keys), oldestFirst: startsAtLatest),
+            id: \.self
+          ) { day in
           VStack(alignment: .leading, spacing: 2) {
             Text(NativeImmichClient.formatChineseDate(day)).font(.headline).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal)
             let gridSpacing: CGFloat = columns > 7 ? 1 : 2
@@ -1026,12 +1048,37 @@ struct NativeResultGrid: View {
             }
           }
         }
-        if hasOlder && !assets.isEmpty {
-          ProgressView().frame(maxWidth: .infinity).padding(16)
-            .onAppear { loadMore() }
+          if !startsAtLatest && hasOlder && !assets.isEmpty {
+            ProgressView().frame(maxWidth: .infinity).padding(16)
+              .onAppear { loadMore() }
+          }
+          if startsAtLatest {
+            Color.clear.frame(maxWidth: .infinity).frame(height: 1)
+              .id(bottomAnchor)
+          }
         }
       }
+      .onAppear { positionAtLatest(proxy: scrollProxy) }
+      .onChange(of: initialPositionReady) { _ in
+        positionAtLatest(proxy: scrollProxy)
+      }
+      .onChange(of: merged.last?.id) { _ in
+        positionAtLatest(proxy: scrollProxy)
+      }
+      .onChange(of: merged.count) { _ in
+        positionAtLatest(proxy: scrollProxy)
+      }
+      .simultaneousGesture(
+        DragGesture(minimumDistance: 20)
+          .onChanged { drag in
+            guard startsAtLatest, !isSelecting,
+                  abs(drag.translation.height) > 25 else { return }
+            userMovedGrid = true
+            bottomPositionTask?.cancel()
+          }
+      )
     }
+    .onDisappear { bottomPositionTask?.cancel() }
     .coordinateSpace(name: "resultGridScrollSpace")
     .nativeScrollDisabled(isDragSelecting)
     .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
@@ -1124,6 +1171,24 @@ struct NativeResultGrid: View {
         items: merged,
         initialItem: item
       )
+    }
+  }
+
+  private func positionAtLatest(proxy: ScrollViewProxy) {
+    guard startsAtLatest, initialPositionReady, !userMovedGrid,
+          !merged.isEmpty else { return }
+    bottomPositionTask?.cancel()
+    bottomPositionTask = Task { @MainActor in
+      for delay in [0, 60, 180, 350, 700] {
+        if delay > 0 {
+          try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000)
+        }
+        guard !Task.isCancelled, !userMovedGrid else { return }
+        withAnimation(.none) {
+          proxy.scrollTo(bottomAnchor, anchor: .bottom)
+        }
+      }
+      bottomPositionTask = nil
     }
   }
 
@@ -2082,6 +2147,7 @@ private struct NativeAlbumDetail: View {
   @State private var isDeleting = false
   @State private var batchShareItems: [Any]? = nil
   @State private var isPreparingBatchShare = false
+  @State private var initialLoadCompleted = false
 
   init(client: NativeImmichClient, device: NativeDeviceLibrary, entry: NativeAlbumEntry, mergeAlbums: Bool) {
     self.client = client
@@ -2122,6 +2188,8 @@ private struct NativeAlbumDetail: View {
         assets: serverAssetsToDisplay,
         localAssets: localAssetsToDisplay,
         hasOlder: entry.server != nil && model.next != nil,
+        startsAtLatest: true,
+        initialPositionReady: entry.server == nil || initialLoadCompleted,
         isSelecting: $isSelecting,
         selectedIDs: $selectedIDs
       ) {
@@ -2254,6 +2322,7 @@ private struct NativeAlbumDetail: View {
       if let server = entry.server {
         await model.load(albumId: server.id, reset: true)
       }
+      initialLoadCompleted = true
     }
   }
 

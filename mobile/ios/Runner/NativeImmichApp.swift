@@ -1190,9 +1190,14 @@ struct NativePhotosView: View {
           .font(.system(size: 11, weight: .medium))
           .foregroundColor(.secondary.opacity(0.6))
       } else if model.isLoading {
-        Image(systemName: "antenna.radiowaves.left.and.right")
+        Image(systemName: "server.rack")
           .font(.system(size: 11, weight: .medium))
           .foregroundColor(.secondary)
+          .overlay(alignment: .bottomTrailing) {
+            Image(systemName: "arrow.triangle.2.circlepath")
+              .font(.system(size: 7, weight: .bold))
+              .offset(x: 4, y: 3)
+          }
       } else {
         Image(systemName: "server.rack")
           .font(.system(size: 11, weight: .medium))
@@ -1272,9 +1277,16 @@ struct NativePhotosView: View {
         .font(.system(size: 16, weight: .medium))
         .foregroundColor(.secondary.opacity(0.6))
     } else if model.isLoading {
-      Image(systemName: "antenna.radiowaves.left.and.right")
+      Image(systemName: "server.rack")
         .font(.system(size: 16, weight: .medium))
         .foregroundColor(.secondary)
+        .overlay(alignment: .bottomTrailing) {
+          Image(systemName: "arrow.triangle.2.circlepath")
+            .font(.system(size: 9, weight: .bold))
+            .padding(1)
+            .background(Color(uiColor: .systemBackground), in: Circle())
+            .offset(x: 6, y: 5)
+        }
     } else {
       Image(systemName: "server.rack")
         .font(.system(size: 16, weight: .medium))

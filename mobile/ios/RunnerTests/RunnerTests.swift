@@ -28,6 +28,19 @@ final class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: false))
   }
 
+  func testAlbumOrdersOldestAboveNewest() {
+    let older = Date(timeIntervalSince1970: 100)
+    let newer = Date(timeIntervalSince1970: 200)
+    XCTAssertEqual(
+      nativeSortedResultDays([newer, older], oldestFirst: true),
+      [older, newer]
+    )
+    XCTAssertEqual(
+      nativeSortedResultDays([older, newer], oldestFirst: false),
+      [newer, older]
+    )
+  }
+
   func testTimelineIgnoresDragDuringEarlyBootstrap() {
     XCTAssertTrue(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: true, elapsedSinceBootstrapStart: 0.2))
     XCTAssertFalse(nativeShouldIgnoreTimelineDragDuringBootstrap(isBootstrapping: true, elapsedSinceBootstrapStart: 1.0))

@@ -3127,6 +3127,19 @@ struct NativeThumbnail: View {
 
 import AVKit
 
+private struct NativeGallerySystemOverlayModifier: ViewModifier {
+  let isImmersive: Bool
+
+  @ViewBuilder
+  func body(content: Content) -> some View {
+    if #available(iOS 16.0, *) {
+      content.persistentSystemOverlays(isImmersive ? .hidden : .automatic)
+    } else {
+      content
+    }
+  }
+}
+
 struct NativeUnifiedGalleryViewer: View {
   let client: NativeImmichClient
   let device: NativeDeviceLibrary
@@ -3357,6 +3370,7 @@ struct NativeUnifiedGalleryViewer: View {
         .transition(.opacity)
       }
     }
+    .animation(.easeInOut(duration: 0.2), value: showChrome)
     .confirmationDialog("删除范围", isPresented: $showDeleteScopeDialog, titleVisibility: .visible) {
       if currentItem?.local != nil {
         Button("仅删除本地", role: .destructive) {
@@ -3420,6 +3434,7 @@ struct NativeUnifiedGalleryViewer: View {
       NativeActivityView(activityItems: payload.content)
     }
     .statusBarHidden(true)
+    .modifier(NativeGallerySystemOverlayModifier(isImmersive: !showChrome))
   }
 
   @ViewBuilder

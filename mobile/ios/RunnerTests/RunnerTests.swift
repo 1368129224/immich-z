@@ -20,6 +20,19 @@ final class RunnerTests: XCTestCase {
     XCTAssertTrue(nativeInitialTimelineReady(source: .server, remoteLoaded: true, remoteLoading: false, localSnapshotLoaded: false, localLoading: true))
   }
 
+  func testTimelineBottomAnchorMustBeInsideViewportAtBottom() {
+    let viewport = CGRect(x: 0, y: 0, width: 390, height: 700)
+    XCTAssertTrue(nativeTimelineBottomReached(
+      anchorFrame: CGRect(x: 0, y: 699, width: 390, height: 1),
+      viewportFrame: viewport
+    ))
+    XCTAssertFalse(nativeTimelineBottomReached(
+      anchorFrame: CGRect(x: 0, y: 1_299, width: 390, height: 1),
+      viewportFrame: viewport
+    ))
+    XCTAssertFalse(nativeTimelineBottomReached(anchorFrame: .null, viewportFrame: viewport))
+  }
+
   func testTimelineKeepsBottomOnlyDuringBootstrapWithoutInterruption() {
     XCTAssertTrue(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: true))
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: false, userMovedTimeline: false, pendingSourceChange: false, hasAssets: true))

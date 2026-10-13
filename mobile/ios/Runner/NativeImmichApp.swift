@@ -1059,6 +1059,8 @@ struct NativePhotosView: View {
   @State private var itemBounds: [String: CGRect] = [:]
   @State private var lastPublishedItemBounds: [String: CGRect] = [:]
   @State private var lastItemBoundsUpdate: Date = .distantPast
+  @State private var timelineBottomAnchorFrame = CGRect.null
+  @State private var timelineViewportFrame = CGRect.null
   @State private var pendingSourceChangeScroll = false
   @State private var hasInitialScrolled = false
   @State private var isBootstrappingTimeline = true
@@ -1070,6 +1072,7 @@ struct NativePhotosView: View {
   @State private var userMovedTimeline = false
   @State private var hydrationTask: Task<Void, Never>?
   @State private var bottomPositionTask: Task<Void, Never>?
+  @State private var bottomPositionRetryCount = 0
   @State private var bottomPositionRequest = 0
   @State private var loadingOlderAnchor: String?
   @State private var showServerSettings = false
@@ -1233,44 +1236,31 @@ struct NativePhotosView: View {
     device.assets.filter { (!cloud.checkedIDs.contains($0.id) || cloud.failedVerificationIDs.contains($0.id)) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
-  @ViewBuilder
   private var trailingToolbarContent: some View {
-    if isSelecting {
-      Button(selectedIDs.count == totalDisplayCount ? "取消全选" : "全选") {
-        if selectedIDs.count == totalDisplayCount { selectedIDs.removeAll() }
-        else { selectedIDs = Set(cachedDayGroups.flatMap(\.assets).map(\.id)) }
+    HStack(spacing: 2) {
+      Button {
+        showServerSettings = true
+      } label: {
+        serverStatusIcon
+          .frame(width: 20, height: 20)
+          .frame(width: 36, height: 32)
+          .contentShape(Rectangle())
       }
-    } else {
-      HStack(spacing: 2) {
-        Button("选择") {
-          isSelecting = true
-          selectedIDs.removeAll()
-        }
-        .disabled(!isInitialTimelineVisible)
-        .font(.system(size: 14, weight: .medium))
-        .buttonStyle(.plain)
-        .padding(.horizontal, 5)
+      .buttonStyle(.plain)
+      .accessibilityLabel("服务器状态")
 
-        Button {
-          showServerSettings = true
-        } label: {
-          serverStatusIcon
-        }
-        .frame(width: 36, height: 40)
-        .buttonStyle(.plain)
-
-        Button {
-          showSyncSettings = true
-        } label: {
-          cloudSyncStatusIcon
-            .frame(width: 28, height: 28)
-        }
-        .frame(width: 36, height: 40)
-        .buttonStyle(.plain)
-        .accessibilityLabel("同步状态")
+      Button {
+        showSyncSettings = true
+      } label: {
+        cloudSyncStatusIcon
+          .frame(width: 20, height: 20)
+          .frame(width: 36, height: 32)
+          .contentShape(Rectangle())
       }
-      .fixedSize(horizontal: true, vertical: false)
+      .buttonStyle(.plain)
+      .accessibilityLabel("同步状态")
     }
+    .fixedSize(horizontal: true, vertical: false)
   }
 
   @ViewBuilder
@@ -1307,7 +1297,7 @@ struct NativePhotosView: View {
 
   private var cloudSyncStatusIcon: some View {
     Image(systemName: "icloud")
-      .font(.system(size: 18, weight: .medium))
+      .font(.system(size: 16, weight: .medium))
       .foregroundColor(.secondary)
       .overlay(alignment: .bottomTrailing) {
         Image(systemName: cloudSyncBadgeName)
@@ -1469,10 +1459,14 @@ struct NativePhotosView: View {
                 }
               }
             }
-            Color.clear
-              .frame(maxWidth: .infinity)
-              .frame(height: 1)
-              .id(bottomAnchor)
+            GeometryReader { geometry in
+              Color.clear.preference(
+                key: NativeTimelineBottomAnchorFramePreferenceKey.self,
+                value: geometry.frame(in: .named("photosScrollSpace"))
+              )
+            }
+            .frame(height: 1)
+            .id(bottomAnchor)
           }
   }
 
@@ -1480,6 +1474,12 @@ struct NativePhotosView: View {
     content
         .coordinateSpace(name: "photosScrollSpace")
         .nativeScrollDisabled(isDragSelecting)
+        .onPreferenceChange(NativeTimelineBottomAnchorFramePreferenceKey.self) { frame in
+          timelineBottomAnchorFrame = frame
+        }
+        .onPreferenceChange(NativeTimelineViewportFramePreferenceKey.self) { frame in
+          timelineViewportFrame = frame
+        }
         .onPreferenceChange(NativeItemFramePreferenceKey.self) { frames in
           let forceUpdate = isSelecting || isDragSelecting || isMagnifying
           let now = Date()
@@ -1769,18 +1769,16 @@ struct NativePhotosView: View {
                 Button {
                   triggerRefresh(proxy: proxy)
                 } label: {
-                  if isRefreshing || model.isLoading {
-                    ProgressView()
-                      .scaleEffect(0.7)
-                      .frame(width: 16, height: 16)
-                  } else {
-                    Image(systemName: "arrow.clockwise")
-                      .font(.system(size: 14, weight: .medium))
-                      .foregroundColor(.secondary)
-                  }
+                  Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(.secondary)
+                    .frame(width: 20, height: 20)
+                    .frame(width: 36, height: 32)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .disabled(!isInitialTimelineVisible)
+                .disabled(!isInitialTimelineVisible || isRefreshing || model.isLoading)
+                .accessibilityLabel("刷新照片")
 
                 Text("\(totalDisplayCount) 项")
                   .font(.caption)
@@ -1797,7 +1795,7 @@ struct NativePhotosView: View {
               }
               .pickerStyle(.segmented)
               // Leave room for both server and sync buttons on narrow iPhones.
-              .frame(width: min(142, UIScreen.main.bounds.width * 0.34))
+              .frame(width: min(142, UIScreen.main.bounds.width * 0.34), height: 32)
               .accessibilityLabel("照片来源")
             }
           }
@@ -1911,6 +1909,14 @@ struct NativePhotosView: View {
               timelineGestureContent(
                 ZStack {
                   ScrollView { timelineGridContent(proxy: proxy) }
+                    .background(
+                      GeometryReader { geometry in
+                        Color.clear.preference(
+                          key: NativeTimelineViewportFramePreferenceKey.self,
+                          value: geometry.frame(in: .named("photosScrollSpace"))
+                        )
+                      }
+                    )
                     .opacity(isInitialTimelineVisible ? 1 : 0)
                     .allowsHitTesting(isInitialTimelineVisible)
                   if !isInitialTimelineVisible {
@@ -2211,6 +2217,7 @@ struct NativePhotosView: View {
       if !isInitialTimelineVisible {
         // A source switch during cold start still needs the hidden layout
         // settling passes before the new timeline becomes visible.
+        bottomPositionRetryCount = 0
         scrollToBottom(proxy: proxy, animated: false)
       } else {
         if let targetAssetID = cachedDayGroups.last?.assets.last?.id {
@@ -2237,6 +2244,7 @@ struct NativePhotosView: View {
       didInitialPosition = true
       return
     }
+    bottomPositionRetryCount = 0
     scrollToBottom(proxy: proxy, animated: false, initial: true)
   }
 
@@ -2273,6 +2281,7 @@ struct NativePhotosView: View {
     // LazyVStack estimates heights for off-screen days. Revisit its bottom
     // after layout materializes them, rather than trusting a single scrollTo.
     bottomPositionTask = Task { @MainActor in
+      var stableBottomPasses = 0
       for (index, delay) in [0, 50, 150, 350, 700].enumerated() {
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000) }
         guard !Task.isCancelled, request == bottomPositionRequest, !userMovedTimeline,
@@ -2290,10 +2299,44 @@ struct NativePhotosView: View {
           withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
         }
         didInitialPosition = true
+        try? await Task.sleep(nanoseconds: 40_000_000)
+        if nativeTimelineBottomReached(
+          anchorFrame: timelineBottomAnchorFrame,
+          viewportFrame: timelineViewportFrame
+        ) {
+          stableBottomPasses += 1
+        } else {
+          stableBottomPasses = 0
+        }
+        // LazyVStack's estimated height may change as day groups materialize.
+        // Require multiple separated bottom measurements before revealing it.
+        if stableBottomPasses >= 3 { break }
       }
       if request == bottomPositionRequest {
-        bottomPositionTask = nil
-        if !isInitialTimelineVisible {
+        let reachedBottom = nativeTimelineBottomReached(
+          anchorFrame: timelineBottomAnchorFrame,
+          viewportFrame: timelineViewportFrame
+        )
+        if reachedBottom && stableBottomPasses >= 3 {
+          bottomPositionTask = nil
+          bottomPositionRetryCount = 0
+          isBootstrappingTimeline = false
+          isInitialTimelineVisible = true
+        } else if !Task.isCancelled && !userMovedTimeline &&
+                    bottomPositionRetryCount < 1 {
+          // Retry only after SwiftUI has published the latest lazy-stack
+          // geometry; never expose the grid at the stale top offset.
+          bottomPositionRetryCount += 1
+          try? await Task.sleep(nanoseconds: 100_000_000)
+          guard !Task.isCancelled, request == bottomPositionRequest,
+                !userMovedTimeline else { return }
+          bottomPositionTask = nil
+          scrollToBottom(proxy: proxy, animated: false, initial: initial)
+        } else {
+          bottomPositionTask = nil
+          bottomPositionRetryCount = 0
+          // Bound the hidden wait if an OS/layout edge case prevents geometry
+          // reporting; the final scroll request has still targeted the anchor.
           isBootstrappingTimeline = false
           isInitialTimelineVisible = true
         }
@@ -2570,6 +2613,22 @@ struct NativeItemFramePreferenceKey: PreferenceKey {
   static var defaultValue: [String: CGRect] = [:]
   static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
     value.merge(nextValue(), uniquingKeysWith: { $1 })
+  }
+}
+
+struct NativeTimelineBottomAnchorFramePreferenceKey: PreferenceKey {
+  static var defaultValue = CGRect.null
+  static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+    let next = nextValue()
+    if !next.isNull { value = next }
+  }
+}
+
+struct NativeTimelineViewportFramePreferenceKey: PreferenceKey {
+  static var defaultValue = CGRect.null
+  static func reduce(value: inout CGRect, nextValue: () -> CGRect) {
+    let next = nextValue()
+    if !next.isNull { value = next }
   }
 }
 

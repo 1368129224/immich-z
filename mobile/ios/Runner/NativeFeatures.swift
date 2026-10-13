@@ -43,6 +43,16 @@ func nativeShouldKeepTimelineAtBottom(
     hasAssets && !positioningInProgress
 }
 
+func nativeTimelineBottomReached(
+  anchorFrame: CGRect,
+  viewportFrame: CGRect,
+  tolerance: CGFloat = 2
+) -> Bool {
+  guard !anchorFrame.isNull, !viewportFrame.isNull else { return false }
+  return anchorFrame.maxY >= viewportFrame.minY - tolerance &&
+    anchorFrame.maxY <= viewportFrame.maxY + tolerance
+}
+
 func nativeViewerNextSelectionID(
   deletingID: String,
   orderedIDs: [String]

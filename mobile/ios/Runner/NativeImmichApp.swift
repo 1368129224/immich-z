@@ -1,6 +1,7 @@
 import Combine
 import CryptoKit
 import Foundation
+import Network
 import Photos
 import PhotosUI
 import Security
@@ -1161,6 +1162,49 @@ private final class NativeTimelineModel: ObservableObject {
   func acknowledgeNewAssets() { newlyAddedCount = 0 }
 }
 
+func nativeTimelineRefreshTTL(isCellular: Bool, isExpensive: Bool = false) -> TimeInterval {
+  if isCellular || isExpensive {
+    return 180.0 // 3 minutes on cellular or metered connections
+  } else {
+    return 30.0  // 30 seconds on Wi-Fi / unmetered connections
+  }
+}
+
+func nativeShouldRefreshTimeline(
+  lastRefreshTime: Date,
+  now: Date,
+  isCellular: Bool,
+  isExpensive: Bool = false
+) -> Bool {
+  let ttl = nativeTimelineRefreshTTL(isCellular: isCellular, isExpensive: isExpensive)
+  return now.timeIntervalSince(lastRefreshTime) >= ttl
+}
+
+final class NativeNetworkMonitor: ObservableObject {
+  static let shared = NativeNetworkMonitor()
+  private let monitor: NWPathMonitor
+  private let queue = DispatchQueue(label: "com.immichz.networkmonitor", qos: .utility)
+
+  @Published private(set) var isCellular: Bool = false
+  @Published private(set) var isExpensive: Bool = false
+  @Published private(set) var isConnected: Bool = true
+
+  private init() {
+    monitor = NWPathMonitor()
+    monitor.pathUpdateHandler = { [weak self] path in
+      let cellular = path.usesInterfaceType(.cellular)
+      let expensive = path.isExpensive
+      let connected = path.status == .satisfied
+      DispatchQueue.main.async {
+        self?.isCellular = cellular
+        self?.isExpensive = expensive
+        self?.isConnected = connected
+      }
+    }
+    monitor.start(queue: queue)
+  }
+}
+
 struct NativePhotosView: View {
   let client: NativeImmichClient
   @ObservedObject var device: NativeDeviceLibrary
@@ -1208,6 +1252,7 @@ struct NativePhotosView: View {
   @State private var needsInitialBackgroundRefresh = false
   @State private var initialRemoteLoaded = false
   @State private var lastForegroundRefreshTime: Date = .distantPast
+  @State private var lastTimelineRefreshTime: Date = .distantPast
   @State private var needsForegroundRefresh = false
   @State private var didInitialPosition = false
   @State private var userMovedTimeline = false
@@ -1772,6 +1817,7 @@ struct NativePhotosView: View {
           bottomPositionTask = nil
           isBootstrappingTimeline = false
           isInitialTimelineVisible = true
+          lastTimelineRefreshTime = Date()
           device.refresh()
           await model.refreshLatest()
           if !serverExclusionsReady { refreshExcludedServerAssetIDs() }
@@ -1848,12 +1894,20 @@ struct NativePhotosView: View {
           }
           rebuildDayGroups()
           refreshExcludedLocalAssetIDs()
-          refreshExcludedServerAssetIDs()
+          if !serverExclusionsReady { refreshExcludedServerAssetIDs() }
+
+          let now = Date()
+          let isCellular = NativeNetworkMonitor.shared.isCellular
+          let isExpensive = NativeNetworkMonitor.shared.isExpensive
+
           if isInitialTimelineVisible {
-            Task(priority: .utility) {
-              await model.refreshLatest()
-              rebuildDayGroups()
-              scheduleMatchedHydration()
+            if nativeShouldRefreshTimeline(lastRefreshTime: lastTimelineRefreshTime, now: now, isCellular: isCellular, isExpensive: isExpensive) {
+              lastTimelineRefreshTime = now
+              Task(priority: .utility) {
+                await model.refreshLatest()
+                rebuildDayGroups()
+                scheduleMatchedHydration()
+              }
             }
           } else if !cachedDayGroups.isEmpty &&
               (model.hasCachedSnapshot || device.hasLoadedInitialSnapshot) {
@@ -1863,6 +1917,7 @@ struct NativePhotosView: View {
             needsInitialBackgroundRefresh = true
             positionInitiallyIfReady(proxy: proxy)
           } else if !model.isLoading {
+            lastTimelineRefreshTime = now
             Task {
               await model.loadInitial()
               initialRemoteLoaded = true
@@ -1882,6 +1937,7 @@ struct NativePhotosView: View {
           guard visible, needsInitialBackgroundRefresh else { return }
           needsInitialBackgroundRefresh = false
           scheduleBackgroundCloudCheck()
+          lastTimelineRefreshTime = Date()
           Task(priority: .utility) {
             await model.refreshLatest()
             rebuildDayGroups()
@@ -1939,8 +1995,14 @@ struct NativePhotosView: View {
             isBootstrappingTimeline = false
           }
           let now = Date()
-          guard now.timeIntervalSince(lastForegroundRefreshTime) > 2 else { return }
-          lastForegroundRefreshTime = now
+          let isCellular = NativeNetworkMonitor.shared.isCellular
+          let isExpensive = NativeNetworkMonitor.shared.isExpensive
+          guard nativeShouldRefreshTimeline(lastRefreshTime: lastTimelineRefreshTime, now: now, isCellular: isCellular, isExpensive: isExpensive) else {
+            device.refresh()
+            rebuildDayGroups()
+            return
+          }
+          lastTimelineRefreshTime = now
           scheduleBackgroundCloudCheck()
           Task(priority: .utility) {
             // The existing grid stays interactive while the metadata reloads.

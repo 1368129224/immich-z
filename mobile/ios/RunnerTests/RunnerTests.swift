@@ -548,4 +548,37 @@ final class RunnerTests: XCTestCase {
     XCTAssertTrue(nativeShouldAcceptSearchResult(requestGeneration: 2, currentGeneration: 2))
     XCTAssertFalse(nativeShouldAcceptSearchResult(requestGeneration: 3, currentGeneration: 2))
   }
+
+  func testNativeTimelineRefreshTTLAdaptsToNetworkType() {
+    // Wi-Fi / unmetered
+    XCTAssertEqual(nativeTimelineRefreshTTL(isCellular: false, isExpensive: false), 30.0)
+
+    // Cellular / mobile data
+    XCTAssertEqual(nativeTimelineRefreshTTL(isCellular: true, isExpensive: false), 180.0)
+
+    // Metered / expensive connection (e.g. hotspot or Low Data Mode)
+    XCTAssertEqual(nativeTimelineRefreshTTL(isCellular: false, isExpensive: true), 180.0)
+    XCTAssertEqual(nativeTimelineRefreshTTL(isCellular: true, isExpensive: true), 180.0)
+  }
+
+  func testNativeShouldRefreshTimelineRespectsTTL() {
+    let now = Date(timeIntervalSince1970: 10000)
+
+    // Wi-Fi (TTL 30s)
+    XCTAssertFalse(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-10), now: now, isCellular: false))
+    XCTAssertFalse(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-29), now: now, isCellular: false))
+    XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-30), now: now, isCellular: false))
+    XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-60), now: now, isCellular: false))
+
+    // Cellular (TTL 180s)
+    XCTAssertFalse(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-30), now: now, isCellular: true))
+    XCTAssertFalse(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-120), now: now, isCellular: true))
+    XCTAssertFalse(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-179), now: now, isCellular: true))
+    XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-180), now: now, isCellular: true))
+    XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: now.addingTimeInterval(-300), now: now, isCellular: true))
+
+    // Initial / distant past
+    XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: .distantPast, now: now, isCellular: false))
+    XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: .distantPast, now: now, isCellular: true))
+  }
 }

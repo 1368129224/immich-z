@@ -306,4 +306,246 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(item.cloudSymbol(matchedServerIDs: [:], checkedIDs: ["local"]), "icloud.slash")
     XCTAssertEqual(item.cloudSymbol(matchedServerIDs: ["local": "server"], checkedIDs: ["local"]), "checkmark.icloud")
   }
+
+  func testRecentSearchesStoreRoundTripAndDeduplication() {
+    let testKey = "test_recent_searches_\(UUID().uuidString)"
+    let store = NativeRecentSearchesStore(userDefaults: .standard, storageKey: testKey, maxCount: 3)
+    defer { store.clear() }
+
+    XCTAssertTrue(store.load().isEmpty)
+
+    // Whitespace trimming
+    store.add("  cat  ")
+    XCTAssertEqual(store.load(), ["cat"])
+
+    // Empty/blank ignored
+    store.add("")
+    store.add("   \t  ")
+    XCTAssertEqual(store.load(), ["cat"])
+
+    // Second item prepends
+    store.add("dog")
+    XCTAssertEqual(store.load(), ["dog", "cat"])
+
+    // Case-insensitive deduplication moves latest to front
+    store.add("CAT")
+    XCTAssertEqual(store.load(), ["CAT", "dog"])
+
+    // Max count capping (maxCount = 3)
+    store.add("bird")
+    store.add("fish")
+    XCTAssertEqual(store.load(), ["fish", "bird", "CAT"])
+
+    // Remove single item
+    store.remove("bird")
+    XCTAssertEqual(store.load(), ["fish", "CAT"])
+
+    // Clear all
+    store.clear()
+    XCTAssertTrue(store.load().isEmpty)
+  }
+
+  func testNativeFilterLocalAssetsByQueryAndFilename() {
+    let d1 = Date(timeIntervalSince1970: 1715342400) // 2024-05-10
+    let d2 = Date(timeIntervalSince1970: 1718452800) // 2024-06-15
+    let d3 = Date(timeIntervalSince1970: 1721476800) // 2024-07-20
+
+    let a1 = NativeDeviceAsset(id: "loc1", date: d1, isVideo: false, contentVersion: 1)
+    let a2 = NativeDeviceAsset(id: "loc2", date: d2, isVideo: false, contentVersion: 1)
+    let a3 = NativeDeviceAsset(id: "loc3", date: d3, isVideo: true, contentVersion: 1)
+    let all = [a1, a2, a3]
+
+    let mockLookup: (String) -> String? = { id in
+      switch id {
+      case "loc1": return "IMG_1234.JPG"
+      case "loc2": return "Vacation_Summer.png"
+      case "loc3": return "Beach_Party.mov"
+      default: return nil
+      }
+    }
+
+    // Keyword matching
+    let hitVacation = nativeFilterLocalAssets(
+      assets: all, query: "vacation", filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture, filenameLookup: mockLookup
+    )
+    XCTAssertEqual(hitVacation.map(\.id), ["loc2"])
+
+    // Case insensitivity
+    let hitSummer = nativeFilterLocalAssets(
+      assets: all, query: "SUMMER", filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture, filenameLookup: mockLookup
+    )
+    XCTAssertEqual(hitSummer.map(\.id), ["loc2"])
+
+    // No match
+    let hitNone = nativeFilterLocalAssets(
+      assets: all, query: "nonexistent", filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture, filenameLookup: mockLookup
+    )
+    XCTAssertTrue(hitNone.isEmpty)
+
+    // Nil/empty query passes all
+    let hitAll = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture, filenameLookup: mockLookup
+    )
+    XCTAssertEqual(hitAll.count, 3)
+  }
+
+  func testNativeFilterLocalAssetsByMediaTypeAndFavorites() {
+    let now = Date()
+    let photoNormal = NativeDeviceAsset(id: "p1", date: now, isVideo: false, contentVersion: 1, isFavorite: false)
+    let photoFav = NativeDeviceAsset(id: "p2", date: now, isVideo: false, contentVersion: 1, isFavorite: true)
+    let videoFav = NativeDeviceAsset(id: "v1", date: now, isVideo: true, contentVersion: 1, isFavorite: true)
+    let all = [photoNormal, photoFav, videoFav]
+
+    // Photos only
+    let photosOnly = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: false,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture
+    )
+    XCTAssertEqual(photosOnly.map(\.id), ["p1", "p2"])
+
+    // Videos only
+    let videosOnly = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: false, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture
+    )
+    XCTAssertEqual(videosOnly.map(\.id), ["v1"])
+
+    // Neither photos nor videos
+    let neither = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: false, filterVideos: false,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture
+    )
+    XCTAssertTrue(neither.isEmpty)
+
+    // Favorites only
+    let favs = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: true,
+      favoritesOnly: true, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture
+    )
+    XCTAssertEqual(favs.map(\.id), ["p2", "v1"])
+
+    // Favorites and photos only
+    let favPhotos = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: false,
+      favoritesOnly: true, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture
+    )
+    XCTAssertEqual(favPhotos.map(\.id), ["p2"])
+  }
+
+  func testNativeFilterLocalAssetsByDateRange() {
+    let jan = Date(timeIntervalSince1970: 1704888000) // 2024-01-10
+    let jun = Date(timeIntervalSince1970: 1718020800) // 2024-06-10
+    let dec = Date(timeIntervalSince1970: 1733832000) // 2024-12-10
+
+    let a1 = NativeDeviceAsset(id: "jan", date: jan, isVideo: false, contentVersion: 1)
+    let a2 = NativeDeviceAsset(id: "jun", date: jun, isVideo: false, contentVersion: 1)
+    let a3 = NativeDeviceAsset(id: "dec", date: dec, isVideo: false, contentVersion: 1)
+    let all = [a1, a2, a3]
+
+    let may1 = Date(timeIntervalSince1970: 1714564800) // 2024-05-01
+    let jul1 = Date(timeIntervalSince1970: 1719835200) // 2024-07-01
+
+    // After May 1 -> June & Dec
+    let afterMay = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: true, after: may1,
+      useBefore: false, before: .distantFuture
+    )
+    XCTAssertEqual(afterMay.map(\.id), ["jun", "dec"])
+
+    // Before July 1 -> Jan & June
+    let beforeJul = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: true, before: jul1
+    )
+    XCTAssertEqual(beforeJul.map(\.id), ["jan", "jun"])
+
+    // Range May 1 - July 1 -> June only
+    let rangeMayJul = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: true, after: may1,
+      useBefore: true, before: jul1
+    )
+    XCTAssertEqual(rangeMayJul.map(\.id), ["jun"])
+  }
+
+  func testNativeFilterLocalAssetsByAlbum() {
+    let a1 = NativeDeviceAsset(id: "loc1", date: Date(), isVideo: false, contentVersion: 1)
+    let a2 = NativeDeviceAsset(id: "loc2", date: Date(), isVideo: false, contentVersion: 1)
+    let a3 = NativeDeviceAsset(id: "loc3", date: Date(), isVideo: false, contentVersion: 1)
+    let all = [a1, a2, a3]
+
+    let inAlbum = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture, allowedLocalAssetIDs: ["loc1", "loc3"]
+    )
+    XCTAssertEqual(inAlbum.map(\.id), ["loc1", "loc3"])
+
+    // Empty allowed IDs (e.g. server album) excludes all local assets
+    let inEmptyAlbum = nativeFilterLocalAssets(
+      assets: all, query: nil, filterPhotos: true, filterVideos: true,
+      favoritesOnly: false, useAfter: false, after: .distantPast,
+      useBefore: false, before: .distantFuture, allowedLocalAssetIDs: []
+    )
+    XCTAssertTrue(inEmptyAlbum.isEmpty)
+  }
+
+  func testNativeFilterSearchResultsBySource() {
+    let s1 = NativeAsset(id: "S1", date: Date(timeIntervalSince1970: 100), isImage: true, isFavorite: false, thumbhash: nil)
+    let s2 = NativeAsset(id: "S2", date: Date(timeIntervalSince1970: 200), isImage: true, isFavorite: false, thumbhash: nil)
+    let s3 = NativeAsset(id: "S3", date: Date(timeIntervalSince1970: 300), isImage: true, isFavorite: false, thumbhash: nil)
+    let servers = [s1, s2, s3]
+
+    let l1 = NativeDeviceAsset(id: "L1", date: s1.date, isVideo: false, contentVersion: 1)
+    let l2 = NativeDeviceAsset(id: "L2", date: s2.date, isVideo: false, contentVersion: 1)
+    let l4 = NativeDeviceAsset(id: "L4", date: Date(timeIntervalSince1970: 400), isVideo: false, contentVersion: 1)
+    let locals = [l1, l2, l4]
+
+    let matched = ["L1": "S1", "L2": "S2"]
+
+    // All source: retains all
+    let allResult = nativeFilterSearchResultsBySource(source: .all, serverAssets: servers, localAssets: locals, matchedServerIDs: matched)
+    XCTAssertEqual(allResult.server.count, 3)
+    XCTAssertEqual(allResult.local.count, 3)
+
+    // Device source: only device assets and matched server copies (S3 is excluded)
+    let deviceResult = nativeFilterSearchResultsBySource(source: .device, serverAssets: servers, localAssets: locals, matchedServerIDs: matched)
+    XCTAssertEqual(deviceResult.local.map(\.id), ["L1", "L2", "L4"])
+    XCTAssertEqual(deviceResult.server.map(\.id), ["S1", "S2"])
+
+    // Server source: only server assets and matched local copies (L4 is excluded)
+    let serverResult = nativeFilterSearchResultsBySource(source: .server, serverAssets: servers, localAssets: locals, matchedServerIDs: matched)
+    XCTAssertEqual(serverResult.server.map(\.id), ["S1", "S2", "S3"])
+    XCTAssertEqual(serverResult.local.map(\.id), ["L1", "L2"])
+  }
+
+  func testNativeDeduplicateServerAssets() {
+    let s1 = NativeAsset(id: "S1", date: .distantPast, isImage: true, isFavorite: false, thumbhash: nil)
+    let s2 = NativeAsset(id: "S2", date: .distantPast, isImage: true, isFavorite: false, thumbhash: nil)
+    let s3 = NativeAsset(id: "S3", date: .distantPast, isImage: true, isFavorite: false, thumbhash: nil)
+
+    let merged = nativeDeduplicateServerAssets(existing: [s1, s2], incoming: [s2, s3])
+    XCTAssertEqual(merged.map(\.id), ["S1", "S2", "S3"])
+  }
+
+  func testNativeSearchRaceConditionResolution() {
+    XCTAssertFalse(nativeShouldAcceptSearchResult(requestGeneration: 1, currentGeneration: 2))
+    XCTAssertTrue(nativeShouldAcceptSearchResult(requestGeneration: 2, currentGeneration: 2))
+    XCTAssertFalse(nativeShouldAcceptSearchResult(requestGeneration: 3, currentGeneration: 2))
+  }
 }

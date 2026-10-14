@@ -792,7 +792,19 @@ extension NativeImmichClient {
     if !filter.isEmpty { payload["filter"] = filter }
     let response = try await send(path: "search/smart", method: "POST", body: payload)
     guard let assets = response["assets"] as? [String: Any], let rows = assets["items"] as? [[String: Any]] else { throw NativeFeatureError.badResponse }
-    return NativeSearchPage(assets: rows.compactMap(Self.decodeAsset), next: assets["nextPage"] as? String)
+    let next: String?
+    if let str = assets["nextPage"] as? String {
+      next = str
+    } else if let num = assets["nextPage"] as? NSNumber {
+      next = num.stringValue
+    } else if let cursor = assets["nextCursor"] as? String {
+      next = cursor
+    } else if rows.count >= 100 {
+      next = "\(page + 1)"
+    } else {
+      next = nil
+    }
+    return NativeSearchPage(assets: rows.compactMap(Self.decodeAsset), next: next)
   }
 
   func explore() async throws -> [NativeExploreSection] {
@@ -1522,148 +1534,1049 @@ struct NativeGridItem: Identifiable {
   }
 }
 
+final class NativeRecentSearchesStore {
+  static let shared = NativeRecentSearchesStore()
+  private let userDefaults: UserDefaults
+  private let storageKey: String
+  private let maxCount: Int
+
+  init(userDefaults: UserDefaults = .standard, storageKey: String = "immich_device_recent_searches", maxCount: Int = 15) {
+    self.userDefaults = userDefaults
+    self.storageKey = storageKey
+    self.maxCount = maxCount
+  }
+
+  func load() -> [String] {
+    userDefaults.stringArray(forKey: storageKey) ?? []
+  }
+
+  func add(_ query: String) {
+    let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmed.isEmpty else { return }
+    var current = load()
+    current.removeAll { $0.caseInsensitiveCompare(trimmed) == .orderedSame }
+    current.insert(trimmed, at: 0)
+    if current.count > maxCount {
+      current = Array(current.prefix(maxCount))
+    }
+    userDefaults.set(current, forKey: storageKey)
+  }
+
+  func remove(_ query: String) {
+    var current = load()
+    current.removeAll { $0 == query }
+    userDefaults.set(current, forKey: storageKey)
+  }
+
+  func clear() {
+    userDefaults.removeObject(forKey: storageKey)
+  }
+}
+
+enum NativeSearchAlbumFilter: Hashable, Identifiable {
+  case all
+  case server(id: String, name: String)
+  case local(id: String, name: String)
+
+  var id: String {
+    switch self {
+    case .all: return "all"
+    case .server(let id, _): return "server:\(id)"
+    case .local(let id, _): return "local:\(id)"
+    }
+  }
+
+  var displayName: String {
+    switch self {
+    case .all: return "全部相册"
+    case .server(_, let name): return "\(name) (云端)"
+    case .local(_, let name): return "\(name) (本机)"
+    }
+  }
+
+  var shortName: String {
+    switch self {
+    case .all: return "全部相册"
+    case .server(_, let name): return name
+    case .local(_, let name): return name
+    }
+  }
+}
+
+final class NativeLocalAssetFilenameCache {
+  static let shared = NativeLocalAssetFilenameCache()
+  private var cache: [String: String] = [:]
+  private let lock = NSLock()
+
+  func filename(for localID: String) -> String? {
+    lock.lock()
+    if let cached = cache[localID] {
+      lock.unlock()
+      return cached
+    }
+    lock.unlock()
+
+    guard let phAsset = PHAsset.fetchAssets(withLocalIdentifiers: [localID], options: nil).firstObject else {
+      return nil
+    }
+    let name = (phAsset.value(forKey: "filename") as? String)
+      ?? PHAssetResource.assetResources(for: phAsset).first?.originalFilename
+
+    if let name {
+      lock.lock()
+      cache[localID] = name
+      lock.unlock()
+    }
+    return name
+  }
+
+  func clear() {
+    lock.lock()
+    cache.removeAll()
+    lock.unlock()
+  }
+}
+
+func nativeFilterLocalAssets(
+  assets: [NativeDeviceAsset],
+  query: String?,
+  filterPhotos: Bool,
+  filterVideos: Bool,
+  favoritesOnly: Bool,
+  useAfter: Bool,
+  after: Date,
+  useBefore: Bool,
+  before: Date,
+  allowedLocalAssetIDs: Set<String>? = nil,
+  filenameLookup: ((String) -> String?)? = nil
+) -> [NativeDeviceAsset] {
+  guard filterPhotos || filterVideos else { return [] }
+
+  let trimmedQuery = query?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+  let hasQuery = trimmedQuery != nil && !trimmedQuery!.isEmpty
+
+  var calendar = Calendar.autoupdatingCurrent
+  calendar.timeZone = .autoupdatingCurrent
+  let startAfter = useAfter ? calendar.startOfDay(for: after) : nil
+  let endBefore = useBefore ? (calendar.date(byAdding: .day, value: 1, to: calendar.startOfDay(for: before)) ?? before) : nil
+
+  let lookup = filenameLookup ?? { NativeLocalAssetFilenameCache.shared.filename(for: $0) }
+
+  return assets.filter { asset in
+    // Media type filter
+    if asset.isVideo && !filterVideos { return false }
+    if !asset.isVideo && !filterPhotos { return false }
+
+    // Favorites filter
+    if favoritesOnly && !asset.isFavorite { return false }
+
+    // Date filters
+    if let startAfter, asset.date < startAfter { return false }
+    if let endBefore, asset.date > endBefore { return false }
+
+    // Album filter
+    if let allowedIDs = allowedLocalAssetIDs, !allowedIDs.contains(asset.id) {
+      return false
+    }
+
+    // Query filter (filename or formatted date match)
+    if let q = trimmedQuery, hasQuery {
+      if let fname = lookup(asset.id)?.lowercased(), fname.contains(q) {
+        return true
+      }
+      let dateString = NativeImmichClient.formatChineseDate(asset.date)
+      if dateString.contains(q) {
+        return true
+      }
+      return false
+    }
+
+    return true
+  }
+}
+
+func nativeFilterSearchResultsBySource(
+  source: NativePhotosSource,
+  serverAssets: [NativeAsset],
+  localAssets: [NativeDeviceAsset],
+  matchedServerIDs: [String: String]
+) -> (server: [NativeAsset], local: [NativeDeviceAsset]) {
+  switch source {
+  case .all:
+    return (serverAssets, localAssets)
+  case .device:
+    let localIDs = Set(localAssets.map(\.id))
+    let matchedServerIDSet = Set(matchedServerIDs.filter { localIDs.contains($0.key) }.values)
+    let filteredServer = serverAssets.filter { matchedServerIDSet.contains($0.id) }
+    return (filteredServer, localAssets)
+  case .server:
+    let serverIDSet = Set(serverAssets.map(\.id))
+    let localIDsWithServerMatch = Set(matchedServerIDs.compactMap { localID, serverID in
+      serverIDSet.contains(serverID) ? localID : nil
+    })
+    let filteredLocal = localAssets.filter { localIDsWithServerMatch.contains($0.id) }
+    return (serverAssets, filteredLocal)
+  }
+}
+
+func nativeShouldAcceptSearchResult(requestGeneration: Int, currentGeneration: Int) -> Bool {
+  requestGeneration == currentGeneration
+}
+
+func nativeDeduplicateServerAssets(existing: [NativeAsset], incoming: [NativeAsset]) -> [NativeAsset] {
+  var seen = Set(existing.map(\.id))
+  var result = existing
+  for asset in incoming {
+    if seen.insert(asset.id).inserted {
+      result.append(asset)
+    }
+  }
+  return result
+}
+
+@MainActor
+final class NativeUnifiedSearchModel: ObservableObject {
+  @Published var serverAssets: [NativeAsset] = []
+  @Published var localAssets: [NativeDeviceAsset] = []
+  @Published var loading = false
+  @Published var serverError: String?
+  @Published var smartSearchDegraded = false
+  @Published var smartErrorMessage: String?
+  @Published var hasMore = false
+  @Published var hasLoaded = false
+
+  private let client: NativeImmichClient
+  private(set) var currentGeneration = 0
+  private var metadataCursor: String?
+  private var hasMoreMetadata = false
+  private var smartPage = 1
+  private var hasMoreSmart = false
+  private var seenServerAssetIDs = Set<String>()
+
+  private var lastQuery: String?
+  private var lastServerFilter: [String: Any] = [:]
+  private var lastServerAlbumID: String?
+
+  init(_ client: NativeImmichClient) {
+    self.client = client
+  }
+
+  func clear() {
+    currentGeneration += 1
+    serverAssets = []
+    localAssets = []
+    loading = false
+    serverError = nil
+    smartSearchDegraded = false
+    smartErrorMessage = nil
+    hasMore = false
+    hasLoaded = false
+    seenServerAssetIDs.removeAll()
+    metadataCursor = nil
+    smartPage = 1
+    hasMoreMetadata = false
+    hasMoreSmart = false
+    lastQuery = nil
+    lastServerFilter = [:]
+    lastServerAlbumID = nil
+  }
+
+  func search(
+    query: String?,
+    source: NativePhotosSource,
+    filterPhotos: Bool,
+    filterVideos: Bool,
+    favoritesOnly: Bool,
+    useAfter: Bool,
+    after: Date,
+    useBefore: Bool,
+    before: Date,
+    albumFilter: NativeSearchAlbumFilter,
+    device: NativeDeviceLibrary,
+    reset: Bool = true
+  ) async {
+    guard filterPhotos || filterVideos else {
+      if reset { clear() }
+      return
+    }
+
+    currentGeneration += 1
+    let gen = currentGeneration
+
+    if reset {
+      serverAssets = []
+      localAssets = []
+      seenServerAssetIDs.removeAll()
+      metadataCursor = nil
+      smartPage = 1
+      hasMoreMetadata = false
+      hasMoreSmart = false
+      serverError = nil
+      smartSearchDegraded = false
+      smartErrorMessage = nil
+    }
+
+    loading = true
+    hasLoaded = true
+    defer {
+      if gen == currentGeneration {
+        loading = false
+        hasMore = hasMoreMetadata || hasMoreSmart
+      }
+    }
+
+    let trimmedQuery = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let effectiveQuery = (trimmedQuery?.isEmpty == false) ? trimmedQuery : nil
+
+    // Build server filters
+    var serverFilters: [String: Any] = [:]
+    if filterPhotos != filterVideos {
+      serverFilters["type"] = ["eq": filterPhotos ? "IMAGE" : "VIDEO"]
+    }
+    if favoritesOnly {
+      serverFilters["isFavorite"] = ["eq": true]
+    }
+    let formatter = ISO8601DateFormatter()
+    if useAfter {
+      serverFilters["takenAt"] = ["gte": formatter.string(from: after)]
+    }
+    if useBefore {
+      var bounds = serverFilters["takenAt"] as? [String: String] ?? [:]
+      let endOfDay = Calendar.current.date(byAdding: .day, value: 1, to: Calendar.current.startOfDay(for: before)) ?? before
+      bounds["lte"] = formatter.string(from: endOfDay)
+      serverFilters["takenAt"] = bounds
+    }
+
+    var serverAlbumId: String? = nil
+    var localAlbumIDs: Set<String>? = nil
+
+    switch albumFilter {
+    case .all:
+      break
+    case .server(let id, _):
+      serverAlbumId = id
+    case .local(let id, _):
+      if let localAlbum = device.albums.first(where: { $0.id == id }) {
+        localAlbumIDs = Set(device.assets(in: localAlbum).map(\.id))
+      } else {
+        localAlbumIDs = []
+      }
+    }
+
+    lastQuery = effectiveQuery
+    lastServerFilter = serverFilters
+    lastServerAlbumID = serverAlbumId
+
+    // 1. Local Search Task
+    var matchedLocals: [NativeDeviceAsset] = []
+    if source != .server {
+      if case .server = albumFilter {
+        matchedLocals = []
+      } else {
+        matchedLocals = nativeFilterLocalAssets(
+          assets: device.assets,
+          query: effectiveQuery,
+          filterPhotos: filterPhotos,
+          filterVideos: filterVideos,
+          favoritesOnly: favoritesOnly,
+          useAfter: useAfter,
+          after: after,
+          useBefore: useBefore,
+          before: before,
+          allowedLocalAssetIDs: localAlbumIDs
+        )
+      }
+    }
+
+    guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+    self.localAssets = matchedLocals
+
+    // 2. Server Search Task
+    if source == .device || (case .local = albumFilter) {
+      self.serverAssets = []
+      self.hasMoreMetadata = false
+      self.hasMoreSmart = false
+      return
+    }
+
+    var newServerAssets: [NativeAsset] = []
+    var metadataError: Error?
+
+    if let q = effectiveQuery {
+      // Parallel Dual-Track Search
+      async let metadataSearch: NativeSearchPage? = {
+        do {
+          return try await client.searchPage(query: q, albumId: serverAlbumId, cursor: nil, filter: serverFilters)
+        } catch {
+          metadataError = error
+          return nil
+        }
+      }()
+
+      async let smartSearch: NativeSearchPage? = {
+        do {
+          return try await client.smartSearch(query: q, page: 1, filter: serverFilters)
+        } catch {
+          return nil
+        }
+      }()
+
+      let (metadataPage, smartPageResult) = await (metadataSearch, smartSearch)
+      guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+
+      if let meta = metadataPage {
+        metadataCursor = meta.next
+        hasMoreMetadata = meta.next != nil
+        for a in meta.assets {
+          if seenServerAssetIDs.insert(a.id).inserted {
+            newServerAssets.append(a)
+          }
+        }
+      }
+
+      if let smart = smartPageResult {
+        smartPage = 2
+        hasMoreSmart = smart.next != nil
+        for a in smart.assets {
+          if seenServerAssetIDs.insert(a.id).inserted {
+            newServerAssets.append(a)
+          }
+        }
+      } else {
+        smartSearchDegraded = true
+        smartErrorMessage = "智能搜索不可用，已展示普通与本机搜索结果"
+      }
+
+      if metadataPage == nil && smartPageResult == nil {
+        if let err = metadataError {
+          serverError = err.localizedDescription
+        } else {
+          serverError = "服务器搜索失败"
+        }
+      }
+    } else {
+      // Pure metadata search without text query
+      do {
+        let meta = try await client.searchPage(query: nil, albumId: serverAlbumId, cursor: nil, filter: serverFilters)
+        guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+        metadataCursor = meta.next
+        hasMoreMetadata = meta.next != nil
+        hasMoreSmart = false
+        for a in meta.assets {
+          if seenServerAssetIDs.insert(a.id).inserted {
+            newServerAssets.append(a)
+          }
+        }
+      } catch {
+        guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+        serverError = error.localizedDescription
+      }
+    }
+
+    guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+    self.serverAssets = newServerAssets
+  }
+
+  func loadMore() async {
+    guard !loading, hasMore else { return }
+    let gen = currentGeneration
+    loading = true
+    defer {
+      if gen == currentGeneration {
+        loading = false
+        hasMore = hasMoreMetadata || hasMoreSmart
+      }
+    }
+
+    var newItems: [NativeAsset] = []
+
+    if hasMoreMetadata, let cursor = metadataCursor {
+      do {
+        let page = try await client.searchPage(query: lastQuery, albumId: lastServerAlbumID, cursor: cursor, filter: lastServerFilter)
+        guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+        metadataCursor = page.next
+        hasMoreMetadata = page.next != nil
+        for a in page.assets {
+          if seenServerAssetIDs.insert(a.id).inserted {
+            newItems.append(a)
+          }
+        }
+      } catch {
+        hasMoreMetadata = false
+      }
+    }
+
+    if hasMoreSmart, let query = lastQuery {
+      do {
+        let page = try await client.smartSearch(query: query, page: smartPage, filter: lastServerFilter)
+        guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+        smartPage += 1
+        hasMoreSmart = page.next != nil
+        for a in page.assets {
+          if seenServerAssetIDs.insert(a.id).inserted {
+            newItems.append(a)
+          }
+        }
+      } catch {
+        hasMoreSmart = false
+      }
+    }
+
+    guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
+    self.serverAssets += newItems
+  }
+}
+
+private struct FilterTagView: View {
+  let label: String
+  let onRemove: () -> Void
+
+  var body: some View {
+    HStack(spacing: 4) {
+      Text(label)
+        .font(.caption2)
+        .lineLimit(1)
+      Button(action: onRemove) {
+        Image(systemName: "xmark")
+          .font(.system(size: 8, weight: .bold))
+      }
+      .buttonStyle(.plain)
+    }
+    .padding(.horizontal, 8)
+    .padding(.vertical, 4)
+    .background(Color.accentColor.opacity(0.12))
+    .foregroundColor(.accentColor)
+    .cornerRadius(12)
+  }
+}
+
 private struct NativeSearchView: View {
   let client: NativeImmichClient
-  @StateObject private var model: NativeResultsModel
+  @ObservedObject var device: NativeDeviceLibrary
+  @StateObject private var model: NativeUnifiedSearchModel
+
   @State private var term = ""
-  @State private var submitted = ""
-  @State private var smartMode = false
-  @State private var explore: [NativeExploreSection] = []
-  @State private var exploreError: String?
+  @State private var sourceFilter: NativePhotosSource = .all
   @State private var filterPhotos = true
   @State private var filterVideos = true
   @State private var favoritesOnly = false
-  @State private var after = Date()
-  @State private var before = Date()
   @State private var useAfter = false
+  @State private var after = Date()
   @State private var useBefore = false
-  init(client: NativeImmichClient) {
+  @State private var before = Date()
+  @State private var selectedAlbum: NativeSearchAlbumFilter = .all
+
+  @State private var recentSearches: [String] = []
+  @State private var explore: [NativeExploreSection] = []
+  @State private var exploreError: String?
+  @State private var serverAlbums: [NativeServerAlbum] = []
+  @State private var debounceTask: Task<Void, Never>?
+
+  init(client: NativeImmichClient, device: NativeDeviceLibrary) {
     self.client = client
-    _model = StateObject(wrappedValue: NativeResultsModel(client))
+    self.device = device
+    _model = StateObject(wrappedValue: NativeUnifiedSearchModel(client))
   }
+
+  private var hasActiveFilters: Bool {
+    !filterPhotos || !filterVideos || favoritesOnly || useAfter || useBefore || selectedAlbum != .all || sourceFilter != .all
+  }
+
+  private var isAtExploreHome: Bool {
+    term.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !hasActiveFilters && !model.hasLoaded
+  }
+
+  private var displayResults: (server: [NativeAsset], local: [NativeDeviceAsset]) {
+    nativeFilterSearchResultsBySource(
+      source: sourceFilter,
+      serverAssets: model.serverAssets,
+      localAssets: model.localAssets,
+      matchedServerIDs: NativeSyncCacheStore.shared.matchedServerIDs
+    )
+  }
+
+  private func formatShortDate(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy/MM/dd"
+    return formatter.string(from: date)
+  }
+
+  private func resetFilters() {
+    sourceFilter = .all
+    filterPhotos = true
+    filterVideos = true
+    favoritesOnly = false
+    useAfter = false
+    useBefore = false
+    selectedAlbum = .all
+    runSearch(immediate: true)
+  }
+
   var body: some View {
     NavigationView {
       VStack(spacing: 0) {
-        HStack {
-          TextField(smartMode ? "描述你要找的照片" : "搜索文件名、路径或描述", text: $term)
-            .textFieldStyle(.roundedBorder).submitLabel(.search)
-            .onSubmit { runSearch() }
-          if !term.isEmpty { Button { term = ""; runSearch() } label: { Image(systemName: "xmark.circle.fill") } }
-        }.padding(.horizontal)
-        HStack {
-          Picker("搜索方式", selection: $smartMode) {
-            Text("文件与信息").tag(false); Text("智能搜索").tag(true)
-          }.pickerStyle(.segmented)
+        // Search bar & menu
+        HStack(spacing: 8) {
+          HStack {
+            Image(systemName: "magnifyingglass")
+              .foregroundColor(.secondary)
+            TextField("搜索照片、视频、地点或描述", text: $term)
+              .submitLabel(.search)
+              .onSubmit {
+                debounceTask?.cancel()
+                runSearch(immediate: true)
+              }
+            if !term.isEmpty {
+              Button {
+                term = ""
+                debounceTask?.cancel()
+                if !hasActiveFilters {
+                  model.clear()
+                } else {
+                  runSearch(immediate: true)
+                }
+              } label: {
+                Image(systemName: "xmark.circle.fill")
+                  .foregroundColor(.secondary)
+              }
+            }
+          }
+          .padding(.horizontal, 10)
+          .padding(.vertical, 8)
+          .background(Color(uiColor: .secondarySystemBackground))
+          .cornerRadius(10)
+
           Menu {
-            Toggle("照片", isOn: $filterPhotos)
-            Toggle("视频", isOn: $filterVideos)
-            Toggle("只看收藏", isOn: $favoritesOnly)
-            Toggle("开始日期", isOn: $useAfter)
-            Toggle("结束日期", isOn: $useBefore)
-          } label: { Image(systemName: "line.3.horizontal.decrease.circle").padding(8) }
-        }.padding(.horizontal)
-        if useAfter { DatePicker("从", selection: $after, displayedComponents: .date).padding(.horizontal) }
-        if useBefore { DatePicker("至", selection: $before, displayedComponents: .date).padding(.horizontal) }
-        if let error = model.error {
-          HStack { Text(error).font(.caption); Button("重试") { runSearch() } }.padding(8)
+            Picker("来源", selection: $sourceFilter) {
+              Text("全部来源").tag(NativePhotosSource.all)
+              Text("仅本机").tag(NativePhotosSource.device)
+              Text("仅云端").tag(NativePhotosSource.server)
+            }
+
+            Menu("相册: \(selectedAlbum.shortName)") {
+              Button("全部相册") { selectedAlbum = .all }
+              if !serverAlbums.isEmpty {
+                Section("云端相册") {
+                  ForEach(serverAlbums) { alb in
+                    Button(alb.name) { selectedAlbum = .server(id: alb.id, name: alb.name) }
+                  }
+                }
+              }
+              if !device.albums.isEmpty {
+                Section("本机相册") {
+                  ForEach(device.albums) { alb in
+                    Button(alb.name) { selectedAlbum = .local(id: alb.id, name: alb.name) }
+                  }
+                }
+              }
+            }
+
+            Section("媒体类型") {
+              Toggle("照片", isOn: $filterPhotos)
+              Toggle("视频", isOn: $filterVideos)
+            }
+
+            Section("属性") {
+              Toggle("只看收藏", isOn: $favoritesOnly)
+            }
+
+            Section("拍摄日期") {
+              Toggle("开始日期", isOn: $useAfter)
+              Toggle("结束日期", isOn: $useBefore)
+            }
+
+            if hasActiveFilters {
+              Divider()
+              Button("重置所有筛选", role: .destructive) {
+                resetFilters()
+              }
+            }
+          } label: {
+            ZStack(alignment: .topTrailing) {
+              Image(systemName: hasActiveFilters ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                .font(.system(size: 22))
+                .padding(4)
+              if hasActiveFilters {
+                Circle()
+                  .fill(Color.accentColor)
+                  .frame(width: 8, height: 8)
+                  .offset(x: -2, y: 2)
+              }
+            }
+          }
         }
-        if submitted.isEmpty && model.assets.isEmpty && !model.loading && !favoritesOnly && !useAfter && !useBefore && filterPhotos && filterVideos {
+        .padding(.horizontal)
+        .padding(.top, 4)
+        .padding(.bottom, 6)
+
+        // Segmented source filter
+        Picker("来源", selection: $sourceFilter) {
+          Text("全部").tag(NativePhotosSource.all)
+          Text("本机").tag(NativePhotosSource.device)
+          Text("云端").tag(NativePhotosSource.server)
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal)
+        .padding(.bottom, hasActiveFilters || useAfter || useBefore ? 4 : 8)
+
+        // Active filter tags
+        if hasActiveFilters {
+          ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+              if sourceFilter != .all {
+                FilterTagView(label: "来源: \(sourceFilter.rawValue)") {
+                  sourceFilter = .all
+                }
+              }
+              if !filterPhotos {
+                FilterTagView(label: "仅视频") {
+                  filterPhotos = true
+                }
+              }
+              if !filterVideos {
+                FilterTagView(label: "仅照片") {
+                  filterVideos = true
+                }
+              }
+              if favoritesOnly {
+                FilterTagView(label: "已收藏") {
+                  favoritesOnly = false
+                }
+              }
+              if useAfter {
+                FilterTagView(label: "从 \(formatShortDate(after))") {
+                  useAfter = false
+                }
+              }
+              if useBefore {
+                FilterTagView(label: "至 \(formatShortDate(before))") {
+                  useBefore = false
+                }
+              }
+              if selectedAlbum != .all {
+                FilterTagView(label: "相册: \(selectedAlbum.shortName)") {
+                  selectedAlbum = .all
+                }
+              }
+              Button("重置") {
+                resetFilters()
+              }
+              .font(.caption2)
+              .foregroundColor(.secondary)
+              .padding(.horizontal, 4)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 6)
+          }
+        }
+
+        // Date pickers
+        if useAfter {
+          DatePicker("从", selection: $after, displayedComponents: .date)
+            .padding(.horizontal)
+            .padding(.vertical, 2)
+        }
+        if useBefore {
+          DatePicker("至", selection: $before, displayedComponents: .date)
+            .padding(.horizontal)
+            .padding(.vertical, 2)
+        }
+
+        // Status banners
+        if model.smartSearchDegraded, let msg = model.smartErrorMessage {
+          HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle.fill")
+              .foregroundColor(.orange)
+              .font(.caption)
+            Text(msg)
+              .font(.caption)
+              .foregroundColor(.secondary)
+            Spacer()
+          }
+          .padding(.horizontal)
+          .padding(.vertical, 4)
+          .background(Color.orange.opacity(0.1))
+        }
+
+        if model.serverError != nil && !displayResults.local.isEmpty {
+          HStack(spacing: 6) {
+            Image(systemName: "wifi.slash")
+              .foregroundColor(.secondary)
+              .font(.caption)
+            Text("无法连接服务器，当前仅展示本机搜索结果")
+              .font(.caption)
+              .foregroundColor(.secondary)
+            Spacer()
+            Button("重试") { runSearch(immediate: true) }
+              .font(.caption)
+          }
+          .padding(.horizontal)
+          .padding(.vertical, 4)
+          .background(Color.secondary.opacity(0.1))
+        }
+
+        if let err = model.serverError, displayResults.local.isEmpty && displayResults.server.isEmpty && !model.loading {
+          HStack {
+            Text(err).font(.caption).foregroundColor(.secondary)
+            Button("重试") { runSearch(immediate: true) }
+          }
+          .padding(8)
+        }
+
+        if sourceFilter == .device && !device.authorized {
+          VStack(spacing: 8) {
+            Image(systemName: "photo.on.rectangle.angled")
+              .font(.system(size: 36))
+              .foregroundColor(.secondary)
+            Text("未授权访问系统照片")
+              .font(.headline)
+            Text("请允许访问系统照片以搜索本机照片")
+              .font(.caption)
+              .foregroundColor(.secondary)
+            Button("前往设置") {
+              if let url = URL(string: UIApplication.openSettingsURLString) {
+                UIApplication.shared.open(url)
+              }
+            }
+            .buttonStyle(.bordered)
+          }
+          .padding()
+        }
+
+        // Main content area
+        if isAtExploreHome {
           ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
-              if let exploreError { Text(exploreError).font(.caption); Button("重试探索") { Task { await loadExplore() } } }
-              ForEach(explore) { section in
-                VStack(alignment: .leading) {
-                  Text(section.id).font(.headline)
-                  ScrollView(.horizontal) {
-                    HStack {
-                      ForEach(section.items) { tile in
-                        Button { term = tile.name; runSearch() } label: {
-                          VStack(alignment: .leading, spacing: 4) {
-                            Color.clear
-                              .frame(width: 108, height: 108)
-                              .overlay(
-                                GeometryReader { geo in
-                                  Group {
-                                    if let asset = tile.asset {
-                                      NativeThumbnail(client: client, asset: asset)
-                                    } else {
-                                      Rectangle().fill(Color(uiColor: .secondarySystemBackground))
-                                        .overlay {
-                                          Image(systemName: "photo")
-                                            .foregroundColor(.secondary)
-                                        }
-                                    }
-                                  }
-                                  .frame(width: geo.size.width, height: geo.size.height)
-                                  .clipped()
-                                }
-                              )
-                              .clipped()
-                            Text(tile.name).font(.caption).lineLimit(1)
-                          }.frame(width: 108)
-                        }.buttonStyle(.plain)
+            VStack(alignment: .leading, spacing: 20) {
+              if !recentSearches.isEmpty {
+                VStack(alignment: .leading, spacing: 10) {
+                  HStack {
+                    Text("最近搜索").font(.headline)
+                    Spacer()
+                    Button("清空") {
+                      NativeRecentSearchesStore.shared.clear()
+                      recentSearches = []
+                    }
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+                  }
+
+                  ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                      ForEach(recentSearches, id: \.self) { searchItem in
+                        HStack(spacing: 6) {
+                          Button {
+                            term = searchItem
+                            debounceTask?.cancel()
+                            runSearch(immediate: true)
+                          } label: {
+                            HStack(spacing: 4) {
+                              Image(systemName: "magnifyingglass")
+                                .font(.system(size: 11))
+                                .foregroundColor(.secondary)
+                              Text(searchItem)
+                                .font(.subheadline)
+                                .lineLimit(1)
+                            }
+                          }
+                          .buttonStyle(.plain)
+
+                          Button {
+                            NativeRecentSearchesStore.shared.remove(searchItem)
+                            recentSearches = NativeRecentSearchesStore.shared.load()
+                          } label: {
+                            Image(systemName: "xmark")
+                              .font(.system(size: 10, weight: .bold))
+                              .foregroundColor(.secondary)
+                          }
+                          .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color(uiColor: .secondarySystemBackground))
+                        .cornerRadius(16)
                       }
                     }
                   }
                 }
               }
-              Text("本机尚未上传的照片不参与服务器语义搜索").font(.caption).foregroundColor(.secondary)
-            }.padding()
+
+              if let exploreError {
+                HStack {
+                  Text(exploreError).font(.caption).foregroundColor(.secondary)
+                  Button("重试探索") { Task { await loadExplore() } }
+                }
+              }
+
+              if !explore.isEmpty {
+                VStack(alignment: .leading, spacing: 16) {
+                  Text("探索分类").font(.headline)
+                  ForEach(explore) { section in
+                    VStack(alignment: .leading, spacing: 8) {
+                      Text(section.id).font(.subheadline).foregroundColor(.secondary)
+                      ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                          ForEach(section.items) { tile in
+                            Button {
+                              term = tile.name
+                              debounceTask?.cancel()
+                              runSearch(immediate: true)
+                            } label: {
+                              VStack(alignment: .leading, spacing: 4) {
+                                Color.clear
+                                  .frame(width: 108, height: 108)
+                                  .overlay(
+                                    GeometryReader { geo in
+                                      Group {
+                                        if let asset = tile.asset {
+                                          NativeThumbnail(client: client, asset: asset)
+                                        } else {
+                                          Rectangle().fill(Color(uiColor: .secondarySystemBackground))
+                                            .overlay {
+                                              Image(systemName: "photo")
+                                                .foregroundColor(.secondary)
+                                            }
+                                        }
+                                      }
+                                      .frame(width: geo.size.width, height: geo.size.height)
+                                      .clipped()
+                                    }
+                                  )
+                                  .clipped()
+                                  .cornerRadius(8)
+                                Text(tile.name)
+                                  .font(.caption)
+                                  .lineLimit(1)
+                              }
+                              .frame(width: 108)
+                            }
+                            .buttonStyle(.plain)
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              Text("本机尚未上传的照片仅支持文件名和基础信息搜索")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .padding(.top, 8)
+            }
+            .padding()
           }
-        } else if model.assets.isEmpty && !model.loading {
-          Spacer(); Text("没有找到匹配的服务器照片").foregroundColor(.secondary); Spacer()
+        } else if displayResults.server.isEmpty && displayResults.local.isEmpty && !model.loading && model.hasLoaded {
+          Spacer()
+          VStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+              .font(.system(size: 44))
+              .foregroundColor(.secondary)
+            Text("没有找到匹配的照片或视频")
+              .font(.headline)
+              .foregroundColor(.secondary)
+            Text("尝试更换关键词或减少筛选条件")
+              .font(.caption)
+              .foregroundColor(.secondary)
+          }
+          Spacer()
         } else {
-          NativeResultGrid(client: client, assets: model.assets, hasOlder: model.next != nil) {
-            Task { await fetch(reset: false) }
+          NativeResultGrid(
+            client: client,
+            assets: displayResults.server,
+            localAssets: displayResults.local,
+            hasOlder: model.hasMore,
+            startsAtLatest: true
+          ) {
+            Task { await model.loadMore() }
           }
         }
-        if model.loading { ProgressView().padding(8) }
+
+        if model.loading {
+          ProgressView().padding(8)
+        }
       }
       .navigationTitle("搜索")
-      .task { await loadExplore() }
-      .onChange(of: smartMode) { _ in runSearch() }
-      .onChange(of: filterPhotos) { _ in runSearch() }
-      .onChange(of: filterVideos) { _ in runSearch() }
-      .onChange(of: favoritesOnly) { _ in runSearch() }
-      .onChange(of: useAfter) { _ in runSearch() }
-      .onChange(of: useBefore) { _ in runSearch() }
-      .onChange(of: after) { _ in if useAfter { runSearch() } }
-      .onChange(of: before) { _ in if useBefore { runSearch() } }
-    }.navigationViewStyle(.stack)
-  }
-
-  private var filters: [String: Any] {
-    var value: [String: Any] = [:]
-    if filterPhotos != filterVideos { value["type"] = ["eq": filterPhotos ? "IMAGE" : "VIDEO"] }
-    if favoritesOnly { value["isFavorite"] = ["eq": true] }
-    let formatter = ISO8601DateFormatter()
-    if useAfter { value["takenAt"] = ["gte": formatter.string(from: after)] }
-    if useBefore {
-      var bounds = value["takenAt"] as? [String: String] ?? [:]
-      bounds["lte"] = formatter.string(from: Calendar.current.date(byAdding: .day, value: 1, to: before) ?? before)
-      value["takenAt"] = bounds
+      .task {
+        recentSearches = NativeRecentSearchesStore.shared.load()
+        await loadExplore()
+        await loadServerAlbums()
+      }
+      .onChange(of: term) { newTerm in
+        debounceTask?.cancel()
+        let trimmed = newTerm.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+          if !hasActiveFilters {
+            model.clear()
+          } else {
+            runSearch(immediate: true)
+          }
+        } else {
+          debounceTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            runSearch(immediate: false)
+          }
+        }
+      }
+      .onChange(of: sourceFilter) { _ in runSearch(immediate: true) }
+      .onChange(of: filterPhotos) { _ in runSearch(immediate: true) }
+      .onChange(of: filterVideos) { _ in runSearch(immediate: true) }
+      .onChange(of: favoritesOnly) { _ in runSearch(immediate: true) }
+      .onChange(of: useAfter) { _ in runSearch(immediate: true) }
+      .onChange(of: useBefore) { _ in runSearch(immediate: true) }
+      .onChange(of: after) { _ in if useAfter { runSearch(immediate: true) } }
+      .onChange(of: before) { _ in if useBefore { runSearch(immediate: true) } }
+      .onChange(of: selectedAlbum) { _ in runSearch(immediate: true) }
     }
-    return value
+    .navigationViewStyle(.stack)
   }
 
-  private func runSearch() {
-    submitted = term.trimmingCharacters(in: .whitespacesAndNewlines)
-    Task { await fetch(reset: true) }
-  }
-
-  private func fetch(reset: Bool) async {
-    guard filterPhotos || filterVideos else {
-      if reset { model.clear() }
+  private func runSearch(immediate: Bool = false) {
+    let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.isEmpty && !hasActiveFilters {
+      debounceTask?.cancel()
+      model.clear()
       return
     }
-    if smartMode && !submitted.isEmpty { await model.smart(query: submitted, filter: filters, reset: reset) }
-    else { await model.load(query: submitted.isEmpty ? nil : submitted, filter: filters, reset: reset) }
+    if !trimmed.isEmpty {
+      NativeRecentSearchesStore.shared.add(trimmed)
+      recentSearches = NativeRecentSearchesStore.shared.load()
+    }
+    Task {
+      await model.search(
+        query: trimmed.isEmpty ? nil : trimmed,
+        source: sourceFilter,
+        filterPhotos: filterPhotos,
+        filterVideos: filterVideos,
+        favoritesOnly: favoritesOnly,
+        useAfter: useAfter,
+        after: after,
+        useBefore: useBefore,
+        before: before,
+        albumFilter: selectedAlbum,
+        device: device,
+        reset: true
+      )
+    }
   }
 
   private func loadExplore() async {
     guard explore.isEmpty else { return }
-    do { explore = try await client.explore(); exploreError = nil }
-    catch { exploreError = error.localizedDescription }
+    do {
+      explore = try await client.explore()
+      exploreError = nil
+    } catch {
+      exploreError = error.localizedDescription
+    }
+  }
+
+  private func loadServerAlbums() async {
+    guard serverAlbums.isEmpty else { return }
+    do {
+      serverAlbums = try await client.serverAlbums()
+    } catch {
+      // Non-fatal
+    }
   }
 }
 
@@ -3240,7 +4153,7 @@ struct NativeTabShell: View {
       NativePhotosView(client: client, device: device, onLogout: onLogout, matchedAssetDiagnostics: matchedAssetDiagnostics)
         .tabItem { Label("照片", systemImage: "photo.on.rectangle") }
         .tag(0)
-      NativeSearchView(client: client)
+      NativeSearchView(client: client, device: device)
         .tabItem { Label("搜索", systemImage: "magnifyingglass") }
         .tag(1)
       NativeAlbumsView(client: client, device: device)

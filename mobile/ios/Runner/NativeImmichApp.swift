@@ -1231,6 +1231,8 @@ struct NativePhotosView: View {
   @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerAlbumIDsRaw = "[]"
   @State private var excludedServerAssetIDs = Set<String>()
   @State private var activeViewerItem: NativeGridItem?
+  @AppStorage("immichz_photos_aspect_ratio_grid") private var isAspectRatioGrid = false
+  @State private var selectedTimelineLevel: String = "所有照片"
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
   @State private var isDragSelecting = false
@@ -1480,28 +1482,53 @@ struct NativePhotosView: View {
   }
 
   private var trailingToolbarContent: some View {
-    HStack(spacing: 2) {
-      Button {
-        showServerSettings = true
-      } label: {
-        serverStatusIcon
-          .frame(width: 20, height: 20)
-          .frame(width: 36, height: 32)
-          .contentShape(Rectangle())
-      }
-      .buttonStyle(.plain)
-      .accessibilityLabel("服务器状态")
+    HStack(spacing: 6) {
+      if isSelecting {
+        Button(selectedIDs.count >= totalDisplayCount && totalDisplayCount > 0 ? "取消全选" : "全选") {
+          toggleSelectAll()
+        }
+        .font(.system(size: 16, weight: .medium))
+      } else {
+        Button("选择") {
+          withAnimation(.easeInOut(duration: 0.2)) {
+            isSelecting = true
+          }
+        }
+        .font(.system(size: 16, weight: .medium))
 
-      Button {
-        showSyncSettings = true
-      } label: {
-        cloudSyncStatusIcon
-          .frame(width: 20, height: 20)
-          .frame(width: 36, height: 32)
-          .contentShape(Rectangle())
+        Menu {
+          Button {
+            withAnimation(.easeInOut(duration: 0.2)) {
+              isAspectRatioGrid.toggle()
+            }
+          } label: {
+            Label(
+              isAspectRatioGrid ? "正方形照片网格" : "原始比例网格",
+              systemImage: isAspectRatioGrid ? "square.grid.2x2" : "rectangle.grid.2x2"
+            )
+          }
+
+          Divider()
+
+          Button {
+            showServerSettings = true
+          } label: {
+            Label("服务器设置", systemImage: "server.rack")
+          }
+
+          Button {
+            showSyncSettings = true
+          } label: {
+            Label("同步与备份状态", systemImage: "arrow.triangle.2.circlepath")
+          }
+        } label: {
+          Image(systemName: "ellipsis.circle")
+            .font(.system(size: 18, weight: .regular))
+            .foregroundColor(.primary)
+            .frame(width: 32, height: 32)
+            .contentShape(Rectangle())
+        }
       }
-      .buttonStyle(.plain)
-      .accessibilityLabel("同步状态")
     }
     .fixedSize(horizontal: true, vertical: false)
   }
@@ -1594,6 +1621,7 @@ struct NativePhotosView: View {
                   ForEach(group.assets) { entry in
                     Color.clear
                       .aspectRatio(1, contentMode: .fit)
+                      .background(isAspectRatioGrid ? Color(uiColor: .secondarySystemBackground).opacity(0.35) : Color.clear)
                       .overlay(
                         GeometryReader { geo in
                           Group {
@@ -1663,12 +1691,58 @@ struct NativePhotosView: View {
                       }
                       .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
                         guard !isMagnifying else { return }
-                        if !isSelecting {
-                          enterSelection(startingWith: entry.id)
-                        } else {
+                        if isSelecting {
                           startDragSelectionInSelectMode(startingWith: entry.id)
                         }
                       }
+                      .contextMenu(isSelecting ? nil : ContextMenu {
+                        Button {
+                          shareSingleAsset(entry)
+                        } label: {
+                          Label("分享", systemImage: "square.and.arrow.up")
+                        }
+
+                        Button {
+                          toggleSingleFavorite(entry)
+                        } label: {
+                          Label(entry.isFavorite ? "取消收藏" : "收藏", systemImage: entry.isFavorite ? "heart.fill" : "heart")
+                        }
+
+                        Button {
+                          copySingleAsset(entry)
+                        } label: {
+                          Label("复制", systemImage: "doc.on.doc")
+                        }
+
+                        Button {
+                          selectedIDs = [entry.id]
+                          showAlbumTargetDialog = true
+                        } label: {
+                          Label("加入相册...", systemImage: "plus.rectangle.on.folder")
+                        }
+
+                        if entry.local == nil && entry.server != nil {
+                          Button {
+                            selectedIDs = [entry.id]
+                            prepareSaveToDevice()
+                          } label: {
+                            Label("保存到本机", systemImage: "square.and.arrow.down")
+                          }
+                        }
+
+                        Divider()
+
+                        Button(role: .destructive) {
+                          selectedIDs = [entry.id]
+                          if entry.server != nil && entry.local == nil {
+                            requestRemoteOnlyDeletion()
+                          } else {
+                            showDeleteConfirmation = true
+                          }
+                        } label: {
+                          Label("删除", systemImage: "trash")
+                        }
+                      })
                       .id(entry.id)
                   }
                 }
@@ -2106,20 +2180,85 @@ struct NativePhotosView: View {
             .padding(.vertical, 10)
             .background(.ultraThinMaterial)
           } else {
-            if !device.authorized && sourceFilter != .server {
-              Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
-            }
-            if let message = actionMessage {
-              HStack(spacing: 8) {
-                Text(message).font(.caption).lineLimit(3)
-                Spacer(minLength: 4)
-                Button { actionMessage = nil } label: {
-                  Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
-                .accessibilityLabel("关闭操作提示")
+            VStack(spacing: 6) {
+              if !device.authorized && sourceFilter != .server {
+                Button("允许访问本机照片（可选）") { Task { await device.requestAccess() } }.padding(6)
               }
-              .padding(6)
+              if let message = actionMessage {
+                HStack(spacing: 8) {
+                  Text(message).font(.caption).lineLimit(3)
+                  Spacer(minLength: 4)
+                  Button { actionMessage = nil } label: {
+                    Image(systemName: "xmark.circle.fill").foregroundColor(.secondary)
+                  }
+                  .buttonStyle(.plain)
+                  .accessibilityLabel("关闭操作提示")
+                }
+                .padding(6)
+              }
+
+              HStack(spacing: 12) {
+                HStack(spacing: 2) {
+                  ForEach(["年", "月", "日", "所有照片"], id: \.self) { level in
+                    Button {
+                      UISelectionFeedbackGenerator().selectionChanged()
+                      selectedTimelineLevel = level
+                      if level == "所有照片" {
+                        columns = 4
+                        scrollToBottom(proxy: proxy, animated: true)
+                      } else if level == "日" {
+                        columns = 3
+                      } else if level == "月" {
+                        columns = 5
+                      } else if level == "年" {
+                        columns = 7
+                      }
+                    } label: {
+                      Text(level)
+                        .font(.system(size: 13, weight: selectedTimelineLevel == level ? .bold : .medium))
+                        .foregroundColor(selectedTimelineLevel == level ? .primary : .secondary)
+                        .padding(.horizontal, level == "所有照片" ? 10 : 8)
+                        .padding(.vertical, 5)
+                        .background(
+                          Group {
+                            if selectedTimelineLevel == level {
+                              Capsule()
+                                .fill(Color(uiColor: .systemBackground))
+                                .shadow(color: .black.opacity(0.12), radius: 3, y: 1)
+                            }
+                          }
+                        )
+                    }
+                    .buttonStyle(.plain)
+                  }
+                }
+                .padding(3)
+                .background(.ultraThinMaterial)
+                .clipShape(Capsule())
+                .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+
+                if userMovedTimeline {
+                  Button {
+                    scrollToBottom(proxy: proxy, animated: true)
+                  } label: {
+                    HStack(spacing: 3) {
+                      Image(systemName: "arrow.down")
+                        .font(.system(size: 11, weight: .bold))
+                      Text("最新")
+                        .font(.system(size: 12, weight: .semibold))
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.ultraThinMaterial)
+                    .clipShape(Capsule())
+                    .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+                  }
+                  .buttonStyle(.plain)
+                  .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                }
+              }
+              .padding(.bottom, 6)
+              .animation(.spring(response: 0.35, dampingFraction: 0.8), value: userMovedTimeline)
             }
           }
         }
@@ -2174,6 +2313,60 @@ struct NativePhotosView: View {
             trailingToolbarContent
           }
         }
+  }
+
+  private func shareSingleAsset(_ item: NativeGridItem) {
+    Task {
+      let result = await nativePrepareBatchShare(items: [item], client: client)
+      await MainActor.run {
+        if !result.files.isEmpty {
+          batchShareItems = result.files
+        } else {
+          actionMessage = "未能准备该照片原件"
+        }
+      }
+    }
+  }
+
+  private func copySingleAsset(_ item: NativeGridItem) {
+    Task {
+      let result = await nativePrepareBatchShare(items: [item], client: client)
+      await MainActor.run {
+        if let fileURL = result.files.first as? URL,
+           let data = try? Data(contentsOf: fileURL),
+           let img = UIImage(data: data) {
+          UIPasteboard.general.image = img
+          actionMessage = "已复制原图到剪贴板"
+        } else {
+          actionMessage = "无法复制原图"
+        }
+      }
+    }
+  }
+
+  private func toggleSingleFavorite(_ item: NativeGridItem) {
+    Task {
+      let target = !item.isFavorite
+      if let server = item.server {
+        try? await client.updateFavorite(id: server.id, isFavorite: target)
+      }
+      if let local = item.local {
+        _ = await device.updateFavorite(ids: [local.id], isFavorite: target)
+      }
+      device.refresh()
+      await model.refreshLatest()
+      rebuildDayGroups()
+    }
+  }
+
+  private func toggleSelectAll() {
+    let allIDs = Set(cachedDayGroups.flatMap { $0.assets.map(\.id) })
+    if selectedIDs.count >= allIDs.count && !allIDs.isEmpty {
+      selectedIDs.removeAll()
+    } else {
+      selectedIDs = allIDs
+    }
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
   }
 
   private func timelineModalContent<Content: View>(_ content: Content) -> some View {
@@ -3339,6 +3532,7 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
   let chrome: Chrome
   let showsChrome: Bool
   let isZoomed: Bool
+  var onSwipeUp: (() -> Void)? = nil
   let onDismiss: () -> Void
 
   @State private var dragY: CGFloat = 0
@@ -3357,6 +3551,11 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
             .onChanged { value in
               guard !isZoomed, !finishing else { return }
               if !locked {
+                if value.translation.height < -15 && abs(value.translation.height) > abs(value.translation.width) * 1.25 {
+                  locked = true
+                  onSwipeUp?()
+                  return
+                }
                 guard value.translation.height > 8,
                       value.translation.height > abs(value.translation.width) * 1.25 else { return }
                 locked = true
@@ -3393,6 +3592,63 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
   }
 }
 
+private struct NativeViewerFilmstrip: View {
+  let client: NativeImmichClient
+  let device: NativeDeviceLibrary
+  let items: [NativeGridItem]
+  @Binding var currentAssetID: String
+
+  var body: some View {
+    ScrollViewReader { proxy in
+      ScrollView(.horizontal, showsIndicators: false) {
+        HStack(spacing: 2) {
+          ForEach(items) { item in
+            let isCurrent = item.id == currentAssetID
+            Group {
+              if let server = item.server {
+                NativeThumbnail(client: client, asset: server, columns: 8)
+              } else if let local = item.local {
+                NativeDeviceThumbnail(asset: local, columns: 8)
+              } else {
+                Color.gray.opacity(0.3)
+              }
+            }
+            .frame(width: isCurrent ? 36 : 16, height: isCurrent ? 34 : 30)
+            .clipped()
+            .clipShape(RoundedRectangle(cornerRadius: isCurrent ? 4 : 2))
+            .overlay(
+              RoundedRectangle(cornerRadius: isCurrent ? 4 : 2)
+                .stroke(isCurrent ? Color.white : Color.clear, lineWidth: 1.5)
+            )
+            .padding(.horizontal, isCurrent ? 4 : 0)
+            .id(item.id)
+            .contentShape(Rectangle())
+            .onTapGesture {
+              if item.id != currentAssetID {
+                UISelectionFeedbackGenerator().selectionChanged()
+                currentAssetID = item.id
+              }
+            }
+          }
+        }
+        .padding(.horizontal, UIScreen.main.bounds.width / 2 - 18)
+      }
+      .frame(height: 36)
+      .background(Color.black.opacity(0.45))
+      .clipShape(Capsule())
+      .padding(.horizontal, 16)
+      .onChange(of: currentAssetID) { newID in
+        withAnimation(.easeOut(duration: 0.15)) {
+          proxy.scrollTo(newID, anchor: .center)
+        }
+      }
+      .onAppear {
+        proxy.scrollTo(currentAssetID, anchor: .center)
+      }
+    }
+  }
+}
+
 private struct NativeGallerySystemOverlayModifier: ViewModifier {
   let isImmersive: Bool
 
@@ -3417,6 +3673,8 @@ struct NativeUnifiedGalleryViewer: View {
   var onDismissViewer: (() -> Void)? = nil
 
   @Environment(\.dismiss) private var dismiss
+  @State private var isLivePhotoEnabled = true
+  @State private var isLivePhotoMuted = true
   @State private var currentAssetID: String
   @State private var showChrome = true
   @State private var isCurrentImageZoomed = false
@@ -3501,6 +3759,9 @@ struct NativeUnifiedGalleryViewer: View {
           chrome: viewerChrome,
           showsChrome: showChrome,
           isZoomed: isCurrentImageZoomed,
+          onSwipeUp: {
+            showInfoSheet = true
+          },
           onDismiss: {
             // The page has already flown offscreen. Avoid a second UIKit
             // fullScreenCover slide that made the release visibly stutter.
@@ -3592,15 +3853,38 @@ struct NativeUnifiedGalleryViewer: View {
                 .clipShape(Circle())
             }
 
+            if let item = currentItem, (item.local?.isLivePhoto == true || item.server?.livePhotoVideoId != nil) {
+              Menu {
+                Button {
+                  isLivePhotoEnabled.toggle()
+                } label: {
+                  Label(isLivePhotoEnabled ? "关闭实况" : "开启实况", systemImage: isLivePhotoEnabled ? "livephoto.slash" : "livephoto")
+                }
+                Button {
+                  isLivePhotoMuted.toggle()
+                } label: {
+                  Label(isLivePhotoMuted ? "开启声音" : "静音", systemImage: isLivePhotoMuted ? "speaker.wave.2" : "speaker.slash")
+                }
+              } label: {
+                HStack(spacing: 4) {
+                  Image(systemName: "livephoto")
+                  Text("实况")
+                    .font(.caption2.weight(.semibold))
+                  Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(Color.black.opacity(0.4))
+                .clipShape(Capsule())
+                .foregroundColor(.white)
+              }
+            }
+
             Spacer()
 
             if let item = currentItem {
               VStack(spacing: 2) {
-                if item.local?.isLivePhoto == true || item.server?.livePhotoVideoId != nil {
-                  Label("实况 · 长按播放", systemImage: "livephoto")
-                    .font(.caption2)
-                    .foregroundColor(.white.opacity(0.8))
-                }
                 Text(NativeImmichClient.formatChineseDate(item.date))
                   .font(.subheadline.weight(.semibold))
                   .foregroundColor(.white)
@@ -3627,6 +3911,17 @@ struct NativeUnifiedGalleryViewer: View {
           .padding(.top, 48)
 
           Spacer()
+
+          // Filmstrip Scrubber (High-Speed Scrubbing)
+          if items.count > 1 {
+            NativeViewerFilmstrip(
+              client: client,
+              device: device,
+              items: items,
+              currentAssetID: $currentAssetID
+            )
+            .padding(.bottom, 8)
+          }
 
           // Bottom Bar
           HStack(spacing: 12) {

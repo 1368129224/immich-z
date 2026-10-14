@@ -2,10 +2,10 @@ name: Build iOS (IPA)
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, gemini]
     tags: ["v*"]
   pull_request:
-    branches: [main, master]
+    branches: [main, master, gemini]
   workflow_dispatch:
 
 concurrency:
@@ -67,7 +67,7 @@ jobs:
           retention-days: 30
 
       - name: Publish unsigned IPA to latest-build release (quota fallback)
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/gemini'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

@@ -1601,6 +1601,16 @@ enum NativeSearchAlbumFilter: Hashable, Identifiable {
     case .local(_, let name): return name
     }
   }
+
+  var isLocal: Bool {
+    if case .local = self { return true }
+    return false
+  }
+
+  var isServer: Bool {
+    if case .server = self { return true }
+    return false
+  }
 }
 
 final class NativeLocalAssetFilenameCache {
@@ -1870,7 +1880,7 @@ final class NativeUnifiedSearchModel: ObservableObject {
     // 1. Local Search Task
     var matchedLocals: [NativeDeviceAsset] = []
     if source != .server {
-      if case .server = albumFilter {
+      if albumFilter.isServer {
         matchedLocals = []
       } else {
         matchedLocals = nativeFilterLocalAssets(
@@ -1892,7 +1902,7 @@ final class NativeUnifiedSearchModel: ObservableObject {
     self.localAssets = matchedLocals
 
     // 2. Server Search Task
-    if source == .device || (case .local = albumFilter) {
+    if source == .device || albumFilter.isLocal {
       self.serverAssets = []
       self.hasMoreMetadata = false
       self.hasMoreSmart = false
@@ -1900,31 +1910,33 @@ final class NativeUnifiedSearchModel: ObservableObject {
     }
 
     var newServerAssets: [NativeAsset] = []
-    var metadataError: Error?
 
     if let q = effectiveQuery {
+      let captureServerAlbumId = serverAlbumId
+      let captureServerFilters = serverFilters
+
       // Parallel Dual-Track Search
-      async let metadataSearch: NativeSearchPage? = {
+      async let metadataSearch: (page: NativeSearchPage?, error: Error?) = {
         do {
-          return try await client.searchPage(query: q, albumId: serverAlbumId, cursor: nil, filter: serverFilters)
+          let page = try await client.searchPage(query: q, albumId: captureServerAlbumId, cursor: nil, filter: captureServerFilters)
+          return (page, nil)
         } catch {
-          metadataError = error
-          return nil
+          return (nil, error)
         }
       }()
 
       async let smartSearch: NativeSearchPage? = {
         do {
-          return try await client.smartSearch(query: q, page: 1, filter: serverFilters)
+          return try await client.smartSearch(query: q, page: 1, filter: captureServerFilters)
         } catch {
           return nil
         }
       }()
 
-      let (metadataPage, smartPageResult) = await (metadataSearch, smartSearch)
+      let (metadataOutcome, smartPageResult) = await (metadataSearch, smartSearch)
       guard nativeShouldAcceptSearchResult(requestGeneration: gen, currentGeneration: currentGeneration) else { return }
 
-      if let meta = metadataPage {
+      if let meta = metadataOutcome.page {
         metadataCursor = meta.next
         hasMoreMetadata = meta.next != nil
         for a in meta.assets {
@@ -1947,8 +1959,8 @@ final class NativeUnifiedSearchModel: ObservableObject {
         smartErrorMessage = "智能搜索不可用，已展示普通与本机搜索结果"
       }
 
-      if metadataPage == nil && smartPageResult == nil {
-        if let err = metadataError {
+      if metadataOutcome.page == nil && smartPageResult == nil {
+        if let err = metadataOutcome.error {
           serverError = err.localizedDescription
         } else {
           serverError = "服务器搜索失败"

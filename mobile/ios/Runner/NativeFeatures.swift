@@ -53,6 +53,28 @@ func nativeTimelineBottomReached(
     anchorFrame.maxY <= viewportFrame.maxY + tolerance
 }
 
+func nativeBottomPullToRefreshThreshold() -> CGFloat { 55.0 }
+
+func nativeIsTimelineNearBottom(
+  anchorFrame: CGRect,
+  viewportFrame: CGRect,
+  threshold: CGFloat = 20
+) -> Bool {
+  guard !anchorFrame.isNull, !viewportFrame.isNull else { return false }
+  return anchorFrame.maxY <= viewportFrame.maxY + threshold
+}
+
+func nativeShouldTriggerBottomPullRefresh(
+  isAtBottom: Bool,
+  dragTranslationY: CGFloat,
+  overscrollDistance: CGFloat,
+  isRefreshing: Bool
+) -> Bool {
+  guard isAtBottom, !isRefreshing else { return false }
+  let threshold = nativeBottomPullToRefreshThreshold()
+  return dragTranslationY <= -threshold || overscrollDistance >= threshold
+}
+
 func nativeViewerNextSelectionID(
   deletingID: String,
   orderedIDs: [String]

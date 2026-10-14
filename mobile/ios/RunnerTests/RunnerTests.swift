@@ -581,4 +581,64 @@ final class RunnerTests: XCTestCase {
     XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: .distantPast, now: now, isCellular: false))
     XCTAssertTrue(nativeShouldRefreshTimeline(lastRefreshTime: .distantPast, now: now, isCellular: true))
   }
+
+  func testNativeBottomPullToRefreshDetection() {
+    let viewport = CGRect(x: 0, y: 0, width: 390, height: 800)
+
+    // When near bottom (anchorFrame.maxY around or inside viewport)
+    let bottomAnchor = CGRect(x: 0, y: 798, width: 390, height: 1)
+    XCTAssertTrue(nativeIsTimelineNearBottom(anchorFrame: bottomAnchor, viewportFrame: viewport))
+
+    // When not at bottom (e.g. anchorFrame is far below viewport)
+    let offscreenAnchor = CGRect(x: 0, y: 2500, width: 390, height: 1)
+    XCTAssertFalse(nativeIsTimelineNearBottom(anchorFrame: offscreenAnchor, viewportFrame: viewport))
+
+    // Null frames
+    XCTAssertFalse(nativeIsTimelineNearBottom(anchorFrame: .null, viewportFrame: viewport))
+    XCTAssertFalse(nativeIsTimelineNearBottom(anchorFrame: bottomAnchor, viewportFrame: .null))
+
+    // Threshold check
+    XCTAssertEqual(nativeBottomPullToRefreshThreshold(), 55.0)
+
+    // Refresh trigger conditions
+    // 1. At bottom and pulled up >= 55pt
+    XCTAssertTrue(nativeShouldTriggerBottomPullRefresh(
+      isAtBottom: true,
+      dragTranslationY: -60,
+      overscrollDistance: 60,
+      isRefreshing: false
+    ))
+
+    // 2. At bottom but insufficient pull (< 55pt)
+    XCTAssertFalse(nativeShouldTriggerBottomPullRefresh(
+      isAtBottom: true,
+      dragTranslationY: -30,
+      overscrollDistance: 30,
+      isRefreshing: false
+    ))
+
+    // 3. Not at bottom (scrolling in middle of list), even with large drag
+    XCTAssertFalse(nativeShouldTriggerBottomPullRefresh(
+      isAtBottom: false,
+      dragTranslationY: -80,
+      overscrollDistance: 80,
+      isRefreshing: false
+    ))
+
+    // 4. Pulling downward at bottom (scrolling back up)
+    XCTAssertFalse(nativeShouldTriggerBottomPullRefresh(
+      isAtBottom: true,
+      dragTranslationY: 40,
+      overscrollDistance: 0,
+      isRefreshing: false
+    ))
+
+    // 5. Already refreshing
+    XCTAssertFalse(nativeShouldTriggerBottomPullRefresh(
+      isAtBottom: true,
+      dragTranslationY: -70,
+      overscrollDistance: 70,
+      isRefreshing: true
+    ))
+  }
 }

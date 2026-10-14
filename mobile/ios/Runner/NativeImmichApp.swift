@@ -1245,6 +1245,8 @@ struct NativePhotosView: View {
   @State private var lastItemBoundsUpdate: Date = .distantPast
   @State private var timelineBottomAnchorFrame = CGRect.null
   @State private var timelineViewportFrame = CGRect.null
+  @State private var bottomPullDistance: CGFloat = 0
+  @State private var bottomPullHapticTriggered = false
   @State private var pendingSourceChangeScroll = false
   @State private var hasInitialScrolled = false
   @State private var isBootstrappingTimeline = true
@@ -1680,6 +1682,36 @@ struct NativePhotosView: View {
             }
             .frame(height: 1)
             .id(bottomAnchor)
+
+            if isInitialTimelineVisible {
+              HStack(spacing: 8) {
+                if isRefreshing || model.isLoading {
+                  ProgressView()
+                    .scaleEffect(0.8)
+                  Text("正在刷新…")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                } else if bottomPullDistance >= nativeBottomPullToRefreshThreshold() {
+                  Image(systemName: "arrow.down")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                  Text("松手立即刷新")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                } else if bottomPullDistance > 15 {
+                  Image(systemName: "arrow.up")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.secondary)
+                  Text("上拉刷新最新照片")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                }
+              }
+              .frame(height: max(1, min(60, bottomPullDistance > 0 ? bottomPullDistance : (isRefreshing ? 40 : 1))))
+              .frame(maxWidth: .infinity)
+              .opacity(bottomPullDistance > 15 || isRefreshing ? 1 : 0)
+              .animation(.easeInOut(duration: 0.15), value: bottomPullDistance)
+            }
           }
   }
 
@@ -1737,6 +1769,24 @@ struct NativePhotosView: View {
                   pendingSourceChangeScroll = false
                   if !didInitialPosition { didInitialPosition = true }
                 }
+
+                let nearBottom = nativeIsTimelineNearBottom(
+                  anchorFrame: timelineBottomAnchorFrame,
+                  viewportFrame: timelineViewportFrame
+                )
+                if nearBottom && drag.translation.height < 0 {
+                  let pull = -drag.translation.height
+                  bottomPullDistance = pull
+                  if pull >= nativeBottomPullToRefreshThreshold() && !bottomPullHapticTriggered {
+                    bottomPullHapticTriggered = true
+                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                  } else if pull < nativeBottomPullToRefreshThreshold() && bottomPullHapticTriggered {
+                    bottomPullHapticTriggered = false
+                  }
+                } else if bottomPullDistance > 0 {
+                  bottomPullDistance = 0
+                  bottomPullHapticTriggered = false
+                }
                 return
               }
               guard !isMagnifying else { return }
@@ -1752,7 +1802,25 @@ struct NativePhotosView: View {
               }
               handle2DDragSelection(at: drag.location)
             }
-            .onEnded { _ in
+            .onEnded { drag in
+              if !isSelecting {
+                let nearBottom = nativeIsTimelineNearBottom(
+                  anchorFrame: timelineBottomAnchorFrame,
+                  viewportFrame: timelineViewportFrame
+                )
+                let shouldRefresh = nativeShouldTriggerBottomPullRefresh(
+                  isAtBottom: nearBottom,
+                  dragTranslationY: drag.translation.height,
+                  overscrollDistance: bottomPullDistance,
+                  isRefreshing: isRefreshing || model.isLoading
+                )
+                bottomPullDistance = 0
+                bottomPullHapticTriggered = false
+                if shouldRefresh {
+                  triggerRefresh(proxy: proxy)
+                }
+                return
+              }
               isDragSelecting = false
               dragSelectionIntent = .undecided
               finishDragSelection()
@@ -2066,12 +2134,18 @@ struct NativePhotosView: View {
                 Button {
                   triggerRefresh(proxy: proxy)
                 } label: {
-                  Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundColor(.secondary)
-                    .frame(width: 20, height: 20)
-                    .frame(width: 36, height: 32)
-                    .contentShape(Rectangle())
+                  if isRefreshing || model.isLoading {
+                    ProgressView()
+                      .scaleEffect(0.7)
+                      .frame(width: 36, height: 32)
+                  } else {
+                    Image(systemName: "arrow.clockwise")
+                      .font(.system(size: 16, weight: .medium))
+                      .foregroundColor(.secondary)
+                      .frame(width: 20, height: 20)
+                      .frame(width: 36, height: 32)
+                      .contentShape(Rectangle())
+                  }
                 }
                 .buttonStyle(.plain)
                 .disabled(!isInitialTimelineVisible || isRefreshing || model.isLoading)
@@ -2498,15 +2572,18 @@ struct NativePhotosView: View {
   }
 
   private func triggerRefresh(proxy _: ScrollViewProxy) {
-    guard isInitialTimelineVisible, !isRefreshing else { return }
+    guard isInitialTimelineVisible, !isRefreshing, !model.isLoading else { return }
     isBootstrappingTimeline = false
     isRefreshing = true
+    lastTimelineRefreshTime = Date()
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
     device.refresh()
     Task(priority: .utility) {
       await model.refreshLatest()
+      if !serverExclusionsReady { refreshExcludedServerAssetIDs() }
       rebuildDayGroups()
       scheduleMatchedHydration()
+      scheduleBackgroundCloudCheck()
       isRefreshing = false
     }
   }

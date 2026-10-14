@@ -1272,8 +1272,6 @@ struct NativePhotosView: View {
   @State private var showDeleteConfirmation = false
   @State private var showRemoteOnlyDeleteConfirmation = false
   @State private var pendingRemoteOnlyDeleteItems: [NativeGridItem] = []
-  @State private var showLocalDeleteWarning = false
-  @State private var pendingDeleteScope: NativeDeleteTargetScope = .all
   @State private var deletionError: String?
   @State private var isDeleting = false
   @State private var batchShareItems: [Any]? = nil
@@ -1969,8 +1967,10 @@ struct NativePhotosView: View {
         }
         .onChange(of: device.assets.count) { _ in
           rebuildDayGroups()
-          positionInitiallyIfReady(proxy: proxy)
-          keepBottomUntilUserScrolls(proxy: proxy)
+          if !hasInitialScrolled {
+            positionInitiallyIfReady(proxy: proxy)
+            keepBottomUntilUserScrolls(proxy: proxy)
+          }
           scheduleBackgroundCloudCheck()
           if pendingSourceChangeScroll { positionAtLatestAfterSourceChange(proxy: proxy) }
         }
@@ -2369,7 +2369,7 @@ struct NativePhotosView: View {
     UIImpactFeedbackGenerator(style: .light).impactOccurred()
   }
 
-  private func timelineModalContent<Content: View>(_ content: Content) -> some View {
+  private func timelineModalContent<Content: View>(_ content: Content, proxy: ScrollViewProxy) -> some View {
     content
         .confirmationDialog("选择相册来源", isPresented: $showAlbumTargetDialog, titleVisibility: .visible) {
           Button("加入本机相册") { showLocalAlbumPicker = true }
@@ -2378,10 +2378,10 @@ struct NativePhotosView: View {
         } message: { Text("本机资产和云端资产分别操作，不会自动上传。") }
         .confirmationDialog("删除选中的 \(selectedIDs.count) 项照片", isPresented: $showDeleteConfirmation, titleVisibility: .visible) {
           if selectionSpansBothSources {
-            Button("删除所有所选副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all) } }
+            Button("删除所有所选副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .all, proxy: proxy) } }
           }
           if selectedItems.contains(where: { $0.local != nil }) {
-            Button("仅删除本机副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly) } }
+            Button("仅删除本机副本", role: .destructive) { Task { await deleteSelectedPhotos(scope: .localOnly, proxy: proxy) } }
           }
           if selectedItems.contains(where: { $0.server != nil }) {
             Button("仅删除云端副本", role: .destructive) { requestRemoteOnlyDeletion() }
@@ -2395,7 +2395,7 @@ struct NativePhotosView: View {
           Button("仅删除云端", role: .destructive) {
             let items = pendingRemoteOnlyDeleteItems
             pendingRemoteOnlyDeleteItems = []
-            Task { await performSelectedDeletion(items: items, scope: .remoteOnly) }
+            Task { await performSelectedDeletion(items: items, scope: .remoteOnly, proxy: proxy) }
           }
         } message: { Text("将删除所选的 \(pendingRemoteOnlyDeleteItems.count) 项云端副本；本机副本会保留。若开启自动备份，照片可能再次上传。") }
         .alert("保存到本机照片", isPresented: $showSaveConfirmation) {
@@ -2404,14 +2404,6 @@ struct NativePhotosView: View {
         } message: {
           Text(duplicateSaveCount > 0 ? "所选内容中有 \(duplicateSaveCount) 项已存在本机副本，继续操作可能产生重复照片。" : "将下载云端原件并保存到系统照片。")
         }
-        .alert("本机删除确认", isPresented: $showLocalDeleteWarning) {
-          Button("取消", role: .cancel) {}
-          Button("继续", role: .destructive) {
-            let targets = selectedItems
-            let scope = pendingDeleteScope
-            Task { await performSelectedDeletion(items: targets, scope: scope) }
-          }
-        } message: { Text("删除本机照片会永久从系统照片中移除；若开启 iCloud 照片，可能同步到其他设备。将仅执行你刚才选择的删除范围。") }
         .alert("删除失败", isPresented: Binding(get: { deletionError != nil }, set: { if !$0 { deletionError = nil } })) {
           Button("确定", role: .cancel) { deletionError = nil }
         } message: { Text(deletionError ?? "未知错误") }
@@ -2451,11 +2443,17 @@ struct NativePhotosView: View {
                  scope != .remoteOnly || cloud.matchedServerIDs[local.id] == deletedItem.server?.id {
                 cloud.forgetMatches(localIDs: Set([local.id]))
               }
+              userMovedTimeline = true
               device.refresh()
               rebuildDayGroups()
+              if let fallbackID {
+                withAnimation(.none) {
+                  proxy.scrollTo(fallbackID, anchor: .center)
+                }
+              }
               // Removing one copy must not replace/dismiss the presented viewer.
               // It updates its own current page to the surviving server/local copy.
-              guard scope == .all else { return }
+              guard scope == .all || (scope == .localOnly && deletedItem.server == nil) || (scope == .remoteOnly && deletedItem.local == nil) else { return }
               if let fallbackID,
                  let fallbackItem = cachedDayGroups.flatMap(\.assets).first(where: { $0.id == fallbackID }) {
                 activeViewerItem = fallbackItem
@@ -2502,7 +2500,8 @@ struct NativePhotosView: View {
               proxy: proxy
             ),
             proxy: proxy
-          )
+          ),
+          proxy: proxy
         )
       }
     }
@@ -2598,22 +2597,25 @@ struct NativePhotosView: View {
     }
   }
 
-  private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all) async {
+  private func deleteSelectedPhotos(scope: NativeDeleteTargetScope = .all, proxy: ScrollViewProxy? = nil) async {
     guard !isDeleting else { return }
     let items = selectedItems
     guard !items.isEmpty else { return }
-    if scope != .remoteOnly && items.contains(where: { $0.local != nil }) {
-      pendingDeleteScope = scope
-      showLocalDeleteWarning = true
-      return
-    }
-    await performSelectedDeletion(items: items, scope: scope)
+    await performSelectedDeletion(items: items, scope: scope, proxy: proxy)
   }
 
-  private func performSelectedDeletion(items: [NativeGridItem], scope: NativeDeleteTargetScope) async {
+  private func performSelectedDeletion(items: [NativeGridItem], scope: NativeDeleteTargetScope, proxy: ScrollViewProxy? = nil) async {
     guard !isDeleting else { return }
     isDeleting = true
     defer { isDeleting = false }
+
+    let allAssets = cachedDayGroups.flatMap(\.assets)
+    let deletingIDs = Set(items.map(\.id))
+    let firstDeletedIdx = allAssets.firstIndex(where: { deletingIDs.contains($0.id) }) ?? 0
+    let anchorCandidate = allAssets.enumerated()
+      .filter { !deletingIDs.contains($0.element.id) }
+      .min(by: { abs($0.offset - firstDeletedIdx) < abs($1.offset - firstDeletedIdx) })?.element.id
+
     do {
       try await nativeDeleteGridItems(items, scope: scope, client: client, device: device)
       if scope == .all || scope == .remoteOnly {
@@ -2629,8 +2631,14 @@ struct NativePhotosView: View {
       }
       selectedIDs.removeAll()
       isSelecting = false
+      userMovedTimeline = true
       device.refresh()
       rebuildDayGroups()
+      if let anchorCandidate {
+        withAnimation(.none) {
+          proxy?.scrollTo(anchorCandidate, anchor: .center)
+        }
+      }
     } catch {
       if let partial = error as? NativeDeleteOperationError {
         let deletedIDs = partial.deletedServerIDs
@@ -2643,9 +2651,15 @@ struct NativePhotosView: View {
         cloud.forgetMatches(localIDs: invalidated)
       }
       deletionError = "删除未全部成功；已确认的云端删除会更新本地状态，请刷新核对。\(error.localizedDescription)"
+      userMovedTimeline = true
       device.refresh()
       await model.refreshLatest()
       rebuildDayGroups()
+      if let anchorCandidate {
+        withAnimation(.none) {
+          proxy?.scrollTo(anchorCandidate, anchor: .center)
+        }
+      }
     }
   }
 
@@ -3741,6 +3755,7 @@ struct NativeUnifiedGalleryViewer: View {
                 client: client,
                 device: device,
                 item: item,
+                showsControls: showChrome,
                 onZoomChanged: { zoomed in
                   if item.id == currentAssetID { isCurrentImageZoomed = zoomed }
                 },
@@ -4297,6 +4312,7 @@ private struct NativeSingleAssetPage: View {
   let client: NativeImmichClient
   let device: NativeDeviceLibrary
   let item: NativeGridItem
+  var showsControls: Bool = true
   let onZoomChanged: (Bool) -> Void
   let onTap: () -> Void
 
@@ -4307,6 +4323,14 @@ private struct NativeSingleAssetPage: View {
   @State private var livePhoto: PHLivePhoto?
   @State private var livePlayer: AVPlayer?
   @State private var isLivePlaying = false
+
+  // 视频播放与进度控制
+  @State private var isVideoPlaying = true
+  @State private var videoCurrentTime: Double = 0
+  @State private var videoDuration: Double = 0
+  @State private var isScrubbing = false
+  @State private var isVideoMuted = false
+  @State private var timeObserverToken: Any?
 
   private var isLive: Bool {
     item.local?.isLivePhoto == true || item.server?.livePhotoVideoId != nil
@@ -4319,11 +4343,25 @@ private struct NativeSingleAssetPage: View {
 
         if item.isVideo {
           if let player {
-            VideoPlayer(player: player)
-              .frame(width: proxy.size.width, height: proxy.size.height)
-              .ignoresSafeArea()
-              .onAppear { player.play() }
-              .onDisappear { player.pause() }
+            ZStack(alignment: .bottom) {
+              VideoPlayer(player: player)
+                .frame(width: proxy.size.width, height: proxy.size.height)
+                .ignoresSafeArea()
+                .onAppear {
+                  setupVideoObserver(for: player)
+                  player.play()
+                  isVideoPlaying = true
+                }
+                .onDisappear {
+                  player.pause()
+                  isVideoPlaying = false
+                  removeVideoObserver()
+                }
+
+              if showsControls {
+                videoControlsOverlay
+              }
+            }
           } else {
             VStack(spacing: 12) {
               if isLoading { ProgressView().tint(.white) }
@@ -4400,6 +4438,115 @@ private struct NativeSingleAssetPage: View {
     }
   }
 
+  private func setupVideoObserver(for avPlayer: AVPlayer) {
+    removeVideoObserver()
+    avPlayer.isMuted = isVideoMuted
+    let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
+    timeObserverToken = avPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak avPlayer] time in
+      guard !isScrubbing else { return }
+      videoCurrentTime = time.seconds
+      if let item = avPlayer?.currentItem, item.duration.isValid && !item.duration.isIndefinite {
+        videoDuration = item.duration.seconds
+      }
+      isVideoPlaying = (avPlayer?.timeControlStatus == .playing)
+    }
+  }
+
+  private func removeVideoObserver() {
+    if let timeObserverToken, let player {
+      player.removeTimeObserver(timeObserverToken)
+    }
+    timeObserverToken = nil
+  }
+
+  @ViewBuilder
+  private var videoControlsOverlay: some View {
+    VStack(spacing: 0) {
+      Spacer()
+
+      HStack(spacing: 10) {
+        Button {
+          guard let player else { return }
+          if isVideoPlaying {
+            player.pause()
+            isVideoPlaying = false
+          } else {
+            if videoCurrentTime >= videoDuration && videoDuration > 0 {
+              player.seek(to: .zero)
+            }
+            player.play()
+            isVideoPlaying = true
+          }
+        } label: {
+          Image(systemName: isVideoPlaying ? "pause.fill" : "play.fill")
+            .font(.system(size: 15, weight: .bold))
+            .foregroundColor(.white)
+            .frame(width: 28, height: 28)
+        }
+        .buttonStyle(.plain)
+
+        Text(formatTime(videoCurrentTime))
+          .font(.system(size: 11, weight: .medium, design: .monospaced))
+          .foregroundColor(.white.opacity(0.9))
+
+        Slider(
+          value: Binding(
+            get: { videoCurrentTime },
+            set: { newValue in
+              videoCurrentTime = newValue
+              if !isScrubbing {
+                isScrubbing = true
+                player?.pause()
+              }
+              player?.seek(to: CMTime(seconds: newValue, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
+            }
+          ),
+          in: 0...max(videoDuration, 0.1),
+          onEditingChanged: { editing in
+            isScrubbing = editing
+            if !editing {
+              if isVideoPlaying {
+                player?.play()
+              }
+            }
+          }
+        )
+        .tint(.white)
+
+        Text(formatTime(videoDuration))
+          .font(.system(size: 11, weight: .medium, design: .monospaced))
+          .foregroundColor(.white.opacity(0.9))
+
+        Button {
+          guard let player else { return }
+          isVideoMuted.toggle()
+          player.isMuted = isVideoMuted
+        } label: {
+          Image(systemName: isVideoMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(.white)
+            .frame(width: 24, height: 24)
+        }
+        .buttonStyle(.plain)
+      }
+      .padding(.horizontal, 14)
+      .padding(.vertical, 6)
+      .background(Color.black.opacity(0.65))
+      .clipShape(Capsule())
+      .padding(.horizontal, 16)
+      .padding(.bottom, 128)
+    }
+    .allowsHitTesting(true)
+  }
+
+  private func formatTime(_ seconds: Double) -> String {
+    guard seconds.isFinite && !seconds.isNaN else { return "0:00" }
+    let totalSeconds = Int(seconds)
+    let mins = totalSeconds / 60
+    let secs = totalSeconds % 60
+    return String(format: "%d:%02d", mins, secs)
+  }
+
   private func startLivePlayback() {
     guard isLive, !item.isVideo, livePhoto != nil || livePlayer != nil else { return }
     isLivePlaying = true
@@ -4432,6 +4579,7 @@ private struct NativeSingleAssetPage: View {
               if let playerItem {
                 let avPlayer = AVPlayer(playerItem: playerItem)
                 avPlayer.actionAtItemEnd = .pause
+                setupVideoObserver(for: avPlayer)
                 player = avPlayer
               } else {
                 loadError = Self.photoKitErrorMessage(info)
@@ -4454,6 +4602,7 @@ private struct NativeSingleAssetPage: View {
           let item = AVPlayerItem(asset: asset)
           let avPlayer = AVPlayer(playerItem: item)
           avPlayer.actionAtItemEnd = .pause
+          setupVideoObserver(for: avPlayer)
           player = avPlayer
         } else { loadError = "服务器视频播放地址无效" }
       } else { loadError = "视频资产来源不可用" }
@@ -5074,7 +5223,10 @@ struct NativeSyncSettingsSheet: View {
   @ObservedObject var cloud: NativeCloudStatus
   @Environment(\.dismiss) private var dismiss
 
-  @AppStorage("backup_enabled") private var syncEnabled = true
+  @AppStorage("backup_enabled") private var legacySyncEnabled = true
+  @AppStorage("immichz_sync_enabled") private var syncEnabled = true
+  @AppStorage("immichz_sync_wifi_only") private var wifiOnlySync = true
+  @AppStorage("immichz_sync_wifi_only_video") private var wifiOnlySyncVideo = true
 
   private var verifiedLocalOnlyCount: Int {
     device.assets.filter { cloud.checkedIDs.contains($0.id) && !cloud.failedVerificationIDs.contains($0.id) && cloud.matchedServerIDs[$0.id] == nil }.count
@@ -5087,8 +5239,20 @@ struct NativeSyncSettingsSheet: View {
   var body: some View {
     NavigationView {
       Form {
-        Section(header: Text("云端状态核验"), footer: Text("核验需读取本机原件并计算 SHA-1，照片或视频较多时可能耗电发热；不再于启动或滚动时自动执行。已缓存的匹配状态仍会显示。此版本不会上传照片。")) {
-          Toggle("允许原件核验（需手动启动）", isOn: $syncEnabled)
+        Section(header: Text("同步开关与网络偏好"), footer: Text("关闭同步开关将暂停自动核验与同步任务。“仅 WiFi 同步”可节省蜂窝流量；开启后视频亦仅在连接 Wi-Fi 时同步。")) {
+          Toggle("同步开关", isOn: Binding(
+            get: { syncEnabled },
+            set: { newValue in
+              syncEnabled = newValue
+              legacySyncEnabled = newValue
+            }
+          ))
+
+          Toggle("仅 WiFi 同步", isOn: $wifiOnlySync)
+            .disabled(!syncEnabled)
+
+          Toggle("仅 WiFi 同步视频", isOn: $wifiOnlySyncVideo)
+            .disabled(!syncEnabled || wifiOnlySync)
         }
 
         Section(header: Text("相册与同步状态")) {

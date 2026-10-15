@@ -4,6 +4,31 @@ import UIKit
 import XCTest
 
 final class RunnerTests: XCTestCase {
+  func testReleaseUpdateBuildAndLiveContainerLink() throws {
+    let manifest = NativeReleaseUpdate(
+      bundleIdentifier: "com.immichz.immichz", channel: "main",
+      buildNumber: 95, version: "0.0.2+abc1234", commit: "abc1234",
+      sha256: String(repeating: "a", count: 64),
+      downloadURL: NativeReleaseUpdate.ipaURL
+    )
+    XCTAssertTrue(try manifest.isNewer(than: 94, bundleID: "com.immichz.immichz"))
+    XCTAssertFalse(try manifest.isNewer(than: 95, bundleID: "com.immichz.immichz"))
+    let components = try XCTUnwrap(manifest.liveContainerURL.flatMap {
+      URLComponents(url: $0, resolvingAgainstBaseURL: false)
+    })
+    XCTAssertEqual(components.scheme, "livecontainer")
+    XCTAssertEqual(components.host, "install")
+    XCTAssertEqual(components.queryItems?.first?.name, "url")
+    XCTAssertEqual(components.queryItems?.first?.value, NativeReleaseUpdate.ipaURL.absoluteString)
+    XCTAssertThrowsError(try manifest.isNewer(than: 94, bundleID: "other.bundle"))
+    let tampered = NativeReleaseUpdate(
+      bundleIdentifier: manifest.bundleIdentifier, channel: "gemini",
+      buildNumber: 96, version: manifest.version, commit: manifest.commit,
+      sha256: manifest.sha256, downloadURL: URL(string: "https://example.com/other.ipa")!
+    )
+    XCTAssertThrowsError(try tampered.isNewer(than: 94, bundleID: "com.immichz.immichz"))
+  }
+
   func testPhotosSourceFilterUsesActualCopyAndVerifiedMatch() {
     XCTAssertTrue(nativePhotosSourceIncludes(.all, hasLocal: true, hasServer: false, hasVerifiedMatch: false))
     XCTAssertFalse(nativePhotosSourceIncludes(.server, hasLocal: true, hasServer: false, hasVerifiedMatch: false))

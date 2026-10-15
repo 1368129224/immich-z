@@ -2,6 +2,7 @@ import Foundation
 import MapKit
 import Photos
 import SwiftUI
+import UIKit
 
 struct LibraryRow: Identifiable {
   let id: String
@@ -220,5 +221,158 @@ extension NativeImmichClient {
     guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
           let strings = try JSONSerialization.jsonObject(with: data) as? [String] else { throw NativeLibraryError.invalidResponse }
     return strings
+  }
+}
+
+// The main branch publishes this manifest together with its unsigned IPA.
+// LiveContainer performs the download; this app never exposes a private
+// sandbox file URL to another app or attempts an iOS system installation.
+struct NativeReleaseUpdate: Decodable {
+  let bundleIdentifier: String
+  let channel: String
+  let buildNumber: Int
+  let version: String
+  let commit: String
+  let sha256: String
+  let downloadURL: URL
+
+  static let manifestURL = URL(string:
+    "https://github.com/1368129224/immich-z/releases/download/latest-build/immichz-update.json"
+  )!
+  static let ipaURL = URL(string:
+    "https://github.com/1368129224/immich-z/releases/download/latest-build/ImmichZ-unsigned.ipa"
+  )!
+
+  func isNewer(than currentBuild: Int, bundleID: String) throws -> Bool {
+    guard bundleIdentifier == bundleID, channel == "main", buildNumber > 0,
+          !version.isEmpty, !commit.isEmpty,
+          sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+          downloadURL == Self.ipaURL else {
+      throw NativeUpdateError.invalidManifest
+    }
+    return buildNumber > currentBuild
+  }
+
+  var liveContainerURL: URL? {
+    var components = URLComponents()
+    components.scheme = "livecontainer"
+    components.host = "install"
+    components.queryItems = [URLQueryItem(name: "url", value: downloadURL.absoluteString)]
+    return components.url
+  }
+}
+
+private enum NativeUpdateError: LocalizedError {
+  case invalidManifest
+  case unavailable
+  case unknownBuild
+
+  var errorDescription: String? {
+    switch self {
+    case .invalidManifest: return "更新信息无效，已停止安装。请稍后重试。"
+    case .unavailable: return "暂时无法读取 GitHub Release，请检查网络后重试。"
+    case .unknownBuild: return "无法读取当前构建号，暂不能安全比较版本。"
+    }
+  }
+}
+
+struct NativeAppUpdateView: View {
+  @State private var latest: NativeReleaseUpdate?
+  @State private var isChecking = false
+  @State private var status: String?
+  @State private var confirmInstall = false
+
+  private var currentBuild: Int? {
+    guard let string = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else { return nil }
+    return Int(string)
+  }
+
+  private var currentVersion: String {
+    Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "未知版本"
+  }
+
+  var body: some View {
+    Form {
+      Section("当前版本") {
+        HStack { Text("版本"); Spacer(); Text(currentVersion).foregroundColor(.secondary) }
+        HStack { Text("构建号"); Spacer(); Text(currentBuild.map { String($0) } ?? "未知").foregroundColor(.secondary) }
+      }
+
+      Section {
+        Button {
+          Task { await checkForUpdate() }
+        } label: {
+          HStack {
+            Text("检查更新")
+            if isChecking { Spacer(); ProgressView() }
+          }
+        }
+        .disabled(isChecking)
+        if let latest {
+          LabeledContent("主分支新版本", value: latest.version)
+          Button("通过 LiveContainer 更新") { confirmInstall = true }
+          Link("手动下载 IPA", destination: latest.downloadURL)
+        }
+        if let status { Text(status).font(.footnote).foregroundColor(.secondary) }
+      } header: {
+        Text("GitHub Release · main")
+      } footer: {
+        Text("点击更新后由 LiveContainer 下载并询问是否替换。不会在系统中静默安装；未安装 LiveContainer 时可手动下载并导入。")
+      }
+    }
+    .navigationTitle("应用更新")
+    .confirmationDialog("即将打开 LiveContainer", isPresented: $confirmInstall, titleVisibility: .visible) {
+      Button("打开 LiveContainer") { openInLiveContainer() }
+      Button("取消", role: .cancel) {}
+    } message: {
+      Text("LiveContainer 会下载最新 IPA。请在其中确认替换，完成后重新打开 Immich Z。")
+    }
+    .task { await checkForUpdate() }
+  }
+
+  @MainActor private func checkForUpdate() async {
+    guard !isChecking else { return }
+    isChecking = true
+    latest = nil
+    status = nil
+    defer { isChecking = false }
+
+    do {
+      guard let currentBuild, let bundleID = Bundle.main.bundleIdentifier else {
+        throw NativeUpdateError.unknownBuild
+      }
+      var request = URLRequest(url: NativeReleaseUpdate.manifestURL)
+      request.cachePolicy = .reloadIgnoringLocalCacheData
+      request.timeoutInterval = 20
+      let (data, response) = try await URLSession.shared.data(for: request)
+      guard let http = response as? HTTPURLResponse,
+            (200..<300).contains(http.statusCode), data.count < 64_000 else {
+        throw NativeUpdateError.unavailable
+      }
+      let release = try JSONDecoder().decode(NativeReleaseUpdate.self, from: data)
+      if try release.isNewer(than: currentBuild, bundleID: bundleID) {
+        latest = release
+        status = "发现新构建 \(release.buildNumber)，请在 LiveContainer 中确认更新。"
+      } else {
+        status = "当前已是 main 渠道的最新版本。"
+      }
+    } catch is DecodingError {
+      status = NativeUpdateError.invalidManifest.localizedDescription
+    } catch {
+      status = error.localizedDescription
+    }
+  }
+
+  private func openInLiveContainer() {
+    guard let url = latest?.liveContainerURL else {
+      status = NativeUpdateError.invalidManifest.localizedDescription
+      return
+    }
+    UIApplication.shared.open(url) { didOpen in
+      guard !didOpen else { return }
+      Task { @MainActor in
+        status = "无法打开 LiveContainer。请使用“手动下载 IPA”并从文件 App 共享导入。"
+      }
+    }
   }
 }

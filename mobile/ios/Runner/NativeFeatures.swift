@@ -3678,6 +3678,13 @@ private struct NativeLibraryView: View {
             }
           }
         }
+        Section("应用更新") {
+          NavigationLink {
+            NativeAppUpdateView()
+          } label: {
+            Label("检查更新", systemImage: "arrow.down.app")
+          }
+        }
         Section("调试") {
           Button("后台诊断与错误记录") { showDebugSheet = true }
         }

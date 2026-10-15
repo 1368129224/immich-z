@@ -1792,36 +1792,6 @@ struct NativePhotosView: View {
             }
             .frame(height: 1)
             .id(bottomAnchor)
-
-            if isInitialTimelineVisible {
-              HStack(spacing: 8) {
-                if isRefreshing || model.isLoading {
-                  ProgressView()
-                    .scaleEffect(0.8)
-                  Text("正在刷新…")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                } else if bottomPullDistance >= nativeBottomPullToRefreshThreshold() {
-                  Image(systemName: "arrow.down")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.secondary)
-                  Text("松手立即刷新")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                } else if bottomPullDistance > 15 {
-                  Image(systemName: "arrow.up")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.secondary)
-                  Text("上拉刷新最新照片")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                }
-              }
-              .frame(height: max(1, min(60, bottomPullDistance > 0 ? bottomPullDistance : (isRefreshing ? 40 : 1))))
-              .frame(maxWidth: .infinity)
-              .opacity(bottomPullDistance > 15 || isRefreshing ? 1 : 0)
-              .animation(.easeInOut(duration: 0.15), value: bottomPullDistance)
-            }
           }
   }
 
@@ -1879,24 +1849,6 @@ struct NativePhotosView: View {
                   pendingSourceChangeScroll = false
                   if !didInitialPosition { didInitialPosition = true }
                 }
-
-                let nearBottom = nativeIsTimelineNearBottom(
-                  anchorFrame: timelineBottomAnchorFrame,
-                  viewportFrame: timelineViewportFrame
-                )
-                if nearBottom && drag.translation.height < 0 {
-                  let pull = -drag.translation.height
-                  bottomPullDistance = pull
-                  if pull >= nativeBottomPullToRefreshThreshold() && !bottomPullHapticTriggered {
-                    bottomPullHapticTriggered = true
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                  } else if pull < nativeBottomPullToRefreshThreshold() && bottomPullHapticTriggered {
-                    bottomPullHapticTriggered = false
-                  }
-                } else if bottomPullDistance > 0 {
-                  bottomPullDistance = 0
-                  bottomPullHapticTriggered = false
-                }
                 return
               }
               guard !isMagnifying else { return }
@@ -1912,28 +1864,12 @@ struct NativePhotosView: View {
               }
               handle2DDragSelection(at: drag.location)
             }
-            .onEnded { drag in
-              if !isSelecting {
-                let nearBottom = nativeIsTimelineNearBottom(
-                  anchorFrame: timelineBottomAnchorFrame,
-                  viewportFrame: timelineViewportFrame
-                )
-                let shouldRefresh = nativeShouldTriggerBottomPullRefresh(
-                  isAtBottom: nearBottom,
-                  dragTranslationY: drag.translation.height,
-                  overscrollDistance: bottomPullDistance,
-                  isRefreshing: isRefreshing || model.isLoading
-                )
-                bottomPullDistance = 0
-                bottomPullHapticTriggered = false
-                if shouldRefresh {
-                  triggerRefresh(proxy: proxy)
-                }
-                return
+            .onEnded { _ in
+              if isSelecting {
+                isDragSelecting = false
+                dragSelectionIntent = .undecided
+                finishDragSelection()
               }
-              isDragSelecting = false
-              dragSelectionIntent = .undecided
-              finishDragSelection()
             }
         )
         .background(Color(uiColor: .systemBackground))
@@ -2252,9 +2188,7 @@ struct NativePhotosView: View {
                           columns = 7
                         }
                       }
-                      if level == "所有照片" {
-                        scrollToBottom(proxy: proxy, animated: true)
-                      }
+                      scrollToBottom(proxy: proxy, animated: true)
                     } label: {
                       Text(level)
                         .font(.system(size: 13, weight: selectedTimelineLevel == level ? .bold : .medium))
@@ -2935,7 +2869,7 @@ struct NativePhotosView: View {
         if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000) }
         guard !Task.isCancelled, request == bottomPositionRequest, !userMovedTimeline,
               !initial || (isBootstrappingTimeline && !pendingSourceChangeScroll) else { return }
-        if let targetAssetID = cachedDayGroups.last?.assets.last?.id {
+        if let targetAssetID = activeTimelineSections.last?.assets.last?.id ?? cachedDayGroups.last?.assets.last?.id {
           if animated && index == 0 {
             withAnimation(.easeInOut(duration: 0.25)) { proxy.scrollTo(targetAssetID, anchor: .bottom) }
           } else {
@@ -4460,11 +4394,12 @@ private struct NativeSingleAssetPage: View {
         }
       }
       .contentShape(Rectangle())
-      .onTapGesture {
-        if item.isVideo || (livePhoto == nil && image == nil) {
-          onTap()
-        }
-      }
+      .highPriorityGesture(
+        TapGesture()
+          .onEnded {
+            onTap()
+          }
+      )
       .onLongPressGesture(minimumDuration: 0.35, maximumDistance: 15, pressing: { pressing in
         if !pressing { stopLivePlayback() }
       }, perform: {

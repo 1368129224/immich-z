@@ -2506,6 +2506,7 @@ struct NativePhotosView: View {
       }
     }
     .navigationViewStyle(.stack)
+    .ignoresSafeArea(edges: .bottom)
   }
 
   private var selectedItems: [NativeGridItem] {
@@ -3690,7 +3691,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var isLivePhotoEnabled = true
   @State private var isLivePhotoMuted = true
   @State private var currentAssetID: String
-  @State private var showChrome = true
+  @State private var showChrome = false
   @State private var isCurrentImageZoomed = false
   @State private var showInfoSheet = false
   @State private var isFavorite = false
@@ -4534,7 +4535,7 @@ private struct NativeSingleAssetPage: View {
       .background(Color.black.opacity(0.65))
       .clipShape(Capsule())
       .padding(.horizontal, 16)
-      .padding(.bottom, 128)
+      .padding(.bottom, 114)
     }
     .allowsHitTesting(true)
   }

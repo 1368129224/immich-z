@@ -14,10 +14,13 @@ for tool in gh python3; do
 done
 [[ -f "$updater" ]] || { echo "Missing updater: $updater" >&2; exit 1; }
 
-# Pick the newest *successful* main run; a failed or running run has no usable IPA.
-run_id="$(gh run list -R "$repo" -w "$workflow" -b main -s success -L 1 --json databaseId \
+branch="${1:-$(git branch --show-current 2>/dev/null || echo "main")}"
+[[ -n "$branch" ]] || branch="main"
+
+# Pick the newest *successful* run for the specified branch.
+run_id="$(gh run list -R "$repo" -w "$workflow" -b "$branch" -s success -L 1 --json databaseId \
   --jq '.[0].databaseId // empty')"
-[[ -n "$run_id" ]] || { echo "No successful main-branch run found for $workflow" >&2; exit 1; }
+[[ -n "$run_id" ]] || { echo "No successful $branch-branch run found for $workflow" >&2; exit 1; }
 
 mkdir -p "$ipa_dir"
 staging="$(mktemp -d "$ipa_dir/.download.XXXXXXXX")"

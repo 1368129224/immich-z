@@ -246,6 +246,55 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(nativeAspectFitImageSize(imageSize: .zero, viewportSize: viewport), .zero)
   }
 
+  func testViewerZoomRectMatchesViewportAspectRatioAndCentersOnTap() {
+    let viewport = CGSize(width: 390, height: 844)
+    let imageSize = CGSize(width: 390, height: 520)
+    let tapCenter = CGPoint(x: 195, y: 260)
+    let rect = nativeViewerZoomRect(for: tapCenter, in: imageSize, viewportSize: viewport, targetScale: 3.0)
+    XCTAssertEqual(rect.width, 130, accuracy: 0.001)
+    XCTAssertEqual(rect.height, 844.0 / 3.0, accuracy: 0.001)
+    XCTAssertEqual(rect.midX, 195, accuracy: 0.001)
+    XCTAssertEqual(rect.midY, 260, accuracy: 0.001)
+
+    // Tap outside bounds clamps location
+    let tapCorner = CGPoint(x: -50, y: 600)
+    let clampedRect = nativeViewerZoomRect(for: tapCorner, in: imageSize, viewportSize: viewport, targetScale: 3.0)
+    XCTAssertEqual(clampedRect.midX, 0, accuracy: 0.001)
+    XCTAssertEqual(clampedRect.midY, 520, accuracy: 0.001)
+  }
+
+  func testViewerVerticalSwipeClassification() {
+    // Downward swipe to dismiss
+    XCTAssertEqual(
+      nativeClassifyViewerVerticalSwipe(translation: CGSize(width: 0, height: 130), predictedEnd: CGSize(width: 0, height: 150)),
+      .dismiss
+    )
+    XCTAssertEqual(
+      nativeClassifyViewerVerticalSwipe(translation: CGSize(width: 5, height: 50), predictedEnd: CGSize(width: 5, height: 320)),
+      .dismiss
+    )
+
+    // Upward swipe to show EXIF / details
+    XCTAssertEqual(
+      nativeClassifyViewerVerticalSwipe(translation: CGSize(width: 0, height: -30), predictedEnd: CGSize(width: 0, height: -40)),
+      .showDetails
+    )
+    XCTAssertEqual(
+      nativeClassifyViewerVerticalSwipe(translation: CGSize(width: 2, height: -18), predictedEnd: CGSize(width: 2, height: -90)),
+      .showDetails
+    )
+
+    // Horizontal swipe should NOT trigger dismiss or details (leaves to TabView paging)
+    XCTAssertEqual(
+      nativeClassifyViewerVerticalSwipe(translation: CGSize(width: 100, height: 20), predictedEnd: CGSize(width: 200, height: 30)),
+      .none
+    )
+    XCTAssertEqual(
+      nativeClassifyViewerVerticalSwipe(translation: CGSize(width: -80, height: -10), predictedEnd: CGSize(width: -150, height: -20)),
+      .none
+    )
+  }
+
   func testPhotosPinchCellSizeIsContinuousAndClamped() {
     XCTAssertEqual(nativeClampedPhotosCellSize(100, magnification: 1), 100, accuracy: 0.001)
     XCTAssertEqual(nativeClampedPhotosCellSize(100, magnification: 1.5), 150, accuracy: 0.001)

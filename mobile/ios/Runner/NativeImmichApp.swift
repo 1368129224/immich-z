@@ -3550,6 +3550,12 @@ private extension UIView {
 // Keep per-frame gesture updates out of the gallery's asset/page state. Moving
 // the pager (without clipping or scaling its entire UIPageViewController) is
 // cheap; only the lightweight black backdrop and chrome fade are animated.
+private enum NativeViewerDragDirection {
+  case undetermined
+  case draggingDown
+  case swipingUp
+}
+
 private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
   let pager: Pager
   let chrome: Chrome
@@ -3559,7 +3565,7 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
   let onDismiss: () -> Void
 
   @State private var dragY: CGFloat = 0
-  @State private var locked = false
+  @State private var dragDirection: NativeViewerDragDirection = .undetermined
   @State private var finishing = false
 
   var body: some View {
@@ -3573,32 +3579,53 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
           DragGesture(minimumDistance: 8)
             .onChanged { value in
               guard !isZoomed, !finishing else { return }
-              if !locked {
-                if value.translation.height < -15 && abs(value.translation.height) > abs(value.translation.width) * 1.25 {
-                  locked = true
+              let isVertical = abs(value.translation.height) > abs(value.translation.width) * 1.25
+              if dragDirection == .undetermined {
+                let action = nativeClassifyViewerVerticalSwipe(translation: value.translation, predictedEnd: value.predictedEndTranslation)
+                if action == .showDetails {
+                  dragDirection = .swipingUp
                   onSwipeUp?()
                   return
                 }
-                guard value.translation.height > 8,
-                      value.translation.height > abs(value.translation.width) * 1.25 else { return }
-                locked = true
+                if value.translation.height > 8 && isVertical {
+                  dragDirection = .draggingDown
+                } else {
+                  return
+                }
               }
-              dragY = max(0, value.translation.height)
+              if dragDirection == .draggingDown {
+                dragY = max(0, value.translation.height)
+              }
             }
             .onEnded { value in
-              guard locked, !finishing else { return }
-              locked = false
+              let currentDirection = dragDirection
+              dragDirection = .undetermined
+              guard !finishing else { return }
               if isZoomed {
                 withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) { dragY = 0 }
                 return
               }
-              if value.translation.height > 120 || value.predictedEndTranslation.height > 300 {
-                finishing = true
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                withAnimation(.easeOut(duration: 0.22)) {
-                  dragY = UIScreen.main.bounds.height + 80
+              let action = nativeClassifyViewerVerticalSwipe(translation: value.translation, predictedEnd: value.predictedEndTranslation)
+              if currentDirection == .swipingUp || action == .showDetails {
+                if currentDirection != .swipingUp {
+                  onSwipeUp?()
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { onDismiss() }
+                withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) { dragY = 0 }
+                return
+              }
+              if currentDirection == .draggingDown {
+                if action == .dismiss {
+                  finishing = true
+                  UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                  withAnimation(.easeOut(duration: 0.22)) {
+                    dragY = UIScreen.main.bounds.height + 80
+                  }
+                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { onDismiss() }
+                } else {
+                  withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) {
+                    dragY = 0
+                  }
+                }
               } else {
                 withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) {
                   dragY = 0
@@ -3687,7 +3714,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var isLivePhotoEnabled = true
   @State private var isLivePhotoMuted = true
   @State private var currentAssetID: String
-  @State private var showChrome = false
+  @State private var showChrome = true
   @State private var isCurrentImageZoomed = false
   @State private var showInfoSheet = false
   @State private var isFavorite = false
@@ -3785,6 +3812,9 @@ struct NativeUnifiedGalleryViewer: View {
         )
       }
     }
+    .onAppear {
+      presentedController.value?.setNeedsStatusBarAppearanceUpdate()
+    }
     .onChange(of: showChrome) { _ in
       presentedController.value?.setNeedsStatusBarAppearanceUpdate()
     }
@@ -3836,6 +3866,7 @@ struct NativeUnifiedGalleryViewer: View {
     .sheet(isPresented: $showInfoSheet) {
       if let item = currentItem {
         NativeAssetInfoSheet(client: client, device: device, item: item)
+          .modifier(NativeInfoSheetDetentsModifier())
       }
     }
     .sheet(item: Binding<NativeSharePayload?>(
@@ -3852,7 +3883,8 @@ struct NativeUnifiedGalleryViewer: View {
           // Top Bar
           HStack {
             Button {
-              dismiss()
+              if let onDismissViewer { onDismissViewer() }
+              else { dismiss() }
             } label: {
               Image(systemName: "chevron.left")
                 .font(.system(size: 18, weight: .semibold))
@@ -4694,7 +4726,7 @@ final class NativeCenteringScrollView: UIScrollView {
       let fitted = nativeAspectFitImageSize(imageSize: assetSize, viewportSize: boundsSize)
       if fitted != .zero {
         setZoomScale(minimumZoomScale, animated: false)
-        contentView.frame = CGRect(origin: .zero, size: fitted)
+        contentView.bounds = CGRect(origin: .zero, size: fitted)
         contentSize = fitted
       }
     }
@@ -4705,22 +4737,55 @@ final class NativeCenteringScrollView: UIScrollView {
     let boundsSize = bounds.size
     guard boundsSize.width > 0, boundsSize.height > 0 else { return }
 
-    var frameToCenter = contentView.frame
-
-    if frameToCenter.size.width < boundsSize.width {
-      frameToCenter.origin.x = (boundsSize.width - frameToCenter.size.width) / 2.0
-    } else {
-      frameToCenter.origin.x = 0
-    }
-
-    if frameToCenter.size.height < boundsSize.height {
-      frameToCenter.origin.y = (boundsSize.height - frameToCenter.size.height) / 2.0
-    } else {
-      frameToCenter.origin.y = 0
-    }
-
-    contentView.frame = frameToCenter
+    let offsetX = max((boundsSize.width - contentSize.width) * 0.5, 0)
+    let offsetY = max((boundsSize.height - contentSize.height) * 0.5, 0)
+    contentView.center = CGPoint(
+      x: contentSize.width * 0.5 + offsetX,
+      y: contentSize.height * 0.5 + offsetY
+    )
   }
+}
+
+enum NativeViewerGestureAction: Equatable {
+  case none
+  case dismiss
+  case showDetails
+}
+
+func nativeClassifyViewerVerticalSwipe(
+  translation: CGSize,
+  predictedEnd: CGSize
+) -> NativeViewerGestureAction {
+  let isVertical = abs(translation.height) > abs(translation.width) * 1.25
+  guard isVertical else { return .none }
+  if translation.height < -20 || (translation.height < -15 && predictedEnd.height < -80) {
+    return .showDetails
+  }
+  if translation.height > 120 || (translation.height > 40 && predictedEnd.height > 300) {
+    return .dismiss
+  }
+  return .none
+}
+
+func nativeViewerZoomRect(
+  for location: CGPoint,
+  in viewSize: CGSize,
+  viewportSize: CGSize,
+  targetScale: CGFloat = 3.0
+) -> CGRect {
+  guard viewSize.width > 0, viewSize.height > 0,
+        viewportSize.width > 0, viewportSize.height > 0,
+        targetScale > 0 else { return .zero }
+  let zoomWidth = viewportSize.width / targetScale
+  let zoomHeight = viewportSize.height / targetScale
+  let clampedX = max(0, min(viewSize.width, location.x))
+  let clampedY = max(0, min(viewSize.height, location.y))
+  return CGRect(
+    x: clampedX - zoomWidth / 2,
+    y: clampedY - zoomHeight / 2,
+    width: zoomWidth,
+    height: zoomHeight
+  )
 }
 
 // Fit the full image inside the viewer; this is the minimum zoom size.
@@ -4753,6 +4818,7 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     scrollView.maximumZoomScale = 5.0
     scrollView.minimumZoomScale = 1.0
     scrollView.bouncesZoom = true
+    scrollView.isScrollEnabled = false
     scrollView.showsVerticalScrollIndicator = false
     scrollView.showsHorizontalScrollIndicator = false
     scrollView.contentInsetAdjustmentBehavior = .never
@@ -4797,8 +4863,9 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     let fittedSize = nativeAspectFitImageSize(imageSize: livePhoto.size, viewportSize: viewportSize)
     if fittedSize != .zero && photoView.bounds.size != fittedSize {
       uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
-      photoView.frame = CGRect(origin: .zero, size: fittedSize)
+      photoView.bounds = CGRect(origin: .zero, size: fittedSize)
       uiView.contentSize = fittedSize
+      uiView.isScrollEnabled = false
       onZoomChanged(false)
     }
     uiView.centerContent()
@@ -4820,7 +4887,10 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
                            shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
-      true // PhotoKit's playback gesture must not swallow the chrome tap.
+      if gestureRecognizer is UITapGestureRecognizer, otherGestureRecognizer is UITapGestureRecognizer {
+        return false
+      }
+      return true
     }
 
     func viewForZooming(in scrollView: UIScrollView) -> UIView? {
@@ -4829,12 +4899,16 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
       (scrollView as? NativeCenteringScrollView)?.centerContent()
-      onZoomChanged(scrollView.zoomScale > scrollView.minimumZoomScale + 0.01)
+      let zoomed = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
+      scrollView.isScrollEnabled = zoomed
+      onZoomChanged(zoomed)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
       (scrollView as? NativeCenteringScrollView)?.centerContent()
-      onZoomChanged(scale > scrollView.minimumZoomScale + 0.01)
+      let zoomed = scale > scrollView.minimumZoomScale + 0.01
+      scrollView.isScrollEnabled = zoomed
+      onZoomChanged(zoomed)
     }
 
     @objc func handleTap() {
@@ -4845,11 +4919,16 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
       guard let scrollView = gesture.view as? UIScrollView else { return }
       if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
         scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
+        scrollView.isScrollEnabled = false
+        onZoomChanged(false)
       } else if let view = scrollView.viewWithTag(101) {
-        let point = gesture.location(in: view)
-        let side = min(view.bounds.width, view.bounds.height) / 2
-        let rect = CGRect(x: point.x - side / 2, y: point.y - side / 2, width: side, height: side)
-        scrollView.zoom(to: rect, animated: true)
+        let location = gesture.location(in: view)
+        let rect = nativeViewerZoomRect(for: location, in: view.bounds.size, viewportSize: scrollView.bounds.size, targetScale: min(3.0, scrollView.maximumZoomScale))
+        if rect != .zero {
+          scrollView.zoom(to: rect, animated: true)
+          scrollView.isScrollEnabled = true
+          onZoomChanged(true)
+        }
       }
     }
   }
@@ -4870,6 +4949,7 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     scrollView.maximumZoomScale = 5.0
     scrollView.minimumZoomScale = 1.0
     scrollView.bouncesZoom = true
+    scrollView.isScrollEnabled = false
     scrollView.showsVerticalScrollIndicator = false
     scrollView.showsHorizontalScrollIndicator = false
     scrollView.contentInsetAdjustmentBehavior = .never
@@ -4884,6 +4964,7 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
     tapGesture.numberOfTapsRequired = 1
     tapGesture.cancelsTouchesInView = false
+    tapGesture.delegate = context.coordinator
     scrollView.addGestureRecognizer(tapGesture)
 
     let doubleTapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
@@ -4910,8 +4991,9 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     let fittedSize = nativeAspectFitImageSize(imageSize: image.size, viewportSize: viewportSize)
     if fittedSize != .zero && (imageChanged || imageView.bounds.size != fittedSize) {
       uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
-      imageView.frame = CGRect(origin: .zero, size: fittedSize)
+      imageView.bounds = CGRect(origin: .zero, size: fittedSize)
       uiView.contentSize = fittedSize
+      uiView.isScrollEnabled = false
       onZoomChanged(false)
     }
     uiView.centerContent()
@@ -4921,7 +5003,7 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     Coordinator(onTap: onTap, onZoomChanged: onZoomChanged)
   }
 
-  class Coordinator: NSObject, UIScrollViewDelegate {
+  class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
     var onTap: () -> Void
     var onZoomChanged: (Bool) -> Void
 
@@ -4930,18 +5012,30 @@ private struct NativeZoomableImageView: UIViewRepresentable {
       self.onZoomChanged = onZoomChanged
     }
 
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+      if gestureRecognizer is UITapGestureRecognizer, otherGestureRecognizer is UITapGestureRecognizer {
+        return false
+      }
+      return true
+    }
+
     func viewForZooming(in scrollView: UIScrollView) -> UIView? {
       scrollView.viewWithTag(100)
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
       (scrollView as? NativeCenteringScrollView)?.centerContent()
-      onZoomChanged(scrollView.zoomScale > scrollView.minimumZoomScale + 0.01)
+      let zoomed = scrollView.zoomScale > scrollView.minimumZoomScale + 0.01
+      scrollView.isScrollEnabled = zoomed
+      onZoomChanged(zoomed)
     }
 
     func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
       (scrollView as? NativeCenteringScrollView)?.centerContent()
-      onZoomChanged(scale > scrollView.minimumZoomScale + 0.01)
+      let zoomed = scale > scrollView.minimumZoomScale + 0.01
+      scrollView.isScrollEnabled = zoomed
+      onZoomChanged(zoomed)
     }
 
     @objc func handleTap() {
@@ -4952,12 +5046,30 @@ private struct NativeZoomableImageView: UIViewRepresentable {
       guard let scrollView = gesture.view as? UIScrollView else { return }
       if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
         scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
+        scrollView.isScrollEnabled = false
+        onZoomChanged(false)
       } else if let imageView = scrollView.viewWithTag(100) as? UIImageView {
-        let point = gesture.location(in: imageView)
-        let side = min(imageView.bounds.width, imageView.bounds.height) / 2
-        let rect = CGRect(x: point.x - side / 2, y: point.y - side / 2, width: side, height: side)
-        scrollView.zoom(to: rect, animated: true)
+        let location = gesture.location(in: imageView)
+        let rect = nativeViewerZoomRect(for: location, in: imageView.bounds.size, viewportSize: scrollView.bounds.size, targetScale: min(3.0, scrollView.maximumZoomScale))
+        if rect != .zero {
+          scrollView.zoom(to: rect, animated: true)
+          scrollView.isScrollEnabled = true
+          onZoomChanged(true)
+        }
       }
+    }
+  }
+}
+
+private struct NativeInfoSheetDetentsModifier: ViewModifier {
+  @ViewBuilder
+  func body(content: Content) -> some View {
+    if #available(iOS 16.0, *) {
+      content
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    } else {
+      content
     }
   }
 }

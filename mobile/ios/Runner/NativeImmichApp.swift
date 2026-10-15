@@ -1482,78 +1482,32 @@ struct NativePhotosView: View {
     device.assets.filter { (!cloud.checkedIDs.contains($0.id) || cloud.failedVerificationIDs.contains($0.id)) && cloud.matchedServerIDs[$0.id] == nil }.count
   }
 
+  @ViewBuilder
   private var trailingToolbarContent: some View {
-    HStack(spacing: 6) {
-      if isSelecting {
-        Button(selectedIDs.count >= totalDisplayCount && totalDisplayCount > 0 ? "取消全选" : "全选") {
-          toggleSelectAll()
-        }
-        .font(.system(size: 16, weight: .medium))
-      } else {
-        Button("选择") {
-          withAnimation(.easeInOut(duration: 0.2)) {
-            isSelecting = true
-          }
-        }
-        .font(.system(size: 16, weight: .medium))
-
-        // 服务器状态按钮
-        Button {
-          showServerSettings = true
-        } label: {
-          serverStatusIcon
-            .frame(width: 20, height: 20)
-            .frame(width: 32, height: 32)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("服务器状态")
-
-        // 同步与备份状态按钮
-        Button {
-          showSyncSettings = true
-        } label: {
-          cloudSyncStatusIcon
-            .frame(width: 20, height: 20)
-            .frame(width: 32, height: 32)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel("同步与备份状态")
-
-        Menu {
-          Button {
-            withAnimation(.easeInOut(duration: 0.2)) {
-              isAspectRatioGrid.toggle()
-            }
-          } label: {
-            Label(
-              isAspectRatioGrid ? "正方形照片网格" : "原始比例网格",
-              systemImage: isAspectRatioGrid ? "square.grid.2x2" : "rectangle.grid.2x2"
-            )
-          }
-
-          Divider()
-
-          Button {
-            showServerSettings = true
-          } label: {
-            Label("服务器设置", systemImage: "server.rack")
-          }
-
-          Button {
-            showSyncSettings = true
-          } label: {
-            Label("同步与备份状态", systemImage: "arrow.triangle.2.circlepath")
-          }
-        } label: {
-          Image(systemName: "ellipsis.circle")
-            .font(.system(size: 18, weight: .regular))
-            .foregroundColor(.primary)
-            .frame(width: 32, height: 32)
-            .contentShape(Rectangle())
-        }
+    HStack(spacing: 2) {
+      // 服务器状态按钮
+      Button {
+        showServerSettings = true
+      } label: {
+        serverStatusIcon
+          .frame(width: 20, height: 20)
+          .frame(width: 36, height: 32)
+          .contentShape(Rectangle())
       }
+      .buttonStyle(.plain)
+      .accessibilityLabel("服务器状态")
+
+      // 同步与备份状态按钮
+      Button {
+        showSyncSettings = true
+      } label: {
+        cloudSyncStatusIcon
+          .frame(width: 20, height: 20)
+          .frame(width: 36, height: 32)
+          .contentShape(Rectangle())
+      }
+      .buttonStyle(.plain)
+      .accessibilityLabel("同步与备份状态")
     }
     .fixedSize(horizontal: true, vertical: false)
   }

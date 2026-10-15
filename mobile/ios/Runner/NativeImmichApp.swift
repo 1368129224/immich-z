@@ -1582,6 +1582,43 @@ struct NativePhotosView: View {
     return NativeImmichClient.formatChineseDate(group.date, includeDay: !isFirstInMonth)
   }
 
+  private var activeTimelineSections: [NativeTimelineSection] {
+    var calendar = Calendar.autoupdatingCurrent
+    calendar.timeZone = .autoupdatingCurrent
+    if selectedTimelineLevel == "年" {
+      var grouped: [Int: [NativeGridItem]] = [:]
+      for item in filteredTimelineAssets {
+        let year = calendar.component(.year, from: item.date)
+        grouped[year, default: []].append(item)
+      }
+      return grouped.keys.sorted().map { year in
+        let assets = grouped[year] ?? []
+        let date = assets.first?.date ?? Date()
+        return NativeTimelineSection(title: "\(year) 年", date: date, assets: assets)
+      }
+    } else if selectedTimelineLevel == "月" {
+      var grouped: [Int: [NativeGridItem]] = [:]
+      for item in filteredTimelineAssets {
+        let year = calendar.component(.year, from: item.date)
+        let month = calendar.component(.month, from: item.date)
+        let key = year * 100 + month
+        grouped[key, default: []].append(item)
+      }
+      return grouped.keys.sorted().map { key in
+        let assets = grouped[key] ?? []
+        let year = key / 100
+        let month = key % 100
+        let date = assets.first?.date ?? Date()
+        return NativeTimelineSection(title: "\(year)年\(month)月", date: date, assets: assets)
+      }
+    } else {
+      return cachedDayGroups.map { group in
+        let title = formatDateBadge(for: group)
+        return NativeTimelineSection(title: title, date: group.date, assets: group.assets)
+      }
+    }
+  }
+
   private func timelineGridContent(proxy: ScrollViewProxy) -> some View {
           LazyVStack(spacing: 4) {
             if sourceFilter != .device && model.hasOlder && !model.assets.isEmpty {
@@ -1605,18 +1642,19 @@ struct NativePhotosView: View {
               }
               .frame(maxWidth: .infinity, minHeight: 220)
             }
-            ForEach(cachedDayGroups, id: \.date) { group in
+            ForEach(activeTimelineSections) { section in
               VStack(alignment: .leading, spacing: 2) {
-                if columns > 6 {
-                  Text(formatDateBadge(for: group))
-                    .font(.caption2.weight(.bold))
-                    .foregroundColor(.secondary)
-                    .padding(.horizontal, 4)
-                    .padding(.top, 4)
+                if selectedTimelineLevel == "年" || selectedTimelineLevel == "月" || columns > 6 {
+                  Text(section.title)
+                    .font(selectedTimelineLevel == "年" ? .title2.weight(.bold) : (selectedTimelineLevel == "月" ? .headline.weight(.bold) : .caption2.weight(.bold)))
+                    .foregroundColor(.primary)
+                    .padding(.horizontal, 6)
+                    .padding(.top, selectedTimelineLevel == "年" ? 12 : 6)
+                    .padding(.bottom, 2)
                 }
                 let gridSpacing: CGFloat = columns > 7 ? 1 : 2
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
-                  ForEach(group.assets) { entry in
+                  ForEach(section.assets) { entry in
                     Color.clear
                       .aspectRatio(1, contentMode: .fit)
                       .background(isAspectRatioGrid ? Color(uiColor: .secondarySystemBackground).opacity(0.35) : Color.clear)
@@ -1640,8 +1678,8 @@ struct NativePhotosView: View {
                       )
                       .clipped()
                       .overlay(alignment: .topLeading) {
-                        if columns <= 6 && entry.id == group.assets.first?.id {
-                          Text(formatDateBadge(for: group))
+                        if selectedTimelineLevel != "年" && selectedTimelineLevel != "月" && columns <= 6 && entry.id == section.assets.first?.id {
+                          Text(section.title)
                             .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
                             .foregroundColor(.white)
                             .lineLimit(1)
@@ -2202,16 +2240,20 @@ struct NativePhotosView: View {
                   ForEach(["年", "月", "日", "所有照片"], id: \.self) { level in
                     Button {
                       UISelectionFeedbackGenerator().selectionChanged()
-                      selectedTimelineLevel = level
+                      withAnimation(.easeInOut(duration: 0.25)) {
+                        selectedTimelineLevel = level
+                        if level == "所有照片" {
+                          columns = 4
+                        } else if level == "日" {
+                          columns = 3
+                        } else if level == "月" {
+                          columns = 5
+                        } else if level == "年" {
+                          columns = 7
+                        }
+                      }
                       if level == "所有照片" {
-                        columns = 4
                         scrollToBottom(proxy: proxy, animated: true)
-                      } else if level == "日" {
-                        columns = 3
-                      } else if level == "月" {
-                        columns = 5
-                      } else if level == "年" {
-                        columns = 7
                       }
                     } label: {
                       Text(level)
@@ -3156,6 +3198,13 @@ struct NativePhotosView: View {
     }
     return "仅云端\(typeName)"
   }
+}
+
+struct NativeTimelineSection: Identifiable {
+  var id: String { title }
+  let title: String
+  let date: Date
+  let assets: [NativeGridItem]
 }
 
 struct NativeDayGroup {
@@ -4777,6 +4826,7 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
 
     let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
     tapGesture.numberOfTapsRequired = 1
+    tapGesture.cancelsTouchesInView = false
     scrollView.addGestureRecognizer(tapGesture)
 
     let doubleTapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
@@ -4886,6 +4936,7 @@ private struct NativeZoomableImageView: UIViewRepresentable {
 
     let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
     tapGesture.numberOfTapsRequired = 1
+    tapGesture.cancelsTouchesInView = false
     scrollView.addGestureRecognizer(tapGesture)
 
     let doubleTapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))

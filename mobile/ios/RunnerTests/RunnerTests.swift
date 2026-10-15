@@ -27,6 +27,17 @@ final class RunnerTests: XCTestCase {
       sha256: manifest.sha256, downloadURL: URL(string: "https://example.com/other.ipa")!
     )
     XCTAssertThrowsError(try tampered.isNewer(than: 94, bundleID: "com.immichz.immichz"))
+
+    // Test SHA-256 verification
+    let tempFile = FileManager.default.temporaryDirectory.appendingPathComponent("test_\(UUID().uuidString).txt")
+    let testData = Data("hello immichz".utf8)
+    try testData.write(to: tempFile)
+    defer { try? FileManager.default.removeItem(at: tempFile) }
+
+    let correctSHA = "d43336423e82c473f616c1f555a6429fce09ff1295f294893a195c9a176c926f"
+    XCTAssertNoThrow(try nativeVerifyDownloadedIPA(at: tempFile, expectedSHA256: correctSHA))
+    XCTAssertNoThrow(try nativeVerifyDownloadedIPA(at: tempFile, expectedSHA256: correctSHA.uppercased()))
+    XCTAssertThrowsError(try nativeVerifyDownloadedIPA(at: tempFile, expectedSHA256: "0000000000000000000000000000000000000000000000000000000000000000"))
   }
 
   func testPhotosSourceFilterUsesActualCopyAndVerifiedMatch() {

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import MapKit
 import Photos
@@ -225,8 +226,9 @@ extension NativeImmichClient {
 }
 
 // The main branch publishes this manifest together with its unsigned IPA.
-// LiveContainer performs the download; this app never exposes a private
-// sandbox file URL to another app or attempts an iOS system installation.
+// The app downloads the IPA to a temporary file, verifies its SHA-256 against
+// this manifest, and presents the standard iOS Share Sheet with LiveContainer
+// targeted, avoiding the LiveContainer guest app URL scheme block.
 struct NativeReleaseUpdate: Decodable {
   let bundleIdentifier: String
   let channel: String
@@ -262,16 +264,72 @@ struct NativeReleaseUpdate: Decodable {
   }
 }
 
+func nativeComputeFileSHA256(at url: URL) throws -> String {
+  let handle = try FileHandle(forReadingFrom: url)
+  defer { try? handle.close() }
+  var hasher = SHA256()
+  while true {
+    let chunk = handle.readData(ofLength: 65_536)
+    if chunk.isEmpty { break }
+    hasher.update(data: chunk)
+  }
+  let digest = hasher.finalize()
+  return digest.map { String(format: "%02x", $0) }.joined()
+}
+
+func nativeVerifyDownloadedIPA(at fileURL: URL, expectedSHA256: String) throws {
+  let computed = try nativeComputeFileSHA256(at: fileURL)
+  guard computed.lowercased() == expectedSHA256.lowercased() else {
+    throw NativeUpdateError.checksumMismatch
+  }
+}
+
 private enum NativeUpdateError: LocalizedError {
   case invalidManifest
   case unavailable
   case unknownBuild
+  case checksumMismatch
+  case downloadFailed
 
   var errorDescription: String? {
     switch self {
     case .invalidManifest: return "更新信息无效，已停止安装。请稍后重试。"
     case .unavailable: return "暂时无法读取 GitHub Release，请检查网络后重试。"
     case .unknownBuild: return "无法读取当前构建号，暂不能安全比较版本。"
+    case .checksumMismatch: return "安装包哈希校验失败（可能下载损坏或被篡改），已取消导入。"
+    case .downloadFailed: return "安装包下载失败，请检查网络连接后重试。"
+    }
+  }
+}
+
+private final class NativeUpdateDownloadDelegate: NSObject, URLSessionDownloadDelegate {
+  var onProgress: ((Double) -> Void)?
+  var onCompletion: ((Result<URL, Error>) -> Void)?
+
+  func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didWriteData bytesWritten: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+    guard totalBytesExpectedToWrite > 0 else { return }
+    let progress = Double(totalBytesWritten) / Double(totalBytesExpectedToWrite)
+    DispatchQueue.main.async { self.onProgress?(progress) }
+  }
+
+  func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("immichz_update_\(UUID().uuidString)")
+    let target = tempDir.appendingPathComponent("ImmichZ-unsigned.ipa")
+    do {
+      try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+      if FileManager.default.fileExists(atPath: target.path) {
+        try FileManager.default.removeItem(at: target)
+      }
+      try FileManager.default.moveItem(at: location, to: target)
+      DispatchQueue.main.async { self.onCompletion?(.success(target)) }
+    } catch {
+      DispatchQueue.main.async { self.onCompletion?(.failure(error)) }
+    }
+  }
+
+  func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+    if let error {
+      DispatchQueue.main.async { self.onCompletion?(.failure(error)) }
     }
   }
 }
@@ -279,8 +337,12 @@ private enum NativeUpdateError: LocalizedError {
 struct NativeAppUpdateView: View {
   @State private var latest: NativeReleaseUpdate?
   @State private var isChecking = false
+  @State private var isDownloading = false
+  @State private var downloadProgress: Double = 0.0
+  @State private var downloadStatusText: String?
+  @State private var currentDownloadTask: URLSessionDownloadTask?
   @State private var status: String?
-  @State private var confirmInstall = false
+  @State private var sharePayload: NativeSharePayload?
 
   private var currentBuild: Int? {
     guard let string = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String else { return nil }
@@ -307,35 +369,59 @@ struct NativeAppUpdateView: View {
             if isChecking { Spacer(); ProgressView() }
           }
         }
-        .disabled(isChecking)
+        .disabled(isChecking || isDownloading)
+
         if let latest {
           HStack {
             Text("主分支新版本")
             Spacer()
             Text(latest.version).foregroundColor(.secondary)
           }
-          Button("通过 LiveContainer 更新") { confirmInstall = true }
-          Link("手动下载 IPA", destination: latest.downloadURL)
+
+          if isDownloading {
+            VStack(alignment: .leading, spacing: 6) {
+              HStack {
+                Text(downloadStatusText ?? "正在下载安装包…")
+                  .font(.subheadline)
+                Spacer()
+                Text("\(Int(downloadProgress * 100))%")
+                  .font(.subheadline.monospacedDigit())
+                  .foregroundColor(.secondary)
+              }
+              ProgressView(value: downloadProgress)
+              Button("取消下载", role: .destructive) {
+                cancelDownload()
+              }
+              .font(.footnote)
+              .padding(.top, 4)
+            }
+            .padding(.vertical, 4)
+          } else {
+            Button("下载并导入 LiveContainer") {
+              startDownloadAndShare(release: latest)
+            }
+            .disabled(isChecking)
+
+            Link("在浏览器中手动下载 IPA", destination: latest.downloadURL)
+          }
         }
+
         if let status { Text(status).font(.footnote).foregroundColor(.secondary) }
       } header: {
         Text("GitHub Release · main")
       } footer: {
-        Text("点击更新后由 LiveContainer 下载并询问是否替换。不会在系统中静默安装；未安装 LiveContainer 时可手动下载并导入。")
+        Text("下载完成后会自动调出系统共享面板。请在面板中选择「LiveContainer」，并在 LiveContainer 弹出的确认框中选择「覆盖 (Replace)」完成安装。")
       }
     }
     .navigationTitle("应用更新")
-    .confirmationDialog("即将打开 LiveContainer", isPresented: $confirmInstall, titleVisibility: .visible) {
-      Button("打开 LiveContainer") { openInLiveContainer() }
-      Button("取消", role: .cancel) {}
-    } message: {
-      Text("LiveContainer 会下载最新 IPA。请在其中确认替换，完成后重新打开 Immich Z。")
+    .sheet(item: $sharePayload) { payload in
+      NativeActivityView(activityItems: payload.content)
     }
     .task { await checkForUpdate() }
   }
 
   @MainActor private func checkForUpdate() async {
-    guard !isChecking else { return }
+    guard !isChecking, !isDownloading else { return }
     isChecking = true
     latest = nil
     status = nil
@@ -356,7 +442,7 @@ struct NativeAppUpdateView: View {
       let release = try JSONDecoder().decode(NativeReleaseUpdate.self, from: data)
       if try release.isNewer(than: currentBuild, bundleID: bundleID) {
         latest = release
-        status = "发现新构建 \(release.buildNumber)，请在 LiveContainer 中确认更新。"
+        status = "发现新构建 \(release.buildNumber)，点击上方按钮下载并导入 LiveContainer。"
       } else {
         status = "当前已是 main 渠道的最新版本。"
       }
@@ -367,16 +453,55 @@ struct NativeAppUpdateView: View {
     }
   }
 
-  private func openInLiveContainer() {
-    guard let url = latest?.liveContainerURL else {
-      status = NativeUpdateError.invalidManifest.localizedDescription
-      return
+  private func cancelDownload() {
+    currentDownloadTask?.cancel()
+    currentDownloadTask = nil
+    isDownloading = false
+    downloadProgress = 0
+    downloadStatusText = nil
+    status = "下载已取消。"
+  }
+
+  private func startDownloadAndShare(release: NativeReleaseUpdate) {
+    guard !isDownloading else { return }
+    isDownloading = true
+    downloadProgress = 0.0
+    downloadStatusText = "正在连接 GitHub…"
+    status = nil
+
+    let delegate = NativeUpdateDownloadDelegate()
+    let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+    let task = session.downloadTask(with: release.downloadURL)
+    currentDownloadTask = task
+
+    delegate.onProgress = { progress in
+      self.downloadProgress = progress
+      self.downloadStatusText = "正在下载 IPA (\(Int(progress * 100))%)…"
     }
-    UIApplication.shared.open(url) { didOpen in
-      guard !didOpen else { return }
-      Task { @MainActor in
-        status = "无法打开 LiveContainer。请使用“手动下载 IPA”并从文件 App 共享导入。"
+
+    delegate.onCompletion = { result in
+      self.isDownloading = false
+      self.currentDownloadTask = nil
+      switch result {
+      case .success(let downloadedURL):
+        self.downloadStatusText = "正在校验安装包…"
+        do {
+          try nativeVerifyDownloadedIPA(at: downloadedURL, expectedSHA256: release.sha256)
+          self.status = "安装包哈希校验通过，请在弹出的面板中选择 LiveContainer 覆盖安装。"
+          self.sharePayload = NativeSharePayload(content: downloadedURL)
+        } catch {
+          try? FileManager.default.removeItem(at: downloadedURL)
+          self.status = error.localizedDescription
+        }
+      case .failure(let error):
+        if (error as NSError).code == NSURLErrorCancelled {
+          self.status = "下载已取消。"
+        } else {
+          self.status = "下载失败：\(error.localizedDescription)"
+        }
       }
     }
+
+    task.resume()
   }
 }

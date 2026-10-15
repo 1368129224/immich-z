@@ -1219,8 +1219,8 @@ struct NativePhotosView: View {
   @State private var loadingMatchedServerIDs = Set<String>()
   @State private var sourceFilter: NativePhotosSource = .all
   @State private var cachedDayGroups: [NativeDayGroup] = []
+  @State private var cachedTimelineSections: [String: [NativeTimelineSection]] = [:]
   @State private var launchPreviewItems: [NativeGridItem]?
-  @State private var cachedFirstGroupDatesInMonth = Set<Date>()
   @State private var cachedExcludedLocalIDs = Set<String>()
   @State private var localExclusionsReady = true
   @State private var serverExclusionsReady = true
@@ -1233,6 +1233,9 @@ struct NativePhotosView: View {
   @State private var activeViewerItem: NativeGridItem?
   @AppStorage("immichz_photos_aspect_ratio_grid") private var isAspectRatioGrid = false
   @State private var selectedTimelineLevel: String = "所有照片"
+  @State private var isSwitchingTimeline = false
+  @State private var timelineSwitchTask: Task<Void, Never>?
+  @State private var timelineSwitchGeneration = 0
   @State private var selectedIDs: Set<String> = []
   @State private var isSelecting = false
   @State private var isDragSelecting = false
@@ -1577,50 +1580,12 @@ struct NativePhotosView: View {
       }
   }
 
-  private func formatDateBadge(for group: NativeDayGroup) -> String {
-    let isFirstInMonth = cachedFirstGroupDatesInMonth.contains(group.date)
-    return NativeImmichClient.formatChineseDate(group.date, includeDay: !isFirstInMonth)
-  }
-
   private var activeTimelineSections: [NativeTimelineSection] {
-    var calendar = Calendar.autoupdatingCurrent
-    calendar.timeZone = .autoupdatingCurrent
-    if selectedTimelineLevel == "年" {
-      var grouped: [Int: [NativeGridItem]] = [:]
-      for item in filteredTimelineAssets {
-        let year = calendar.component(.year, from: item.date)
-        grouped[year, default: []].append(item)
-      }
-      return grouped.keys.sorted().map { year in
-        let assets = grouped[year] ?? []
-        let date = assets.first?.date ?? Date()
-        return NativeTimelineSection(title: "\(year) 年", date: date, assets: assets)
-      }
-    } else if selectedTimelineLevel == "月" {
-      var grouped: [Int: [NativeGridItem]] = [:]
-      for item in filteredTimelineAssets {
-        let year = calendar.component(.year, from: item.date)
-        let month = calendar.component(.month, from: item.date)
-        let key = year * 100 + month
-        grouped[key, default: []].append(item)
-      }
-      return grouped.keys.sorted().map { key in
-        let assets = grouped[key] ?? []
-        let year = key / 100
-        let month = key % 100
-        let date = assets.first?.date ?? Date()
-        return NativeTimelineSection(title: "\(year)年\(month)月", date: date, assets: assets)
-      }
-    } else {
-      return cachedDayGroups.map { group in
-        let title = formatDateBadge(for: group)
-        return NativeTimelineSection(title: title, date: group.date, assets: group.assets)
-      }
-    }
+    cachedTimelineSections[selectedTimelineLevel] ?? []
   }
 
   private func timelineGridContent(proxy: ScrollViewProxy) -> some View {
-          LazyVStack(spacing: 4) {
+          LazyVStack(spacing: selectedTimelineLevel == "年" || selectedTimelineLevel == "月" ? 0 : 4) {
             if sourceFilter != .device && model.hasOlder && !model.assets.isEmpty {
               Button {
                 requestOlder()
@@ -1644,8 +1609,9 @@ struct NativePhotosView: View {
             }
             ForEach(activeTimelineSections) { section in
               VStack(alignment: .leading, spacing: 2) {
-                if selectedTimelineLevel == "年" || selectedTimelineLevel == "月" || columns > 6 {
-                  Text(section.title)
+                if let title = section.title,
+                   selectedTimelineLevel == "年" || selectedTimelineLevel == "月" || columns > 6 {
+                  Text(title)
                     .font(selectedTimelineLevel == "年" ? .title2.weight(.bold) : (selectedTimelineLevel == "月" ? .headline.weight(.bold) : .caption2.weight(.bold)))
                     .foregroundColor(.primary)
                     .padding(.horizontal, 6)
@@ -1679,7 +1645,7 @@ struct NativePhotosView: View {
                       .clipped()
                       .overlay(alignment: .topLeading) {
                         if selectedTimelineLevel != "年" && selectedTimelineLevel != "月" && columns <= 6 && entry.id == section.assets.first?.id {
-                          Text(section.title)
+                          Text(section.title ?? "")
                             .font(.system(size: max(9, 13 - CGFloat(columns)), weight: .bold))
                             .foregroundColor(.white)
                             .lineLimit(1)
@@ -2088,6 +2054,9 @@ struct NativePhotosView: View {
           hydrationTask = nil
         }
         .onDisappear {
+          timelineSwitchTask?.cancel()
+          timelineSwitchTask = nil
+          isSwitchingTimeline = false
           bottomPositionTask?.cancel()
           bottomPositionTask = nil
           hydrationTask?.cancel()
@@ -2175,20 +2144,7 @@ struct NativePhotosView: View {
                 HStack(spacing: 2) {
                   ForEach(["年", "月", "日", "所有照片"], id: \.self) { level in
                     Button {
-                      UISelectionFeedbackGenerator().selectionChanged()
-                      withAnimation(.easeInOut(duration: 0.25)) {
-                        selectedTimelineLevel = level
-                        if level == "所有照片" {
-                          columns = 4
-                        } else if level == "日" {
-                          columns = 3
-                        } else if level == "月" {
-                          columns = 5
-                        } else if level == "年" {
-                          columns = 7
-                        }
-                      }
-                      scrollToBottom(proxy: proxy, animated: true)
+                      switchTimeline(to: level, proxy: proxy)
                     } label: {
                       Text(level)
                         .font(.system(size: 13, weight: selectedTimelineLevel == level ? .bold : .medium))
@@ -2461,8 +2417,13 @@ struct NativePhotosView: View {
                         )
                       }
                     )
-                    .opacity(isInitialTimelineVisible ? 1 : 0)
-                    .allowsHitTesting(isInitialTimelineVisible)
+                    .opacity(isInitialTimelineVisible && !isSwitchingTimeline ? 1 : 0)
+                    .allowsHitTesting(isInitialTimelineVisible && !isSwitchingTimeline)
+                  if isSwitchingTimeline {
+                    ProgressView()
+                      .frame(maxWidth: .infinity, maxHeight: .infinity)
+                      .background(Color(uiColor: .systemBackground))
+                  }
                   if !isInitialTimelineVisible {
                     NativeCachedTimelinePreview(
                       client: client, items: launchViewerItems,
@@ -2755,6 +2716,52 @@ struct NativePhotosView: View {
     }
   }
 
+  private func switchTimeline(to level: String, proxy: ScrollViewProxy) {
+    guard selectedTimelineLevel != level else {
+      withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+      return
+    }
+    UISelectionFeedbackGenerator().selectionChanged()
+    timelineSwitchTask?.cancel()
+    timelineSwitchGeneration += 1
+    let generation = timelineSwitchGeneration
+    bottomPositionTask?.cancel()
+    bottomPositionTask = nil
+    bottomPositionRequest += 1
+    pendingSourceChangeScroll = false
+    isBootstrappingTimeline = false
+    userMovedTimeline = false
+
+    // Large libraries cannot animate a whole grid reflow. Keep the stable
+    // day identity, relayout without animation, then reveal it at the bottom.
+    isSwitchingTimeline = isInitialTimelineVisible
+    var transaction = Transaction(animation: nil)
+    transaction.disablesAnimations = true
+    withTransaction(transaction) {
+      selectedTimelineLevel = level
+      switch level {
+      case "年": columns = 7
+      case "月": columns = 5
+      case "日": columns = 3
+      default: columns = 4
+      }
+    }
+    guard isInitialTimelineVisible else { return } // Cold-start positioning owns its own scroll.
+    timelineSwitchTask = Task { @MainActor in
+      try? await Task.sleep(nanoseconds: 50_000_000)
+      guard !Task.isCancelled, generation == timelineSwitchGeneration else { return }
+      withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+      try? await Task.sleep(nanoseconds: 120_000_000)
+      guard !Task.isCancelled, generation == timelineSwitchGeneration else { return }
+      if !nativeTimelineBottomReached(anchorFrame: timelineBottomAnchorFrame,
+                                      viewportFrame: timelineViewportFrame, tolerance: 8) {
+        withAnimation(.none) { proxy.scrollTo(bottomAnchor, anchor: .bottom) }
+      }
+      isSwitchingTimeline = false
+      timelineSwitchTask = nil
+    }
+  }
+
   private func triggerRefresh(proxy _: ScrollViewProxy) {
     guard isInitialTimelineVisible, !isRefreshing, !model.isLoading else { return }
     isBootstrappingTimeline = false
@@ -2999,17 +3006,14 @@ struct NativePhotosView: View {
       NativeDayGroup(date: date, assets: grouped[date] ?? [])
     }
     cachedDayGroups = groups
-
-    var seenYearMonths = Set<Int>()
-    var firstDates = Set<Date>()
-    for group in groups {
-      let year = calendar.component(.year, from: group.date)
-      let month = calendar.component(.month, from: group.date)
-      if seenYearMonths.insert(year * 100 + month).inserted {
-        firstDates.insert(group.date)
-      }
-    }
-    cachedFirstGroupDatesInMonth = firstDates
+    // Calculate only when assets change, never on a SwiftUI body/layout pass.
+    let daySections = nativeTimelineSections(from: groups, level: "日", calendar: calendar)
+    cachedTimelineSections = [
+      "年": nativeTimelineSections(from: groups, level: "年", calendar: calendar),
+      "月": nativeTimelineSections(from: groups, level: "月", calendar: calendar),
+      "日": daySections,
+      "所有照片": daySections
+    ]
   }
 
   private var allOrderedAssetIDs: [String] {
@@ -3135,10 +3139,31 @@ struct NativePhotosView: View {
 }
 
 struct NativeTimelineSection: Identifiable {
-  var id: String { title }
-  let title: String
+  var id: Date { date }  // The day stays in place as the display granularity changes.
+  let title: String?
   let date: Date
   let assets: [NativeGridItem]
+}
+
+func nativeTimelineSections(
+  from groups: [NativeDayGroup], level: String, calendar: Calendar
+) -> [NativeTimelineSection] {
+  var lastYear: Int?
+  var lastMonth: Int?
+  return groups.map { group in
+    let year = calendar.component(.year, from: group.date)
+    let month = calendar.component(.month, from: group.date)
+    let firstInMonth = lastYear != year || lastMonth != month
+    let title: String?
+    switch level {
+    case "年": title = lastYear == year ? nil : "\(year) 年"
+    case "月": title = firstInMonth ? "\(year)年\(month)月" : nil
+    default: title = NativeImmichClient.formatChineseDate(group.date, includeDay: !firstInMonth)
+    }
+    lastYear = year
+    lastMonth = month
+    return NativeTimelineSection(title: title, date: group.date, assets: group.assets)
+  }
 }
 
 struct NativeDayGroup {
@@ -3587,6 +3612,7 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
           .transition(.opacity)
       }
     }
+    .animation(.easeInOut(duration: 0.2), value: showsChrome)
   }
 }
 
@@ -3643,19 +3669,6 @@ private struct NativeViewerFilmstrip: View {
       .onAppear {
         proxy.scrollTo(currentAssetID, anchor: .center)
       }
-    }
-  }
-}
-
-private struct NativeGallerySystemOverlayModifier: ViewModifier {
-  let isImmersive: Bool
-
-  @ViewBuilder
-  func body(content: Content) -> some View {
-    if #available(iOS 16.0, *) {
-      content.persistentSystemOverlays(isImmersive ? .hidden : .automatic)
-    } else {
-      content
     }
   }
 }
@@ -3743,11 +3756,7 @@ struct NativeUnifiedGalleryViewer: View {
                 onZoomChanged: { zoomed in
                   if item.id == currentAssetID { isCurrentImageZoomed = zoomed }
                 },
-                onTap: {
-                  withAnimation(.easeInOut(duration: 0.2)) {
-                    showChrome.toggle()
-                  }
-                }
+                onTap: { showChrome.toggle() }
               )
               .tag(item.id)
               .ignoresSafeArea()
@@ -3776,7 +3785,9 @@ struct NativeUnifiedGalleryViewer: View {
         )
       }
     }
-    .animation(.easeInOut(duration: 0.2), value: showChrome)
+    .onChange(of: showChrome) { _ in
+      presentedController.value?.setNeedsStatusBarAppearanceUpdate()
+    }
     .confirmationDialog("删除范围", isPresented: $showDeleteScopeDialog, titleVisibility: .visible) {
       if currentItem?.local != nil {
         Button("仅删除本地", role: .destructive) {
@@ -3834,7 +3845,6 @@ struct NativeUnifiedGalleryViewer: View {
       NativeActivityView(activityItems: payload.content)
     }
     .statusBarHidden(!showChrome)
-    .modifier(NativeGallerySystemOverlayModifier(isImmersive: !showChrome))
   }
 
   private var viewerChrome: some View {
@@ -4324,6 +4334,8 @@ private struct NativeSingleAssetPage: View {
     GeometryReader { proxy in
       ZStack {
         Color.black.ignoresSafeArea()
+          .contentShape(Rectangle())
+          .onTapGesture(perform: onTap)
 
         if item.isVideo {
           if let player {
@@ -4331,6 +4343,7 @@ private struct NativeSingleAssetPage: View {
               VideoPlayer(player: player)
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .ignoresSafeArea()
+                .highPriorityGesture(TapGesture().onEnded { onTap() })
                 .onAppear {
                   setupVideoObserver(for: player)
                   player.play()
@@ -4393,13 +4406,6 @@ private struct NativeSingleAssetPage: View {
           }
         }
       }
-      .contentShape(Rectangle())
-      .highPriorityGesture(
-        TapGesture()
-          .onEnded {
-            onTap()
-          }
-      )
       .onLongPressGesture(minimumDuration: 0.35, maximumDistance: 15, pressing: { pressing in
         if !pressing { stopLivePlayback() }
       }, perform: {
@@ -4762,6 +4768,7 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     let tapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleTap))
     tapGesture.numberOfTapsRequired = 1
     tapGesture.cancelsTouchesInView = false
+    tapGesture.delegate = context.coordinator
     scrollView.addGestureRecognizer(tapGesture)
 
     let doubleTapGesture = UITapGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handleDoubleTap(_:)))
@@ -4801,7 +4808,7 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     Coordinator(onTap: onTap, onZoomChanged: onZoomChanged)
   }
 
-  class Coordinator: NSObject, UIScrollViewDelegate {
+  class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
     var onTap: () -> Void
     var onZoomChanged: (Bool) -> Void
     var wasPlaying = false
@@ -4809,6 +4816,11 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     init(onTap: @escaping () -> Void, onZoomChanged: @escaping (Bool) -> Void) {
       self.onTap = onTap
       self.onZoomChanged = onZoomChanged
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+      true // PhotoKit's playback gesture must not swallow the chrome tap.
     }
 
     func viewForZooming(in scrollView: UIScrollView) -> UIView? {

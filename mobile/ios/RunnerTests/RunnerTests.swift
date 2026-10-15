@@ -47,6 +47,35 @@ final class RunnerTests: XCTestCase {
     XCTAssertFalse(nativeShouldKeepTimelineAtBottom(isBootstrapping: true, userMovedTimeline: false, pendingSourceChange: false, hasAssets: true, positioningInProgress: true))
   }
 
+  func testTimelineGranularityKeepsDayIdentityAndChronologicalOrder() {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+    let dates = [
+      DateComponents(year: 2023, month: 12, day: 31),
+      DateComponents(year: 2024, month: 1, day: 1),
+      DateComponents(year: 2024, month: 1, day: 2),
+      DateComponents(year: 2024, month: 2, day: 1)
+    ].compactMap { calendar.date(from: $0) }
+    let groups = dates.enumerated().map { index, date in
+      NativeDayGroup(date: date, assets: [
+        NativeGridItem(server: NativeAsset(
+          id: "asset-\(index)", date: date, isImage: true,
+          isFavorite: false, thumbhash: nil
+        ), local: nil)
+      ])
+    }
+    let years = nativeTimelineSections(from: groups, level: "年", calendar: calendar)
+    let months = nativeTimelineSections(from: groups, level: "月", calendar: calendar)
+    let days = nativeTimelineSections(from: groups, level: "日", calendar: calendar)
+
+    XCTAssertEqual(years.map(\.title), ["2023 年", "2024 年", nil, nil])
+    XCTAssertEqual(months.map(\.title), ["2023年12月", "2024年1月", nil, "2024年2月"])
+    XCTAssertEqual(years.map(\.id), months.map(\.id))
+    XCTAssertEqual(years.map(\.id), days.map(\.id))
+    XCTAssertEqual(years.last?.assets.last?.server?.id, "asset-3")
+    XCTAssertEqual(months.last?.assets.last?.server?.id, "asset-3")
+  }
+
   func testThumbnailCacheIdentitySurvivesTokenRotation() {
     let first = nativeThumbnailCacheAccountKey(
       server: "https://photos.example/", userId: "alice",

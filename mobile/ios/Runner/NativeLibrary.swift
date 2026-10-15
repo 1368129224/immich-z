@@ -309,7 +309,11 @@ struct NativeAppUpdateView: View {
         }
         .disabled(isChecking)
         if let latest {
-          LabeledContent("主分支新版本", value: latest.version)
+          HStack {
+            Text("主分支新版本")
+            Spacer()
+            Text(latest.version).foregroundColor(.secondary)
+          }
           Button("通过 LiveContainer 更新") { confirmInstall = true }
           Link("手动下载 IPA", destination: latest.downloadURL)
         }

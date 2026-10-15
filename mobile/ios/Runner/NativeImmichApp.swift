@@ -3475,13 +3475,13 @@ struct NativeThumbnail: View {
 
   private var maxPixelDimension: Int {
     if columns <= 2 {
-      return 600
+      return 400
     } else if columns <= 4 {
-      return 360
+      return 250
     } else if columns <= 7 {
-      return 220
+      return 160
     } else {
-      return 130
+      return 100
     }
   }
 }
@@ -3740,11 +3740,6 @@ struct NativeUnifiedGalleryViewer: View {
     items.first(where: { $0.id == currentAssetID })
   }
 
-  private var windowedViewerItems: [NativeGridItem] {
-    let slice = nativeViewerWindowSlice(currentIndex: currentIndex, totalCount: items.count, windowRadius: 15)
-    return Array(items[slice])
-  }
-
   var body: some View {
     ZStack {
       NativeClearBackgroundView { controller in
@@ -3757,7 +3752,7 @@ struct NativeUnifiedGalleryViewer: View {
       } else {
         NativeViewerDismissSurface(
           pager: TabView(selection: $currentAssetID) {
-            ForEach(windowedViewerItems) { item in
+            ForEach(items) { item in
               NativeSingleAssetPage(
                 client: client,
                 device: device,
@@ -4777,10 +4772,6 @@ func nativeAspectFitImageSize(imageSize: CGSize, viewportSize: CGSize) -> CGSize
         viewportSize.width > 0, viewportSize.height > 0 else { return .zero }
   let widthRatio = viewportSize.width / imageSize.width
   let heightRatio = viewportSize.height / imageSize.height
-  // 若长宽比与屏幕极为接近（如截图），直接对齐全屏视口，消除亚像素误差导致的黑边
-  if abs(widthRatio - heightRatio) / max(widthRatio, heightRatio) < 0.008 {
-    return viewportSize
-  }
   let scale = min(widthRatio, heightRatio)
   return CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
 }

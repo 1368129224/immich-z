@@ -600,13 +600,13 @@ struct NativeDeviceThumbnail: View {
 
   private var targetDimension: Int {
     if columns <= 2 {
-      return 500
+      return 400
     } else if columns <= 4 {
-      return 320
+      return 250
     } else if columns <= 7 {
-      return 180
+      return 160
     } else {
-      return 110
+      return 100
     }
   }
 }

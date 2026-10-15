@@ -94,6 +94,14 @@ func nativeShouldDismissViewerOnDeletion(
   itemsCountAfterDeletion <= 0
 }
 
+/// Computes a slice window around the current index for smooth virtualized scrolling.
+func nativeViewerWindowSlice(currentIndex: Int, totalCount: Int, windowRadius: Int = 15) -> Range<Int> {
+  guard totalCount > 0 else { return 0..<0 }
+  let lower = max(0, currentIndex - windowRadius)
+  let upper = min(totalCount, currentIndex + windowRadius + 1)
+  return lower..<upper
+}
+
 func nativeFormattedAppVersion(
   shortVersion: String,
   buildNumber: String,

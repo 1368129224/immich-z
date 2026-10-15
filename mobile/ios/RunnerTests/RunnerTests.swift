@@ -249,6 +249,14 @@ final class RunnerTests: XCTestCase {
     XCTAssertEqual(nativeFormattedAppVersion(shortVersion: "0.0.2", buildNumber: "82", commit: "unknown"), "0.0.2+82")
   }
 
+  func testViewerWindowSliceClamping() {
+    XCTAssertEqual(nativeViewerWindowSlice(currentIndex: 0, totalCount: 10, windowRadius: 3), 0..<4)
+    XCTAssertEqual(nativeViewerWindowSlice(currentIndex: 5, totalCount: 10, windowRadius: 2), 3..<8)
+    XCTAssertEqual(nativeViewerWindowSlice(currentIndex: 9, totalCount: 10, windowRadius: 3), 6..<10)
+    XCTAssertEqual(nativeViewerWindowSlice(currentIndex: 0, totalCount: 0, windowRadius: 5), 0..<0)
+    XCTAssertEqual(nativeViewerWindowSlice(currentIndex: 2, totalCount: 3, windowRadius: 10), 0..<3)
+  }
+
   func testViewerImageFitsViewportWithoutCropping() {
     let viewport = CGSize(width: 390, height: 844)
     XCTAssertEqual(nativeAspectFitImageSize(imageSize: CGSize(width: 4000, height: 3000), viewportSize: viewport), CGSize(width: 390, height: 292.5))

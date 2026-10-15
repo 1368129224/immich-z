@@ -1497,6 +1497,30 @@ struct NativePhotosView: View {
         }
         .font(.system(size: 16, weight: .medium))
 
+        // 服务器状态按钮
+        Button {
+          showServerSettings = true
+        } label: {
+          serverStatusIcon
+            .frame(width: 20, height: 20)
+            .frame(width: 32, height: 32)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("服务器状态")
+
+        // 同步与备份状态按钮
+        Button {
+          showSyncSettings = true
+        } label: {
+          cloudSyncStatusIcon
+            .frame(width: 20, height: 20)
+            .frame(width: 32, height: 32)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("同步与备份状态")
+
         Menu {
           Button {
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -3652,7 +3676,7 @@ private struct NativeViewerFilmstrip: View {
   var body: some View {
     ScrollViewReader { proxy in
       ScrollView(.horizontal, showsIndicators: false) {
-        HStack(spacing: 2) {
+        LazyHStack(spacing: 2) {
           ForEach(items) { item in
             let isCurrent = item.id == currentAssetID
             Group {
@@ -3762,6 +3786,11 @@ struct NativeUnifiedGalleryViewer: View {
     items.first(where: { $0.id == currentAssetID })
   }
 
+  private var windowedViewerItems: [NativeGridItem] {
+    let slice = nativeViewerWindowSlice(currentIndex: currentIndex, totalCount: items.count, windowRadius: 15)
+    return Array(items[slice])
+  }
+
   var body: some View {
     ZStack {
       NativeClearBackgroundView { controller in
@@ -3774,7 +3803,7 @@ struct NativeUnifiedGalleryViewer: View {
       } else {
         NativeViewerDismissSurface(
           pager: TabView(selection: $currentAssetID) {
-            ForEach(items) { item in
+            ForEach(windowedViewerItems) { item in
               NativeSingleAssetPage(
                 client: client,
                 device: device,
@@ -4879,6 +4908,7 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     var onTap: () -> Void
     var onZoomChanged: (Bool) -> Void
     var wasPlaying = false
+    private var pendingSingleTapWorkItem: DispatchWorkItem?
 
     init(onTap: @escaping () -> Void, onZoomChanged: @escaping (Bool) -> Void) {
       self.onTap = onTap
@@ -4912,10 +4942,17 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
     }
 
     @objc func handleTap() {
-      onTap()
+      pendingSingleTapWorkItem?.cancel()
+      let workItem = DispatchWorkItem { [weak self] in
+        self?.onTap()
+      }
+      pendingSingleTapWorkItem = workItem
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: workItem)
     }
 
     @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+      pendingSingleTapWorkItem?.cancel()
+      pendingSingleTapWorkItem = nil
       guard let scrollView = gesture.view as? UIScrollView else { return }
       if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
         scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)
@@ -5006,6 +5043,7 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   class Coordinator: NSObject, UIScrollViewDelegate, UIGestureRecognizerDelegate {
     var onTap: () -> Void
     var onZoomChanged: (Bool) -> Void
+    private var pendingSingleTapWorkItem: DispatchWorkItem?
 
     init(onTap: @escaping () -> Void, onZoomChanged: @escaping (Bool) -> Void) {
       self.onTap = onTap
@@ -5039,10 +5077,17 @@ private struct NativeZoomableImageView: UIViewRepresentable {
     }
 
     @objc func handleTap() {
-      onTap()
+      pendingSingleTapWorkItem?.cancel()
+      let workItem = DispatchWorkItem { [weak self] in
+        self?.onTap()
+      }
+      pendingSingleTapWorkItem = workItem
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2, execute: workItem)
     }
 
     @objc func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+      pendingSingleTapWorkItem?.cancel()
+      pendingSingleTapWorkItem = nil
       guard let scrollView = gesture.view as? UIScrollView else { return }
       if scrollView.zoomScale > scrollView.minimumZoomScale + 0.01 {
         scrollView.setZoomScale(scrollView.minimumZoomScale, animated: true)

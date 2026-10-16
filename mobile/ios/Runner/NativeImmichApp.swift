@@ -1231,6 +1231,7 @@ struct NativePhotosView: View {
   @AppStorage("immichz_photos_excluded_server_album_ids") private var excludedServerAlbumIDsRaw = "[]"
   @State private var excludedServerAssetIDs = Set<String>()
   @State private var activeViewerItem: NativeGridItem?
+  @State private var viewerSourceFrame: CGRect?
   @AppStorage("immichz_photos_aspect_ratio_grid") private var isAspectRatioGrid = false
   @State private var selectedTimelineLevel: String = "所有照片"
   @State private var isSwitchingTimeline = false
@@ -1610,6 +1611,16 @@ struct NativePhotosView: View {
                           }
                           .frame(width: geo.size.width, height: geo.size.height)
                           .clipped()
+                          .contentShape(Rectangle())
+                          .onTapGesture {
+                            guard !isMagnifying else { return }
+                            if isSelecting {
+                              toggleSelection(entry.id)
+                            } else {
+                              viewerSourceFrame = geo.frame(in: .global)
+                              activeViewerItem = entry
+                            }
+                          }
                           .preference(
                             key: NativeItemFramePreferenceKey.self,
                             value: nativePhotoFramePreference(
@@ -1641,6 +1652,7 @@ struct NativePhotosView: View {
                             .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
                             .foregroundColor(.white).shadow(color: .black, radius: 2)
                             .padding(columns > 4 ? 1.5 : 3)
+                            .allowsHitTesting(false)
                         }
                       }
                       .overlay(alignment: .bottomTrailing) {
@@ -1649,6 +1661,7 @@ struct NativePhotosView: View {
                             .font(.system(size: columns > 4 ? 7 : 13, weight: .semibold))
                             .foregroundColor(.white).shadow(color: .black, radius: 2)
                             .padding(columns > 4 ? 1.5 : 3)
+                            .allowsHitTesting(false)
                         }
                       }
                       .overlay(alignment: .topTrailing) {
@@ -1657,18 +1670,11 @@ struct NativePhotosView: View {
                             .font(.system(size: columns > 7 ? 12 : (columns > 4 ? 16 : 20), weight: .semibold))
                             .foregroundStyle(.white, .blue)
                             .padding(columns > 7 ? 1 : 4)
+                            .allowsHitTesting(false)
                         }
                       }
                       .contentShape(Rectangle())
                       .accessibilityLabel("\(entry.date.formatted()), \(cloudDescription(for: entry))")
-                      .onTapGesture {
-                        guard !isMagnifying else { return }
-                        if isSelecting {
-                          toggleSelection(entry.id)
-                        } else {
-                          activeViewerItem = entry
-                        }
-                      }
                       .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
                         guard !isMagnifying else { return }
                         if isSelecting {
@@ -2343,6 +2349,7 @@ struct NativePhotosView: View {
               ? cachedDayGroups.flatMap(\.assets)
               : launchViewerItems,
             initialItem: item,
+            sourceFrame: viewerSourceFrame,
             onDeleteItem: { deletedItem, scope in
               let previousAssetIDs = cachedDayGroups.flatMap(\.assets).map(\.id)
               let fallbackID = nativeViewerNextSelectionID(deletingID: deletedItem.id, orderedIDs: previousAssetIDs)
@@ -3525,9 +3532,8 @@ private extension UIView {
   }
 }
 
-// Keep per-frame gesture updates out of the gallery's asset/page state. Moving
-// the pager (without clipping or scaling its entire UIPageViewController) is
-// cheap; only the lightweight black backdrop and chrome fade are animated.
+// Keep per-frame gesture updates out of the gallery's asset/page state.
+// Only scale the pager for the final thumbnail dismissal animation.
 private enum NativeViewerDragDirection {
   case undetermined
   case draggingDown
@@ -3539,20 +3545,29 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
   let chrome: Chrome
   let showsChrome: Bool
   let isZoomed: Bool
+  let sourceFrame: CGRect?
+  @Binding var dismissRequested: Bool
   var onSwipeUp: (() -> Void)? = nil
   let onDismiss: () -> Void
 
   @State private var dragY: CGFloat = 0
   @State private var dragDirection: NativeViewerDragDirection = .undetermined
+  @State private var dismissScaleX: CGFloat = 1
+  @State private var dismissScaleY: CGFloat = 1
+  @State private var dismissX: CGFloat = 0
+  @State private var backdropOpacity: Double = 1
+  @State private var pagerOpacity: Double = 1
   @State private var finishing = false
 
   var body: some View {
     ZStack {
       Color.black
-        .opacity(max(0, 1 - Double(dragY / 320)))
+        .opacity(backdropOpacity * max(0, 1 - Double(dragY / 320)))
         .ignoresSafeArea()
       pager
-        .offset(y: dragY)
+        .opacity(pagerOpacity)
+        .scaleEffect(x: dismissScaleX, y: dismissScaleY)
+        .offset(x: dismissX, y: dragY)
         .simultaneousGesture(
           DragGesture(minimumDistance: 8)
             .onChanged { value in
@@ -3562,7 +3577,6 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
                 let action = nativeClassifyViewerVerticalSwipe(translation: value.translation, predictedEnd: value.predictedEndTranslation)
                 if action == .showDetails {
                   dragDirection = .swipingUp
-                  onSwipeUp?()
                   return
                 }
                 if value.translation.height > 8 && isVertical {
@@ -3585,20 +3599,13 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
               }
               let action = nativeClassifyViewerVerticalSwipe(translation: value.translation, predictedEnd: value.predictedEndTranslation)
               if currentDirection == .swipingUp || action == .showDetails {
-                if currentDirection != .swipingUp {
-                  onSwipeUp?()
-                }
+                onSwipeUp?()
                 withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) { dragY = 0 }
                 return
               }
               if currentDirection == .draggingDown {
                 if action == .dismiss {
-                  finishing = true
-                  UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                  withAnimation(.easeOut(duration: 0.22)) {
-                    dragY = UIScreen.main.bounds.height + 80
-                  }
-                  DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) { onDismiss() }
+                  finishDismiss(swipingDown: true)
                 } else {
                   withAnimation(.interactiveSpring(response: 0.32, dampingFraction: 0.85)) {
                     dragY = 0
@@ -3613,12 +3620,49 @@ private struct NativeViewerDismissSurface<Pager: View, Chrome: View>: View {
         )
       if showsChrome && !finishing {
         chrome
-          .opacity(max(0, 1 - Double(dragY / 60)))
+          .opacity(backdropOpacity * max(0, 1 - Double(dragY / 60)))
           .transition(.opacity)
       }
     }
     .animation(.easeInOut(duration: 0.2), value: showsChrome)
+    .onChange(of: dismissRequested) { requested in
+      if requested { finishDismiss(swipingDown: false) }
+    }
   }
+
+  private func finishDismiss(swipingDown: Bool) {
+    guard !finishing else { return }
+    finishing = true
+    UIImpactFeedbackGenerator(style: .light).impactOccurred()
+    let screen = UIScreen.main.bounds
+    let target = nativeViewerVisibleSourceFrame(sourceFrame, in: screen)
+    withAnimation(.easeOut(duration: 0.25)) {
+      backdropOpacity = 0
+      if let target {
+        dismissScaleX = target.width / screen.width
+        dismissScaleY = target.height / screen.height
+        dismissX = target.midX - screen.midX
+        dragY = target.midY - screen.midY
+      } else if swipingDown {
+        dragY = screen.height + 80
+      } else {
+        pagerOpacity = 0
+      }
+    }
+    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { onDismiss() }
+  }
+}
+
+func nativeViewerVisibleSourceFrame(_ source: CGRect?, in screen: CGRect) -> CGRect? {
+  guard let source, source.width > 0, source.height > 0,
+        screen.contains(source) else { return nil }
+  return source
+}
+
+func nativeFilmstripTargetIndex(start: Int, translation: CGFloat, count: Int) -> Int {
+  guard count > 0, translation.isFinite else { return 0 }
+  let limitedSteps = max(-CGFloat(count), min(CGFloat(count), (translation / 30).rounded()))
+  return min(count - 1, max(0, start - Int(limitedSteps)))
 }
 
 private struct NativeViewerFilmstrip: View {
@@ -3626,55 +3670,76 @@ private struct NativeViewerFilmstrip: View {
   let device: NativeDeviceLibrary
   let items: [NativeGridItem]
   @Binding var currentAssetID: String
+  @State private var dragStartIndex: Int?
 
   var body: some View {
-    ScrollViewReader { proxy in
-      ScrollView(.horizontal, showsIndicators: false) {
-        LazyHStack(spacing: 2) {
-          ForEach(items) { item in
-            let isCurrent = item.id == currentAssetID
-            Group {
-              if let server = item.server {
-                NativeThumbnail(client: client, asset: server, columns: 8)
-              } else if let local = item.local {
-                NativeDeviceThumbnail(asset: local, columns: 8)
-              } else {
-                Color.gray.opacity(0.3)
+    GeometryReader { geometry in
+      ScrollViewReader { proxy in
+        ScrollView(.horizontal, showsIndicators: false) {
+          LazyHStack(spacing: 2) {
+            ForEach(items) { item in
+              let isCurrent = item.id == currentAssetID
+              Group {
+                if let server = item.server {
+                  NativeThumbnail(client: client, asset: server, columns: 8)
+                } else if let local = item.local {
+                  NativeDeviceThumbnail(asset: local, columns: 8)
+                } else {
+                  Color.gray.opacity(0.3)
+                }
               }
-            }
-            .frame(width: isCurrent ? 36 : 16, height: isCurrent ? 34 : 30)
-            .clipped()
-            .clipShape(RoundedRectangle(cornerRadius: isCurrent ? 4 : 2))
-            .overlay(
-              RoundedRectangle(cornerRadius: isCurrent ? 4 : 2)
-                .stroke(isCurrent ? Color.white : Color.clear, lineWidth: 1.5)
-            )
-            .padding(.horizontal, isCurrent ? 4 : 0)
-            .id(item.id)
-            .contentShape(Rectangle())
-            .onTapGesture {
-              if item.id != currentAssetID {
-                UISelectionFeedbackGenerator().selectionChanged()
-                currentAssetID = item.id
+              .frame(width: 28, height: isCurrent ? 34 : 30)
+              .clipped()
+              .clipShape(RoundedRectangle(cornerRadius: isCurrent ? 4 : 2))
+              .overlay(
+                RoundedRectangle(cornerRadius: isCurrent ? 4 : 2)
+                  .stroke(isCurrent ? Color.white : Color.clear, lineWidth: 1.5)
+              )
+              .id(item.id)
+              .contentShape(Rectangle())
+              .onTapGesture {
+                if item.id != currentAssetID {
+                  UISelectionFeedbackGenerator().selectionChanged()
+                  currentAssetID = item.id
+                }
               }
             }
           }
+          .padding(.horizontal, max(0, geometry.size.width / 2 - 30))
         }
-        .padding(.horizontal, UIScreen.main.bounds.width / 2 - 18)
-      }
-      .frame(height: 36)
-      .background(Color.black.opacity(0.45))
-      .clipShape(Capsule())
-      .padding(.horizontal, 16)
-      .onChange(of: currentAssetID) { newID in
-        withAnimation(.easeOut(duration: 0.15)) {
-          proxy.scrollTo(newID, anchor: .center)
+        .frame(height: 36)
+        .highPriorityGesture(
+          DragGesture(minimumDistance: 4)
+            .onChanged { value in
+              guard !items.isEmpty else { return }
+              let start = dragStartIndex ?? items.firstIndex(where: { $0.id == currentAssetID }) ?? 0
+              if dragStartIndex == nil { dragStartIndex = start }
+              let index = nativeFilmstripTargetIndex(start: start, translation: value.translation.width, count: items.count)
+              if currentAssetID != items[index].id {
+                UISelectionFeedbackGenerator().selectionChanged()
+                currentAssetID = items[index].id
+              }
+            }
+            .onEnded { _ in dragStartIndex = nil }
+        )
+        .background(Color.black.opacity(0.45))
+        .clipShape(Capsule())
+        .padding(.horizontal, 16)
+        .onChange(of: currentAssetID) { newID in
+          if dragStartIndex != nil {
+            proxy.scrollTo(newID, anchor: .center)
+          } else {
+            withAnimation(.easeOut(duration: 0.15)) {
+              proxy.scrollTo(newID, anchor: .center)
+            }
+          }
         }
-      }
-      .onAppear {
-        proxy.scrollTo(currentAssetID, anchor: .center)
+        .onAppear {
+          proxy.scrollTo(currentAssetID, anchor: .center)
+        }
       }
     }
+    .frame(height: 36)
   }
 }
 
@@ -3683,6 +3748,7 @@ struct NativeUnifiedGalleryViewer: View {
   let device: NativeDeviceLibrary
   @State private var items: [NativeGridItem]
   let initialItem: NativeGridItem
+  var sourceFrame: CGRect? = nil
   var onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil
   var onServerAssetUpdated: ((NativeAsset) -> Void)? = nil
   var onServerAssetArchived: ((String) -> Void)? = nil
@@ -3693,6 +3759,7 @@ struct NativeUnifiedGalleryViewer: View {
   @State private var isLivePhotoMuted = true
   @State private var currentAssetID: String
   @State private var showChrome = true
+  @State private var dismissRequested = false
   @State private var isCurrentImageZoomed = false
   @State private var showInfoSheet = false
   @State private var isFavorite = false
@@ -3715,6 +3782,7 @@ struct NativeUnifiedGalleryViewer: View {
     device: NativeDeviceLibrary,
     items: [NativeGridItem],
     initialItem: NativeGridItem,
+    sourceFrame: CGRect? = nil,
     onDeleteItem: ((NativeGridItem, NativeDeleteTargetScope) -> Void)? = nil,
     onServerAssetUpdated: ((NativeAsset) -> Void)? = nil,
     onServerAssetArchived: ((String) -> Void)? = nil,
@@ -3724,6 +3792,7 @@ struct NativeUnifiedGalleryViewer: View {
     self.device = device
     _items = State(initialValue: items)
     self.initialItem = initialItem
+    self.sourceFrame = sourceFrame
     self.onDeleteItem = onDeleteItem
     self.onServerAssetUpdated = onServerAssetUpdated
     self.onServerAssetArchived = onServerAssetArchived
@@ -3757,6 +3826,9 @@ struct NativeUnifiedGalleryViewer: View {
                 client: client,
                 device: device,
                 item: item,
+                isActive: item.id == currentAssetID,
+                isLivePhotoEnabled: isLivePhotoEnabled,
+                isLivePhotoMuted: isLivePhotoMuted,
                 showsControls: showChrome,
                 onZoomChanged: { zoomed in
                   if item.id == currentAssetID { isCurrentImageZoomed = zoomed }
@@ -3768,16 +3840,18 @@ struct NativeUnifiedGalleryViewer: View {
             }
           }
           .tabViewStyle(.page(indexDisplayMode: .never))
+          .nativeScrollDisabled(isCurrentImageZoomed)
           .ignoresSafeArea(),
           chrome: viewerChrome,
           showsChrome: showChrome,
           isZoomed: isCurrentImageZoomed,
+          sourceFrame: currentAssetID == initialItem.id ? sourceFrame : nil,
+          dismissRequested: $dismissRequested,
           onSwipeUp: {
             showInfoSheet = true
           },
           onDismiss: {
-            // The page has already flown offscreen. Avoid a second UIKit
-            // fullScreenCover slide that made the release visibly stutter.
+            // Avoid a second UIKit fullScreenCover transition after the page animation.
             if let controller = presentedController.value,
                controller.presentingViewController != nil {
               controller.dismiss(animated: false) {
@@ -3829,6 +3903,8 @@ struct NativeUnifiedGalleryViewer: View {
     }
     .onChange(of: currentAssetID) { newID in
       isCurrentImageZoomed = false
+      isLivePhotoEnabled = true
+      isLivePhotoMuted = true
       if let item = items.first(where: { $0.id == newID }) { isFavorite = item.isFavorite }
     }
     .onDisappear {
@@ -3861,8 +3937,7 @@ struct NativeUnifiedGalleryViewer: View {
           // Top Bar
           HStack {
             Button {
-              if let onDismissViewer { onDismissViewer() }
-              else { dismiss() }
+              dismissRequested = true
             } label: {
               Image(systemName: "chevron.left")
                 .font(.system(size: 18, weight: .semibold))
@@ -3927,7 +4002,7 @@ struct NativeUnifiedGalleryViewer: View {
             }
           }
           .padding(.horizontal, 16)
-          .padding(.top, 48)
+          .padding(.top, 8)
 
           Spacer()
 
@@ -4005,8 +4080,9 @@ struct NativeUnifiedGalleryViewer: View {
           .padding(.horizontal, 16)
           .background(Color.black.opacity(0.65))
           .cornerRadius(24)
-          .padding(.bottom, 24)
+          .padding(.bottom, 8)
     }
+    .padding(.horizontal, 8)
   }
 
   @ViewBuilder
@@ -4312,10 +4388,33 @@ func nativePrepareBatchShare(items: [NativeGridItem], client: NativeImmichClient
   return NativeBatchShareResult(files: results, failed: failed)
 }
 
+private final class NativeVideoPlayerView: UIView {
+  override static var layerClass: AnyClass { AVPlayerLayer.self }
+  var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+}
+
+private struct NativeVideoSurface: UIViewRepresentable {
+  let player: AVPlayer
+
+  func makeUIView(context: Context) -> NativeVideoPlayerView {
+    let view = NativeVideoPlayerView()
+    view.backgroundColor = .black
+    view.playerLayer.videoGravity = .resizeAspect
+    return view
+  }
+
+  func updateUIView(_ view: NativeVideoPlayerView, context: Context) {
+    view.playerLayer.player = player
+  }
+}
+
 private struct NativeSingleAssetPage: View {
   let client: NativeImmichClient
   let device: NativeDeviceLibrary
   let item: NativeGridItem
+  let isActive: Bool
+  let isLivePhotoEnabled: Bool
+  let isLivePhotoMuted: Bool
   var showsControls: Bool = true
   let onZoomChanged: (Bool) -> Void
   let onTap: () -> Void
@@ -4333,6 +4432,7 @@ private struct NativeSingleAssetPage: View {
   @State private var videoCurrentTime: Double = 0
   @State private var videoDuration: Double = 0
   @State private var isScrubbing = false
+  @State private var resumeAfterScrub = false
   @State private var isVideoMuted = false
   @State private var timeObserverToken: Any?
 
@@ -4350,14 +4450,17 @@ private struct NativeSingleAssetPage: View {
         if item.isVideo {
           if let player {
             ZStack(alignment: .bottom) {
-              VideoPlayer(player: player)
+              NativeVideoSurface(player: player)
                 .frame(width: proxy.size.width, height: proxy.size.height)
                 .ignoresSafeArea()
-                .highPriorityGesture(TapGesture().onEnded { onTap() })
+                .contentShape(Rectangle())
+                .onTapGesture(perform: onTap)
                 .onAppear {
                   setupVideoObserver(for: player)
-                  player.play()
-                  isVideoPlaying = true
+                  if isActive {
+                    player.play()
+                    isVideoPlaying = true
+                  }
                 }
                 .onDisappear {
                   player.pause()
@@ -4379,7 +4482,7 @@ private struct NativeSingleAssetPage: View {
             }
           }
         } else {
-          if isLivePlaying, let livePlayer, livePhoto == nil {
+          if isLivePlaying && isActive && isLivePhotoEnabled, let livePlayer, livePhoto == nil {
             VideoPlayer(player: livePlayer)
               .frame(width: proxy.size.width, height: proxy.size.height)
               .ignoresSafeArea()
@@ -4387,7 +4490,10 @@ private struct NativeSingleAssetPage: View {
           } else if let livePhoto {
             NativeZoomableLivePhotoView(
               livePhoto: livePhoto,
-              isPlaying: isLivePlaying,
+              isPlaying: isLivePlaying && isActive && isLivePhotoEnabled,
+              isEnabled: isLivePhotoEnabled,
+              isMuted: isLivePhotoMuted,
+              isActive: isActive,
               size: proxy.size,
               onTap: onTap,
               onZoomChanged: onZoomChanged
@@ -4397,6 +4503,7 @@ private struct NativeSingleAssetPage: View {
           } else if let image {
             NativeZoomableImageView(
               image: image,
+              isActive: isActive,
               size: proxy.size,
               onTap: onTap,
               onZoomChanged: onZoomChanged
@@ -4423,15 +4530,31 @@ private struct NativeSingleAssetPage: View {
       })
     }
     .ignoresSafeArea()
+    .onChange(of: isActive) { active in
+      if !active {
+        player?.pause()
+        isVideoPlaying = false
+        stopLivePlayback()
+      } else if item.isVideo, let player {
+        player.play()
+        isVideoPlaying = true
+      }
+    }
+    .onChange(of: isLivePhotoEnabled) { enabled in
+      if !enabled { stopLivePlayback() }
+    }
+    .onChange(of: isLivePhotoMuted) { muted in livePlayer?.isMuted = muted }
     .task(id: "\(item.local?.id ?? "remote"):\(item.server?.id ?? "none")") {
       image = nil
       livePhoto = nil
+      removeVideoObserver()
       player?.pause()
       player = nil
       livePlayer = nil
       await loadAssetContent()
     }
     .onDisappear {
+      removeVideoObserver()
       player?.pause()
       player = nil
       stopLivePlayback()
@@ -4445,8 +4568,9 @@ private struct NativeSingleAssetPage: View {
     let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
     timeObserverToken = avPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak avPlayer] time in
       guard !isScrubbing else { return }
-      videoCurrentTime = time.seconds
-      if let item = avPlayer?.currentItem, item.duration.isValid && !item.duration.isIndefinite {
+      if time.seconds.isFinite { videoCurrentTime = time.seconds }
+      if let item = avPlayer?.currentItem, item.duration.isValid,
+         !item.duration.isIndefinite, item.duration.seconds.isFinite {
         videoDuration = item.duration.seconds
       }
       isVideoPlaying = (avPlayer?.timeControlStatus == .playing)
@@ -4495,20 +4619,21 @@ private struct NativeSingleAssetPage: View {
             get: { videoCurrentTime },
             set: { newValue in
               videoCurrentTime = newValue
-              if !isScrubbing {
-                isScrubbing = true
-                player?.pause()
-              }
               player?.seek(to: CMTime(seconds: newValue, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero)
             }
           ),
           in: 0...max(videoDuration, 0.1),
           onEditingChanged: { editing in
-            isScrubbing = editing
-            if !editing {
-              if isVideoPlaying {
+            if editing {
+              resumeAfterScrub = isVideoPlaying
+              isScrubbing = true
+              player?.pause()
+            } else {
+              isScrubbing = false
+              if resumeAfterScrub && isActive {
                 player?.play()
               }
+              resumeAfterScrub = false
             }
           }
         )
@@ -4535,7 +4660,7 @@ private struct NativeSingleAssetPage: View {
       .background(Color.black.opacity(0.65))
       .clipShape(Capsule())
       .padding(.horizontal, 16)
-      .padding(.bottom, 114)
+      .padding(.bottom, 160)
     }
     .allowsHitTesting(true)
   }
@@ -4549,8 +4674,9 @@ private struct NativeSingleAssetPage: View {
   }
 
   private func startLivePlayback() {
-    guard isLive, !item.isVideo, livePhoto != nil || livePlayer != nil else { return }
+    guard isActive, isLivePhotoEnabled, isLive, !item.isVideo, livePhoto != nil || livePlayer != nil else { return }
     isLivePlaying = true
+    livePlayer?.isMuted = isLivePhotoMuted
     livePlayer?.seek(to: .zero)
     livePlayer?.play()
   }
@@ -4580,7 +4706,6 @@ private struct NativeSingleAssetPage: View {
               if let playerItem {
                 let avPlayer = AVPlayer(playerItem: playerItem)
                 avPlayer.actionAtItemEnd = .pause
-                setupVideoObserver(for: avPlayer)
                 player = avPlayer
               } else {
                 loadError = Self.photoKitErrorMessage(info)
@@ -4603,7 +4728,6 @@ private struct NativeSingleAssetPage: View {
           let item = AVPlayerItem(asset: asset)
           let avPlayer = AVPlayer(playerItem: item)
           avPlayer.actionAtItemEnd = .pause
-          setupVideoObserver(for: avPlayer)
           player = avPlayer
         } else { loadError = "服务器视频播放地址无效" }
       } else { loadError = "视频资产来源不可用" }
@@ -4780,6 +4904,9 @@ func nativeAspectFitImageSize(imageSize: CGSize, viewportSize: CGSize) -> CGSize
 private struct NativeZoomableLivePhotoView: UIViewRepresentable {
   let livePhoto: PHLivePhoto
   let isPlaying: Bool
+  let isEnabled: Bool
+  let isMuted: Bool
+  let isActive: Bool
   let size: CGSize
   let onTap: () -> Void
   let onZoomChanged: (Bool) -> Void
@@ -4801,7 +4928,8 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
 
     let photoView = PHLivePhotoView()
     photoView.contentMode = .scaleAspectFit
-    photoView.isMuted = false
+    photoView.isMuted = isMuted
+    photoView.isUserInteractionEnabled = isEnabled
     photoView.tag = 101
     scrollView.addSubview(photoView)
 
@@ -4822,10 +4950,16 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
   func updateUIView(_ uiView: NativeCenteringScrollView, context: Context) {
     context.coordinator.onTap = onTap
     context.coordinator.onZoomChanged = onZoomChanged
+    if !isActive && uiView.zoomScale > uiView.minimumZoomScale + 0.01 {
+      uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
+      uiView.isScrollEnabled = false
+    }
     uiView.contentTag = 101
     uiView.assetSize = livePhoto.size
     guard let photoView = uiView.viewWithTag(101) as? PHLivePhotoView else { return }
     if photoView.livePhoto !== livePhoto { photoView.livePhoto = livePhoto }
+    photoView.isMuted = isMuted
+    photoView.isUserInteractionEnabled = isEnabled
     if isPlaying && !context.coordinator.wasPlaying {
       photoView.startPlayback(with: .full)
     } else if !isPlaying && context.coordinator.wasPlaying {
@@ -4919,6 +5053,7 @@ private struct NativeZoomableLivePhotoView: UIViewRepresentable {
 // Pinch to zoom and double tap zoomable container
 private struct NativeZoomableImageView: UIViewRepresentable {
   let image: UIImage
+  let isActive: Bool
   let size: CGSize
   let onTap: () -> Void
   let onZoomChanged: (Bool) -> Void
@@ -4960,6 +5095,10 @@ private struct NativeZoomableImageView: UIViewRepresentable {
   func updateUIView(_ uiView: NativeCenteringScrollView, context: Context) {
     context.coordinator.onTap = onTap
     context.coordinator.onZoomChanged = onZoomChanged
+    if !isActive && uiView.zoomScale > uiView.minimumZoomScale + 0.01 {
+      uiView.setZoomScale(uiView.minimumZoomScale, animated: false)
+      uiView.isScrollEnabled = false
+    }
     uiView.contentTag = 100
     uiView.assetSize = image.size
 

@@ -611,37 +611,15 @@ struct NativeDeviceThumbnail: View {
   }
 }
 
-struct NativeDeviceViewer: View {
-  let asset: NativeDeviceAsset
-  @Environment(\.dismiss) private var dismiss
-  @State private var image: UIImage?
-  var body: some View {
-    NavigationView {
-      ZStack {
-        Color.black.ignoresSafeArea()
-        if let image { Image(uiImage: image).resizable().scaledToFit() }
-        else { ProgressView().tint(.white) }
-      }
-      .toolbar { ToolbarItem(placement: .navigationBarLeading) { Button("关闭") { dismiss() } } }
-      .task {
-        guard let source = PHAsset.fetchAssets(withLocalIdentifiers: [asset.id], options: nil).firstObject else { return }
-        let options = PHImageRequestOptions()
-        options.isNetworkAccessAllowed = true
-        PHImageManager.default().requestImage(for: source, targetSize: PHImageManagerMaximumSize, contentMode: .aspectFit, options: options) { result, _ in
-          Task { @MainActor in image = result }
-        }
-      }
-    }
-    .statusBarHidden(true)
-  }
-}
-
 struct NativeDeviceGrid: View {
+  let client: NativeImmichClient
+  @ObservedObject var device: NativeDeviceLibrary
   let title: String
   let assets: [NativeDeviceAsset]
   @State private var columns: Int = 3
   @State private var gestureBaseColumns: Int? = nil
-  @State private var selected: NativeDeviceAsset?
+  @State private var selected: NativeGridItem?
+  @State private var viewerSourceFrame: CGRect?
   @State private var positioned = false
   private let bottom = "device-bottom"
 
@@ -662,29 +640,32 @@ struct NativeDeviceGrid: View {
               let gridSpacing: CGFloat = columns > 7 ? 1 : 2
               LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: gridSpacing), count: columns), spacing: gridSpacing) {
                 ForEach(groups[day] ?? []) { asset in
-                  Button { selected = asset } label: {
-                    Color.clear
-                      .aspectRatio(1, contentMode: .fit)
-                      .overlay(
-                        GeometryReader { geo in
+                  Color.clear
+                    .aspectRatio(1, contentMode: .fit)
+                    .overlay(
+                      GeometryReader { geo in
+                        Button {
+                          viewerSourceFrame = geo.frame(in: .global)
+                          selected = NativeGridItem(server: nil, local: asset)
+                        } label: {
                           NativeDeviceThumbnail(asset: asset, columns: columns)
                             .frame(width: geo.size.width, height: geo.size.height)
                             .clipped()
                         }
-                      )
-                      .clipped()
-                      .overlay(alignment: .bottomTrailing) {
-                        if asset.isVideo && columns <= 7 {
-                          Image(systemName: "play.fill")
-                            .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
-                            .foregroundColor(.white).shadow(color: .black, radius: 2)
-                            .padding(columns > 4 ? 1.5 : 3)
-                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("设备照片，\(asset.date.formatted())")
                       }
-                      .contentShape(Rectangle())
-                  }
-                  .buttonStyle(.plain)
-                  .accessibilityLabel("设备照片，\(asset.date.formatted())")
+                    )
+                    .clipped()
+                    .overlay(alignment: .bottomLeading) {
+                      if asset.isVideo && columns <= 7 {
+                        Image(systemName: "play.fill")
+                          .font(.system(size: columns > 4 ? 7 : 11, weight: .bold))
+                          .foregroundColor(.white).shadow(color: .black, radius: 2)
+                          .padding(columns > 4 ? 1.5 : 3)
+                          .allowsHitTesting(false)
+                      }
+                    }
                 }
               }
             }
@@ -742,7 +723,16 @@ struct NativeDeviceGrid: View {
         }
       }
     }
-    .sheet(item: $selected) { NativeDeviceViewer(asset: $0) }
+    .fullScreenCover(item: $selected) { item in
+      NativeUnifiedGalleryViewer(
+        client: client,
+        device: device,
+        items: assets.map { NativeGridItem(server: nil, local: $0) },
+        initialItem: item,
+        sourceFrame: viewerSourceFrame,
+        onDismissViewer: { selected = nil }
+      )
+    }
     .navigationTitle(title)
   }
 }
@@ -993,6 +983,7 @@ struct NativeResultGrid: View {
   @State private var itemBounds: [String: CGRect] = [:]
 
   @State private var activeViewerItem: NativeGridItem?
+  @State private var viewerSourceFrame: CGRect?
   @State private var userMovedGrid = false
   @State private var bottomPositionTask: Task<Void, Never>?
 
@@ -1110,6 +1101,16 @@ struct NativeResultGrid: View {
                         }
                         .frame(width: geo.size.width, height: geo.size.height)
                         .clipped()
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                          guard !isMagnifying else { return }
+                          if isSelecting {
+                            toggleSelection(entry.id)
+                          } else {
+                            viewerSourceFrame = geo.frame(in: .global)
+                            activeViewerItem = entry
+                          }
+                        }
                         .preference(key: NativeItemFramePreferenceKey.self, value: [entry.id: geo.frame(in: .named("resultGridScrollSpace"))])
                       }
                     )
@@ -1128,6 +1129,8 @@ struct NativeResultGrid: View {
                           .font(.system(size: columns > 4 ? 7 : 13, weight: .semibold))
                           .foregroundColor(.white).shadow(color: .black, radius: 2)
                           .padding(columns > 4 ? 1.5 : 3)
+                          .allowsHitTesting(false)
+                          .allowsHitTesting(false)
                       }
                     }
 
@@ -1147,17 +1150,10 @@ struct NativeResultGrid: View {
                       }
                     }
                     .padding(columns > 4 ? 2 : 4)
+                    .allowsHitTesting(false)
                   }
                 }
                 .contentShape(Rectangle())
-                .onTapGesture {
-                  guard !isMagnifying else { return }
-                  if isSelecting {
-                    toggleSelection(entry.id)
-                  } else {
-                    activeViewerItem = entry
-                  }
-                }
                 .onLongPressGesture(minimumDuration: 0.28, maximumDistance: 15) {
                   guard !isMagnifying else { return }
                   if !isSelecting {
@@ -1315,6 +1311,7 @@ struct NativeResultGrid: View {
         device: NativeDeviceLibrary(),
         items: merged,
         initialItem: item,
+        sourceFrame: viewerSourceFrame,
         onDismissViewer: { activeViewerItem = nil }
       )
     }
@@ -3660,7 +3657,7 @@ private struct NativeLibraryView: View {
           if features["facialRecognition"] as? Bool != false { NavigationLink("人物") { NativePeopleView(client: client) } }
           if features["map"] as? Bool != false { NavigationLink("地点") { NativePlacesView(client: client) } }
           NavigationLink("本机") {
-            if device.authorized { NativeDeviceGrid(title: "本机照片", assets: device.assets) }
+            if device.authorized { NativeDeviceGrid(client: client, device: device, title: "本机照片", assets: device.assets) }
             else { Button("允许访问设备相册") { Task { await device.requestAccess() } } }
           }
           NavigationLink("回忆") {

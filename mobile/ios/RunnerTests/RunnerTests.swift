@@ -314,6 +314,23 @@ final class RunnerTests: XCTestCase {
     )
   }
 
+  func testViewerDismissOnlyTargetsVisibleSourceThumbnail() {
+    let screen = CGRect(x: 0, y: 0, width: 390, height: 844)
+    let source = CGRect(x: 30, y: 100, width: 90, height: 90)
+    XCTAssertEqual(nativeViewerVisibleSourceFrame(source, in: screen), source)
+    XCTAssertNil(nativeViewerVisibleSourceFrame(CGRect(x: 30, y: -20, width: 90, height: 90), in: screen))
+    XCTAssertNil(nativeViewerVisibleSourceFrame(CGRect(x: 30, y: 100, width: 0, height: 90), in: screen))
+    XCTAssertNil(nativeViewerVisibleSourceFrame(nil, in: screen))
+  }
+
+  func testFilmstripDragSelectsAndClampsAssetIndex() {
+    XCTAssertEqual(nativeFilmstripTargetIndex(start: 4, translation: -60, count: 10), 6)
+    XCTAssertEqual(nativeFilmstripTargetIndex(start: 4, translation: 30, count: 10), 3)
+    XCTAssertEqual(nativeFilmstripTargetIndex(start: 4, translation: -900, count: 10), 9)
+    XCTAssertEqual(nativeFilmstripTargetIndex(start: 4, translation: 900, count: 10), 0)
+    XCTAssertEqual(nativeFilmstripTargetIndex(start: 0, translation: 10, count: 0), 0)
+  }
+
   func testPhotosPinchCellSizeIsContinuousAndClamped() {
     XCTAssertEqual(nativeClampedPhotosCellSize(100, magnification: 1), 100, accuracy: 0.001)
     XCTAssertEqual(nativeClampedPhotosCellSize(100, magnification: 1.5), 150, accuracy: 0.001)
